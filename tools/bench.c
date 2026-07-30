@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     det_dataset dataset = {&storage, next_sample, reset_dataset, (size_t)sample_count};
     det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
                                DET_PRECISION_F32, 1, 0.01f, 0.8f, 0.1f,
-                               sample_count, 1};
+                               sample_count, 1, 1};
     det_train_report report;
     status = det_train(model, &dataset, &config, &report);
     if (status != DET_OK) {

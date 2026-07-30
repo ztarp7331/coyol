@@ -81,6 +81,7 @@ typedef struct {
     float score_threshold;
     int max_samples;
     int seed;
+    int reset_weights;
 } det_train_config;
 
 typedef struct {

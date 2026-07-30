@@ -23,6 +23,24 @@ static void reset_one(void *user) {
     ((one_sample_dataset *)user)->emitted = 0;
 }
 
+static void test_invalid_dataset_sample(void) {
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model_spec spec = {8, 8, 1, 1, 4, 3};
+    assert(det_context_create(1U << 16, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    float pixels[64] = {0.0f};
+    det_box box = {1, 1, 4, 4, 0};
+    one_sample_dataset storage = {{{pixels, 2, 8, 8}, &box, 1}, 0};
+    det_dataset dataset = {&storage, next_one, reset_one, 1};
+    det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1, 0.01f,
+                               0.8f, 0.1f, 1, 3, 1};
+    det_train_report report;
+    assert(det_train(model, &dataset, &config, &report) == DET_ERR_ARGUMENT);
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+}
+
 static void test_arena_and_conv(void) {
     unsigned char memory[4096];
     det_arena arena;
@@ -85,7 +103,7 @@ static void test_train_predict_roundtrip(void) {
     one_sample_dataset storage = {{ {image_data, 1, 32, 32}, &box, 1 }, 0};
     det_dataset dataset = {&storage, next_one, reset_one, 1};
     det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 40, 0.02f,
-                               0.8f, 0.1f, 1, 7};
+                               0.8f, 0.1f, 1, 7, 1};
     det_train_report report;
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
     assert(report.samples_seen == 40U);
@@ -105,6 +123,7 @@ static void test_train_predict_roundtrip(void) {
 
     config.mode = DET_TRAIN_GLOBAL_BP;
     config.epochs = 2;
+    config.reset_weights = 0;
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
     assert(report.used_global_backward == 1);
 
@@ -112,11 +131,21 @@ static void test_train_predict_roundtrip(void) {
     assert(det_save(model, path) == DET_OK);
     det_model *loaded = NULL;
     assert(det_load(ctx, path, &loaded) == DET_OK);
+    det_detection model_detections[16];
+    det_detection loaded_detections[16];
     int current_count = 0;
-    assert(det_predict(model, &image, 0.1f, detections, 16, &current_count) == DET_OK);
+    assert(det_predict(model, &image, 0.1f, model_detections, 16, &current_count) == DET_OK);
     int loaded_count = 0;
-    assert(det_predict(loaded, &image, 0.1f, detections, 16, &loaded_count) == DET_OK);
+    assert(det_predict(loaded, &image, 0.1f, loaded_detections, 16, &loaded_count) == DET_OK);
     assert(loaded_count == current_count);
+    for (int i = 0; i < current_count; ++i) {
+        assert(fabsf(model_detections[i].score - loaded_detections[i].score) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x1 - loaded_detections[i].box.x1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y1 - loaded_detections[i].box.y1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x2 - loaded_detections[i].box.x2) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y2 - loaded_detections[i].box.y2) < 1e-6f);
+        assert(model_detections[i].box.class_id == loaded_detections[i].box.class_id);
+    }
     det_model_destroy(loaded);
     (void)remove(path);
     det_model_destroy(model);
@@ -126,6 +155,7 @@ static void test_train_predict_roundtrip(void) {
 int main(void) {
     test_arena_and_conv();
     test_math();
+    test_invalid_dataset_sample();
     test_train_predict_roundtrip();
     puts("all det tests passed");
     return 0;

@@ -52,6 +52,13 @@ inference and 6.8--21.0 ms model save/load. These are performance baselines,
 not claims that the final detector has already passed the accuracy or
 architecture gates.
 
+After wiring the first spatial backbone, the compact edge profile measured
+915--993 ms `LOCAL_FAST` training, 0.12--0.20 ms inference, and 6.8--23.4 ms save/load for
+the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
+channel, one learned 3 x 3 expansion stage, and three depthwise 3 x 3 pyramid
+stages. It is an executable edge variant of the architecture, not yet the
+larger 16/24/40/64/96-channel research configuration in the table below.
+
 Two training times must be published:
 
 1. `train_core_ms`: prepared low-resolution tensors through final learned
@@ -119,10 +126,23 @@ dual-head NMS-free detection—without copying its complete architecture:
 [YOLO26 paper](https://arxiv.org/html/2606.03748v1) and
 [YOLOv10 dual assignment](https://arxiv.org/abs/2405.14458).
 
+The current C implementation has the same five-resolution topology but uses a
+compact 1/4-channel edge variant while the kernels and training path are being
+validated. The stage weights are learned from scratch, P3/P4/P5 are real
+spatial feature maps, and `GLOBAL_BP` uses convolutional backward operators.
+The larger channel table remains the next scale-up experiment, not a claim
+about the current binary.
+
 ### 2.2 Fast full-model learning
 
 `LOCAL_FAST` must update the convolutional backbone, neck, and head. It must not
 use a frozen or pretrained detector.
+
+The current implementation's local stage update is explicitly a surrogate
+local-learning rule: each stage receives a deterministic sparse local box
+target, while the heads use the detector loss. It is not being presented as
+full detector-loss backpropagation. The downstream-loss comparison against
+`GLOBAL_BP` is a required acceptance experiment before selecting this rule.
 
 Training is a single forward stream with local updates:
 
@@ -172,6 +192,10 @@ It provides:
 - BCE classification loss;
 - IoU plus normalized L1 box loss;
 - SGD with momentum as the first optimizer.
+
+Training preserves weights by default so a loaded model can resume. Set the
+public `reset_weights` flag for a deterministic fresh run; the benchmark and
+tests set it explicitly.
 
 MuSGD is implemented only after SGD is correct. It is retained only if it
 improves validation accuracy per wall-clock second, because fewer epochs do not

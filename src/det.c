@@ -1,6 +1,7 @@
 #include "det.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,22 +24,34 @@ typedef struct {
     float *velocity_b;
 } det_head;
 
+enum { DET_GRAPH_CHANNELS = 4, DET_GRAPH_STEM_CHANNELS = 1, DET_GRAPH_STAGES = 5 };
+
+typedef struct {
+    int input_channels;
+    int output_channels;
+    int input_height;
+    int input_width;
+    int output_height;
+    int output_width;
+    int kernel;
+    int stride;
+    int padding;
+    int depthwise;
+    float *weights;
+    float *bias;
+    float *velocity_w;
+    float *velocity_b;
+    float *gradient_w;
+    float *gradient_b;
+    float *activation;
+    float *gradient_output;
+    float *gradient_input;
+} det_stage;
+
 struct det_model {
     det_context *ctx;
     det_model_spec spec;
-    int feature_channels;
-    float *feature_weights;
-    float *feature_bias;
-    float *feature_velocity_w;
-    float *feature_velocity_b;
-    float *stem_weights;
-    float *stem_bias;
-    float *stem_velocity_w;
-    float *stem_velocity_b;
-    float input_mean[4];
-    float *integral;
-    float *integral_sq;
-    float *input_integral;
+    det_stage stages[DET_GRAPH_STAGES];
     det_head heads[DET_MAX_SCALES];
     size_t train_updates;
 };
@@ -65,6 +78,7 @@ static int checked_size3(int a, int b, int c, size_t *out) {
 
 static size_t align_up_size(size_t value, size_t alignment) {
     size_t mask = alignment - 1U;
+    if (value > SIZE_MAX - mask) return SIZE_MAX;
     return (value + mask) & ~mask;
 }
 
@@ -100,7 +114,7 @@ void *det_arena_alloc(det_arena *arena, size_t bytes, size_t alignment) {
     if (arena == NULL || arena->data == NULL || bytes == 0U || alignment == 0U ||
         (alignment & (alignment - 1U)) != 0U) return NULL;
     size_t start = align_up_size(arena->offset, alignment);
-    if (start > arena->capacity || bytes > arena->capacity - start) return NULL;
+    if (start == SIZE_MAX || start > arena->capacity || bytes > arena->capacity - start) return NULL;
     void *result = arena->data + start;
     arena->offset = start + bytes;
     return result;
@@ -134,17 +148,29 @@ static size_t tensor_index(const det_tensor_f32 *tensor, int c, int y, int x) {
            (size_t)tensor->width + (size_t)x;
 }
 
+static int convolution_output_dim(int input, int kernel, int stride, int padding,
+                                  int *output) {
+    if (input <= 0 || kernel <= 0 || stride <= 0 || padding < 0 || output == NULL) return 0;
+    int64_t numerator = (int64_t)input + 2LL * (int64_t)padding - (int64_t)kernel;
+    if (numerator < 0 || numerator > INT_MAX) return 0;
+    int64_t result = numerator / (int64_t)stride + 1LL;
+    if (result <= 0 || result > INT_MAX) return 0;
+    *output = (int)result;
+    return 1;
+}
+
 det_status det_conv2d_f32(const det_tensor_f32 *input, const float *weights,
                          const float *bias, int out_channels, int kernel,
                          int stride, int padding, det_tensor_f32 *output) {
     if (input == NULL || weights == NULL || bias == NULL || output == NULL ||
         input->data == NULL || output->data == NULL || out_channels <= 0 ||
         kernel <= 0 || stride <= 0 || padding < 0) return DET_ERR_ARGUMENT;
-    int numerator_h = input->height + 2 * padding - kernel;
-    int numerator_w = input->width + 2 * padding - kernel;
-    if (numerator_h < 0 || numerator_w < 0) return DET_ERR_SHAPE;
-    int expected_h = numerator_h / stride + 1;
-    int expected_w = numerator_w / stride + 1;
+    int expected_h = 0;
+    int expected_w = 0;
+    if (!convolution_output_dim(input->height, kernel, stride, padding, &expected_h) ||
+        !convolution_output_dim(input->width, kernel, stride, padding, &expected_w)) {
+        return DET_ERR_SHAPE;
+    }
     if (output->channels != out_channels || output->height != expected_h ||
         output->width != expected_w) return DET_ERR_SHAPE;
     size_t weight_count = (size_t)out_channels * (size_t)input->channels *
@@ -185,11 +211,12 @@ det_status det_conv2d_backward_f32(const det_tensor_f32 *input, const float *wei
         grad_weights == NULL || grad_bias == NULL || input->data == NULL ||
         grad_output->data == NULL || grad_input->data == NULL || out_channels <= 0 ||
         kernel <= 0 || stride <= 0 || padding < 0) return DET_ERR_ARGUMENT;
-    int numerator_h = input->height + 2 * padding - kernel;
-    int numerator_w = input->width + 2 * padding - kernel;
-    if (numerator_h < 0 || numerator_w < 0) return DET_ERR_SHAPE;
-    int output_h = numerator_h / stride + 1;
-    int output_w = numerator_w / stride + 1;
+    int output_h = 0;
+    int output_w = 0;
+    if (!convolution_output_dim(input->height, kernel, stride, padding, &output_h) ||
+        !convolution_output_dim(input->width, kernel, stride, padding, &output_w)) {
+        return DET_ERR_SHAPE;
+    }
     if (grad_output->channels != out_channels || grad_output->height != output_h ||
         grad_output->width != output_w || grad_input->channels != input->channels ||
         grad_input->height != input->height || grad_input->width != input->width) {
@@ -377,79 +404,88 @@ static void free_head(det_head *head) {
     memset(head, 0, sizeof(*head));
 }
 
-static void free_feature_adapter(det_model *model) {
-    if (model == NULL) return;
-    free(model->feature_weights);
-    free(model->feature_bias);
-    free(model->feature_velocity_w);
-    free(model->feature_velocity_b);
-    free(model->stem_weights);
-    free(model->stem_bias);
-    free(model->stem_velocity_w);
-    free(model->stem_velocity_b);
-    free(model->integral);
-    free(model->integral_sq);
-    free(model->input_integral);
-    model->feature_weights = NULL;
-    model->feature_bias = NULL;
-    model->feature_velocity_w = NULL;
-    model->feature_velocity_b = NULL;
-    model->stem_weights = NULL;
-    model->stem_bias = NULL;
-    model->stem_velocity_w = NULL;
-    model->stem_velocity_b = NULL;
-    model->integral = NULL;
-    model->integral_sq = NULL;
-    model->input_integral = NULL;
+static void free_stage(det_stage *stage) {
+    if (stage == NULL) return;
+    free(stage->weights);
+    free(stage->bias);
+    free(stage->velocity_w);
+    free(stage->velocity_b);
+    free(stage->gradient_w);
+    free(stage->gradient_b);
+    free(stage->activation);
+    free(stage->gradient_output);
+    free(stage->gradient_input);
+    memset(stage, 0, sizeof(*stage));
 }
 
-static int alloc_integrals(det_model *model) {
-    size_t stride = (size_t)model->spec.width + 1U;
-    size_t count = stride * ((size_t)model->spec.height + 1U);
-    model->integral = (float *)calloc(count, sizeof(float));
-    model->integral_sq = (float *)calloc(count, sizeof(float));
-    model->input_integral = (float *)calloc((size_t)model->spec.channels * count, sizeof(float));
-    return model->integral != NULL && model->integral_sq != NULL && model->input_integral != NULL;
+static size_t stage_weight_count(const det_stage *stage) {
+    size_t channels = stage->depthwise ? (size_t)stage->output_channels :
+                      (size_t)stage->output_channels * (size_t)stage->input_channels;
+    return channels * (size_t)stage->kernel * (size_t)stage->kernel;
 }
 
-static void build_integrals(det_model *model, const det_image *image) {
-    size_t stride = (size_t)image->width + 1U;
-    size_t count = stride * ((size_t)image->height + 1U);
-    memset(model->integral, 0, count * sizeof(float));
-    memset(model->integral_sq, 0, count * sizeof(float));
-    for (int y = 1; y <= image->height; ++y) {
-        float row_sum = 0.0f;
-        float row_sq = 0.0f;
-        for (int x = 1; x <= image->width; ++x) {
-            float value = 0.0f;
-            for (int c = 0; c < image->channels; ++c) {
-                value += image->data[((size_t)c * (size_t)image->height + (size_t)(y - 1)) *
-                                     (size_t)image->width + (size_t)(x - 1)];
-            }
-            value /= (float)image->channels;
-            row_sum += value;
-            row_sq += value * value;
-            size_t current = (size_t)y * stride + (size_t)x;
-            size_t above = (size_t)(y - 1) * stride + (size_t)x;
-            model->integral[current] = model->integral[above] + row_sum;
-            model->integral_sq[current] = model->integral_sq[above] + row_sq;
-        }
+static size_t stage_weight_index(const det_stage *stage, int oc, int ic, int ky, int kx) {
+    int channel = stage->depthwise ? oc : oc * stage->input_channels + ic;
+    return (((size_t)channel * (size_t)stage->kernel + (size_t)ky) *
+            (size_t)stage->kernel + (size_t)kx);
+}
+
+static int finite_values(const float *values, size_t count) {
+    if (values == NULL) return 0;
+    for (size_t i = 0U; i < count; ++i) {
+        if (!isfinite(values[i])) return 0;
     }
-    size_t plane = stride * ((size_t)image->height + 1U);
-    for (int c = 0; c < image->channels; ++c) {
-        float *integral = model->input_integral + (size_t)c * plane;
-        memset(integral, 0, plane * sizeof(float));
-        for (int y = 1; y <= image->height; ++y) {
-            float row_sum = 0.0f;
-            for (int x = 1; x <= image->width; ++x) {
-                row_sum += image->data[((size_t)c * (size_t)image->height + (size_t)(y - 1)) *
-                                       (size_t)image->width + (size_t)(x - 1)];
-                size_t current = (size_t)y * stride + (size_t)x;
-                size_t above = (size_t)(y - 1) * stride + (size_t)x;
-                integral[current] = integral[above] + row_sum;
-            }
-        }
+    return 1;
+}
+
+static det_status alloc_stage(det_stage *stage, int input_channels, int input_height,
+                              int input_width, int output_channels, int kernel,
+                              int stride, int padding, int depthwise) {
+    if (stage == NULL || input_channels <= 0 || input_height <= 0 || input_width <= 0 ||
+        output_channels <= 0 || kernel <= 0 || stride <= 0 || padding < 0) {
+        return DET_ERR_ARGUMENT;
     }
+    int output_height = 0;
+    int output_width = 0;
+    if (!convolution_output_dim(input_height, kernel, stride, padding, &output_height) ||
+        !convolution_output_dim(input_width, kernel, stride, padding, &output_width)) {
+        return DET_ERR_SHAPE;
+    }
+    if (depthwise && input_channels != output_channels) return DET_ERR_SHAPE;
+    size_t weight_count = (size_t)(depthwise ? output_channels :
+                                   output_channels * input_channels) *
+                          (size_t)kernel * (size_t)kernel;
+    size_t output_count = (size_t)output_channels * (size_t)output_height *
+                          (size_t)output_width;
+    size_t input_count = (size_t)input_channels * (size_t)input_height *
+                         (size_t)input_width;
+    stage->weights = (float *)calloc(weight_count, sizeof(float));
+    stage->bias = (float *)calloc((size_t)output_channels, sizeof(float));
+    stage->velocity_w = (float *)calloc(weight_count, sizeof(float));
+    stage->velocity_b = (float *)calloc((size_t)output_channels, sizeof(float));
+    stage->gradient_w = (float *)calloc(weight_count, sizeof(float));
+    stage->gradient_b = (float *)calloc((size_t)output_channels, sizeof(float));
+    stage->activation = (float *)calloc(output_count, sizeof(float));
+    stage->gradient_output = (float *)calloc(output_count, sizeof(float));
+    stage->gradient_input = (float *)calloc(input_count, sizeof(float));
+    if (stage->weights == NULL || stage->bias == NULL || stage->velocity_w == NULL ||
+        stage->velocity_b == NULL || stage->gradient_w == NULL || stage->gradient_b == NULL ||
+        stage->activation == NULL || stage->gradient_output == NULL ||
+        stage->gradient_input == NULL) {
+        free_stage(stage);
+        return DET_ERR_MEMORY;
+    }
+    stage->input_channels = input_channels;
+    stage->output_channels = output_channels;
+    stage->input_height = input_height;
+    stage->input_width = input_width;
+    stage->output_height = output_height;
+    stage->output_width = output_width;
+    stage->kernel = kernel;
+    stage->stride = stride;
+    stage->padding = padding;
+    stage->depthwise = depthwise;
+    return DET_OK;
 }
 
 static det_status alloc_head(det_head *head, int height, int width, int channels,
@@ -477,7 +513,8 @@ static det_status alloc_head(det_head *head, int height, int width, int channels
 det_status det_model_build(det_context *ctx, const det_model_spec *spec,
                            det_model **out) {
     if (ctx == NULL || spec == NULL || out == NULL || spec->width <= 0 ||
-        spec->height <= 0 || spec->channels <= 0 || spec->num_classes <= 0 ||
+        spec->height <= 0 || spec->width > 4096 || spec->height > 4096 ||
+        spec->channels <= 0 || spec->channels > 4 || spec->num_classes <= 0 ||
         spec->num_classes > DET_MAX_CLASSES || spec->max_detections <= 0) {
         return DET_ERR_ARGUMENT;
     }
@@ -485,35 +522,27 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
     if (model == NULL) return DET_ERR_MEMORY;
     model->ctx = ctx;
     model->spec = *spec;
-    model->feature_channels = 4;
-    size_t feature_weight_count = (size_t)model->feature_channels * 4U;
-    model->feature_weights = (float *)calloc(feature_weight_count, sizeof(float));
-    model->feature_bias = (float *)calloc((size_t)model->feature_channels, sizeof(float));
-    model->feature_velocity_w = (float *)calloc(feature_weight_count, sizeof(float));
-    model->feature_velocity_b = (float *)calloc((size_t)model->feature_channels, sizeof(float));
-    size_t stem_weight_count = (size_t)model->feature_channels * (size_t)spec->channels;
-    model->stem_weights = (float *)calloc(stem_weight_count, sizeof(float));
-    model->stem_bias = (float *)calloc((size_t)model->feature_channels, sizeof(float));
-    model->stem_velocity_w = (float *)calloc(stem_weight_count, sizeof(float));
-    model->stem_velocity_b = (float *)calloc((size_t)model->feature_channels, sizeof(float));
-    if (model->feature_weights == NULL || model->feature_bias == NULL ||
-        model->feature_velocity_w == NULL || model->feature_velocity_b == NULL ||
-        model->stem_weights == NULL || model->stem_bias == NULL ||
-        model->stem_velocity_w == NULL || model->stem_velocity_b == NULL ||
-        !alloc_integrals(model)) {
-        free_feature_adapter(model);
-        free(model);
-        return DET_ERR_MEMORY;
-    }
-    for (int c = 0; c < model->feature_channels; ++c) {
-        model->feature_weights[(size_t)c * 4U + (size_t)c] = 1.0f;
-        if (c < spec->channels) model->stem_weights[(size_t)c * (size_t)spec->channels + (size_t)c] = 1.0f;
+    int stage_height = spec->height;
+    int stage_width = spec->width;
+    for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+        int stage_input_channels = i == 0 ? spec->channels :
+                                   model->stages[i - 1].output_channels;
+        int stage_output_channels = i == 0 ? DET_GRAPH_STEM_CHANNELS : DET_GRAPH_CHANNELS;
+        det_status status = alloc_stage(&model->stages[i], stage_input_channels,
+                                        stage_height, stage_width, stage_output_channels,
+                                        3, 2, 1, i > 1 ? 1 : 0);
+        if (status != DET_OK) {
+            det_model_destroy(model);
+            return status;
+        }
+        stage_height = model->stages[i].output_height;
+        stage_width = model->stages[i].output_width;
     }
     for (int i = 0; i < DET_MAX_SCALES; ++i) {
         int h = (spec->height + k_strides[i] - 1) / k_strides[i];
         int w = (spec->width + k_strides[i] - 1) / k_strides[i];
         int outputs = 4 + spec->num_classes;
-        det_status status = alloc_head(&model->heads[i], h, w, model->feature_channels,
+        det_status status = alloc_head(&model->heads[i], h, w, DET_GRAPH_CHANNELS,
                                        outputs);
         if (status != DET_OK) {
             det_model_destroy(model);
@@ -526,30 +555,14 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
 
 void det_model_destroy(det_model *model) {
     if (model == NULL) return;
+    for (int i = 0; i < DET_GRAPH_STAGES; ++i) free_stage(&model->stages[i]);
     for (int i = 0; i < DET_MAX_SCALES; ++i) free_head(&model->heads[i]);
-    free_feature_adapter(model);
     free(model);
 }
 
 det_status det_model_reset(det_model *model, int seed) {
     if (model == NULL) return DET_ERR_ARGUMENT;
     uint32_t state = (uint32_t)(seed == 0 ? 1 : seed);
-    for (int o = 0; o < model->feature_channels; ++o) {
-        for (int i = 0; i < 4; ++i) {
-            size_t index = (size_t)o * 4U + (size_t)i;
-            model->feature_weights[index] = o == i ? 1.0f : 0.0f;
-            model->feature_velocity_w[index] = 0.0f;
-        }
-        model->feature_bias[o] = 0.0f;
-        model->feature_velocity_b[o] = 0.0f;
-        model->stem_bias[o] = 0.0f;
-        model->stem_velocity_b[o] = 0.0f;
-        for (int i = 0; i < model->spec.channels; ++i) {
-            size_t stem_index = (size_t)o * (size_t)model->spec.channels + (size_t)i;
-            model->stem_weights[stem_index] = o == i ? 1.0f : 0.0f;
-            model->stem_velocity_w[stem_index] = 0.0f;
-        }
-    }
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         det_head *head = &model->heads[s];
         size_t wc = (size_t)head->channels * (size_t)head->outputs;
@@ -564,54 +577,130 @@ det_status det_model_reset(det_model *model, int seed) {
             head->velocity_b[i] = 0.0f;
         }
     }
+    for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
+        det_stage *stage = &model->stages[s];
+        size_t wc = stage_weight_count(stage);
+        for (size_t i = 0U; i < wc; ++i) {
+            state = state * 1664525U + 1013904223U;
+            float r = (float)(state & 0xffffU) / 65535.0f;
+            stage->weights[i] = (r - 0.5f) * 0.04f;
+            stage->velocity_w[i] = 0.0f;
+            stage->gradient_w[i] = 0.0f;
+        }
+        for (int i = 0; i < stage->output_channels; ++i) {
+            stage->bias[i] = 0.0f;
+            stage->velocity_b[i] = 0.0f;
+            stage->gradient_b[i] = 0.0f;
+        }
+        size_t out_count = (size_t)stage->output_channels * (size_t)stage->output_height *
+                           (size_t)stage->output_width;
+        memset(stage->activation, 0, out_count * sizeof(float));
+        memset(stage->gradient_output, 0, out_count * sizeof(float));
+    }
     model->train_updates = 0U;
     return DET_OK;
 }
 
-static void build_stem(det_model *model, const det_image *image) {
-    int pixels = image->width * image->height;
-    float sums[4] = {0.0f};
-    for (int i = 0; i < image->channels; ++i)
-        for (int pixel = 0; pixel < pixels; ++pixel)
-            sums[i] += image->data[(size_t)i * (size_t)pixels + (size_t)pixel];
-    for (int i = 0; i < image->channels; ++i) model->input_mean[i] = sums[i] / (float)pixels;
+static void stage_forward(det_stage *stage, const det_tensor_f32 *input) {
+    det_tensor_f32 output = {stage->activation, stage->output_channels,
+                             stage->output_height, stage->output_width};
+    if (!stage->depthwise) {
+        (void)det_conv2d_f32(input, stage->weights, stage->bias,
+                             stage->output_channels, stage->kernel, stage->stride,
+                             stage->padding, &output);
+        det_relu_inplace(&output);
+        return;
+    }
+    for (int c = 0; c < stage->output_channels; ++c) {
+        for (int oy = 0; oy < stage->output_height; ++oy) {
+            for (int ox = 0; ox < stage->output_width; ++ox) {
+                float sum = stage->bias[c];
+                for (int ky = 0; ky < stage->kernel; ++ky) {
+                    int iy = oy * stage->stride + ky - stage->padding;
+                    if (iy < 0 || iy >= stage->input_height) continue;
+                    for (int kx = 0; kx < stage->kernel; ++kx) {
+                        int ix = ox * stage->stride + kx - stage->padding;
+                        if (ix < 0 || ix >= stage->input_width) continue;
+                        size_t weight_index = stage_weight_index(stage, c, c, ky, kx);
+                        sum += stage->weights[weight_index] *
+                               input->data[tensor_index(input, c, iy, ix)];
+                    }
+                }
+                if (sum < 0.0f) sum = 0.0f;
+                output.data[tensor_index(&output, c, oy, ox)] = sum;
+            }
+        }
+    }
+}
+
+static void stage_backward(det_stage *stage, const det_tensor_f32 *input,
+                           const det_tensor_f32 *grad_output,
+                           det_tensor_f32 *grad_input) {
+    if (!stage->depthwise) {
+        (void)det_conv2d_backward_f32(input, stage->weights, grad_output,
+                                      stage->output_channels, stage->kernel,
+                                      stage->stride, stage->padding, grad_input,
+                                      stage->gradient_w, stage->gradient_b);
+        return;
+    }
+    size_t input_count = (size_t)stage->input_channels * (size_t)stage->input_height *
+                         (size_t)stage->input_width;
+    size_t weight_count = stage_weight_count(stage);
+    memset(grad_input->data, 0, input_count * sizeof(float));
+    memset(stage->gradient_w, 0, weight_count * sizeof(float));
+    memset(stage->gradient_b, 0, (size_t)stage->output_channels * sizeof(float));
+    for (int c = 0; c < stage->output_channels; ++c) {
+        for (int oy = 0; oy < stage->output_height; ++oy) {
+            for (int ox = 0; ox < stage->output_width; ++ox) {
+                float go = grad_output->data[tensor_index(grad_output, c, oy, ox)];
+                stage->gradient_b[c] += go;
+                for (int ky = 0; ky < stage->kernel; ++ky) {
+                    int iy = oy * stage->stride + ky - stage->padding;
+                    if (iy < 0 || iy >= stage->input_height) continue;
+                    for (int kx = 0; kx < stage->kernel; ++kx) {
+                        int ix = ox * stage->stride + kx - stage->padding;
+                        if (ix < 0 || ix >= stage->input_width) continue;
+                        size_t weight_index = stage_weight_index(stage, c, c, ky, kx);
+                        size_t input_index = tensor_index(input, c, iy, ix);
+                        stage->gradient_w[weight_index] += go * input->data[input_index];
+                        grad_input->data[input_index] += go * stage->weights[weight_index];
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void backbone_forward(det_model *model, const det_image *image) {
+    for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+        det_stage *stage = &model->stages[i];
+        det_tensor_f32 input;
+        if (i == 0) {
+            input.data = (float *)image->data;
+            input.channels = image->channels;
+            input.height = image->height;
+            input.width = image->width;
+        } else {
+            det_stage *previous = &model->stages[i - 1];
+            input.data = previous->activation;
+            input.channels = previous->output_channels;
+            input.height = previous->output_height;
+            input.width = previous->output_width;
+        }
+        stage_forward(stage, &input);
+    }
 }
 
 static void extract_feature(const det_model *model, const det_image *image, int scale,
                             int cell_y, int cell_x, float features[4], float base[4]) {
-    int stride = k_strides[scale];
-    int x0 = cell_x * stride;
-    int y0 = cell_y * stride;
-    int x1 = x0 + stride;
-    int y1 = y0 + stride;
-    if (x1 > image->width) x1 = image->width;
-    if (y1 > image->height) y1 = image->height;
-    int count = (x1 - x0) * (y1 - y0);
-    float pooled[4] = {0.0f};
-    size_t integral_stride = (size_t)image->width + 1U;
-    size_t a = (size_t)y0 * integral_stride + (size_t)x0;
-    size_t b = (size_t)y0 * integral_stride + (size_t)x1;
-    size_t below = (size_t)y1 * integral_stride + (size_t)x0;
-    size_t d = (size_t)y1 * integral_stride + (size_t)x1;
-    for (int i = 0; i < model->feature_channels; ++i) {
-        float transformed = model->stem_bias[i];
-        for (int j = 0; j < image->channels; ++j) {
-            const float *channel_integral = model->input_integral + (size_t)j *
-                                            integral_stride * ((size_t)image->height + 1U);
-            float channel_sum = channel_integral[d] - channel_integral[b] -
-                                channel_integral[below] + channel_integral[a];
-            float channel_mean = count > 0 ? channel_sum / (float)count : 0.0f;
-            transformed += model->stem_weights[(size_t)i * (size_t)image->channels + (size_t)j] * channel_mean;
-        }
-        pooled[i] = transformed;
-    }
-    for (int i = 0; i < model->feature_channels; ++i) {
-        if (base != NULL) base[i] = pooled[i];
-        float value = model->feature_bias[i];
-        for (int j = 0; j < 4; ++j) {
-            value += model->feature_weights[(size_t)i * 4U + (size_t)j] * pooled[j];
-        }
-        features[i] = value;
+    (void)image;
+    const det_stage *stage = &model->stages[scale + 2];
+    det_tensor_f32 tensor = {stage->activation, stage->output_channels,
+                             stage->output_height, stage->output_width};
+    for (int c = 0; c < DET_GRAPH_CHANNELS; ++c) {
+        float value = tensor.data[tensor_index(&tensor, c, cell_y, cell_x)];
+        features[c] = value;
+        if (base != NULL) base[c] = value;
     }
 }
 
@@ -632,81 +721,82 @@ static int choose_scale(const det_box *box, int width, int height) {
     return size < 0.2f ? 0 : (size < 0.5f ? 1 : 2);
 }
 
+static float smooth_l1_loss(float value) {
+    float magnitude = fabsf(value);
+    return magnitude < 1.0f ? 0.5f * magnitude * magnitude : magnitude - 0.5f;
+}
+
+static float smooth_l1_gradient(float value) {
+    float magnitude = fabsf(value);
+    if (magnitude < 1.0f) return value;
+    return value < 0.0f ? -1.0f : 1.0f;
+}
+
+static float centered_distance_iou(const float prediction[4], const float target[4]) {
+    float pl = fmaxf(0.0f, prediction[0]);
+    float pt = fmaxf(0.0f, prediction[1]);
+    float pr = fmaxf(0.0f, prediction[2]);
+    float pb = fmaxf(0.0f, prediction[3]);
+    float tl = fmaxf(0.0f, target[0]);
+    float tt = fmaxf(0.0f, target[1]);
+    float tr = fmaxf(0.0f, target[2]);
+    float tb = fmaxf(0.0f, target[3]);
+    float intersection = (fminf(pl, tl) + fminf(pr, tr)) *
+                         (fminf(pt, tt) + fminf(pb, tb));
+    float prediction_area = (pl + pr) * (pt + pb);
+    float target_area = (tl + tr) * (tt + tb);
+    float union_area = prediction_area + target_area - intersection;
+    return union_area > 0.0f ? intersection / union_area : 0.0f;
+}
+
+static float prediction_loss_gradient(const float *prediction, const float *target,
+                                      int outputs, int positive, float gradient[4 + DET_MAX_CLASSES]) {
+    float loss = 0.0f;
+    for (int o = 0; o < outputs; ++o) gradient[o] = 0.0f;
+    if (positive >= 0) {
+        float iou = centered_distance_iou(prediction, target);
+        loss += 0.5f * (1.0f - iou);
+        for (int o = 0; o < 4; ++o) {
+            float difference = prediction[o] - target[o];
+            loss += 0.5f * smooth_l1_loss(difference);
+            gradient[o] = 0.5f * smooth_l1_gradient(difference);
+        }
+    }
+    for (int o = 4; o < outputs; ++o) {
+        float logit = prediction[o];
+        float target_value = target[o];
+        float softplus = logit > 0.0f ? logit + log1pf(expf(-logit)) : log1pf(expf(logit));
+        loss += softplus - target_value * logit;
+        gradient[o] = det_sigmoid(logit) - target_value;
+    }
+    return loss;
+}
+
 static void update_head(det_head *head, const float features[4], const float *target,
-                        float lr, float momentum) {
+                        int positive, float lr, float momentum) {
     float prediction[4 + DET_MAX_CLASSES];
+    float gradient[4 + DET_MAX_CLASSES];
     head_forward(head, features, prediction);
+    (void)prediction_loss_gradient(prediction, target, head->outputs, positive, gradient);
     for (int o = 0; o < head->outputs; ++o) {
-        float error = prediction[o] - target[o];
         size_t base = (size_t)o * (size_t)head->channels;
         for (int c = 0; c < head->channels; ++c) {
-            float grad = error * features[c];
+            float grad = gradient[o] * features[c];
             head->velocity_w[base + (size_t)c] = momentum * head->velocity_w[base + (size_t)c] + grad;
             head->weights[base + (size_t)c] -= lr * head->velocity_w[base + (size_t)c];
         }
-        head->velocity_b[o] = momentum * head->velocity_b[o] + error;
+        head->velocity_b[o] = momentum * head->velocity_b[o] + gradient[o];
         head->bias[o] -= lr * head->velocity_b[o];
     }
 }
 
-static void feature_gradient_from_error(const det_head *head, const float *prediction,
-                                        const float *target, float gradient[4]) {
-    for (int c = 0; c < 4; ++c) gradient[c] = 0.0f;
+static void feature_gradient_from_error(const det_head *head, const float *gradient,
+                                        float feature_gradient[4]) {
+    for (int c = 0; c < 4; ++c) feature_gradient[c] = 0.0f;
     for (int o = 0; o < head->outputs; ++o) {
-        float error = prediction[o] - target[o];
         for (int c = 0; c < 4; ++c) {
-            gradient[c] += error * head->weights[(size_t)o * (size_t)head->channels + (size_t)c];
-        }
-    }
-}
-
-static void update_feature_adapter(det_model *model, const float base[4],
-                                    const float gradient[4], float lr, float momentum) {
-    for (int o = 0; o < model->feature_channels; ++o) {
-        for (int i = 0; i < 4; ++i) {
-            size_t index = (size_t)o * 4U + (size_t)i;
-            float grad = gradient[o] * base[i];
-            model->feature_velocity_w[index] = momentum * model->feature_velocity_w[index] + grad;
-            model->feature_weights[index] -= lr * model->feature_velocity_w[index];
-        }
-        model->feature_velocity_b[o] = momentum * model->feature_velocity_b[o] + gradient[o];
-        model->feature_bias[o] -= lr * model->feature_velocity_b[o];
-    }
-}
-
-static void update_stem(det_model *model, const float gradient[4], float lr, float momentum) {
-    float pooled_gradient[4] = {0.0f};
-    for (int j = 0; j < model->feature_channels; ++j) {
-        for (int o = 0; o < model->feature_channels; ++o) {
-            pooled_gradient[j] += gradient[o] *
-                                  model->feature_weights[(size_t)o * 4U + (size_t)j];
-        }
-    }
-    for (int o = 0; o < model->feature_channels; ++o) {
-        for (int i = 0; i < model->spec.channels; ++i) {
-            size_t index = (size_t)o * (size_t)model->spec.channels + (size_t)i;
-            float grad = pooled_gradient[o] * model->input_mean[i];
-            model->stem_velocity_w[index] = momentum * model->stem_velocity_w[index] + grad;
-            model->stem_weights[index] -= lr * model->stem_velocity_w[index];
-        }
-        model->stem_velocity_b[o] = momentum * model->stem_velocity_b[o] + pooled_gradient[o];
-        model->stem_bias[o] -= lr * model->stem_velocity_b[o];
-    }
-}
-
-static void accumulate_stem_gradient(const det_model *model, const float gradient[4],
-                                     float gradient_w[4][4], float gradient_b[4]) {
-    float pooled_gradient[4] = {0.0f};
-    for (int j = 0; j < model->feature_channels; ++j) {
-        for (int o = 0; o < model->feature_channels; ++o) {
-            pooled_gradient[j] += gradient[o] *
-                                  model->feature_weights[(size_t)o * 4U + (size_t)j];
-        }
-    }
-    for (int o = 0; o < model->feature_channels; ++o) {
-        gradient_b[o] += pooled_gradient[o];
-        for (int i = 0; i < model->spec.channels; ++i) {
-            gradient_w[o][i] += pooled_gradient[o] * model->input_mean[i];
+            feature_gradient[c] += gradient[o] *
+                                   head->weights[(size_t)o * (size_t)head->channels + (size_t)c];
         }
     }
 }
@@ -727,21 +817,173 @@ static void apply_head_gradient(det_head *head, float gradient_w[][4],
     }
 }
 
+static void clear_backbone_gradients(det_model *model) {
+    for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+        det_stage *stage = &model->stages[i];
+        size_t output_count = (size_t)stage->output_channels *
+                              (size_t)stage->output_height * (size_t)stage->output_width;
+        size_t weight_count = stage_weight_count(stage);
+        memset(stage->gradient_output, 0, output_count * sizeof(float));
+        memset(stage->gradient_w, 0, weight_count * sizeof(float));
+        memset(stage->gradient_b, 0, (size_t)stage->output_channels * sizeof(float));
+    }
+}
+
+static void add_feature_gradient_to_backbone(det_model *model, int scale, int y, int x,
+                                             const float gradient[4]) {
+    det_stage *stage = &model->stages[scale + 2];
+    for (int c = 0; c < DET_GRAPH_CHANNELS; ++c) {
+        float value = gradient[c];
+        size_t index = ((size_t)c * (size_t)stage->output_height + (size_t)y) *
+                       (size_t)stage->output_width + (size_t)x;
+        if (stage->activation[index] <= 0.0f) value = 0.0f;
+        stage->gradient_output[index] += value;
+    }
+}
+
+static void accumulate_previous_stage_gradient(det_stage *stage, det_stage *previous) {
+    size_t count = (size_t)stage->input_channels * (size_t)stage->input_height *
+                   (size_t)stage->input_width;
+    for (size_t i = 0U; i < count; ++i) previous->gradient_output[i] += stage->gradient_input[i];
+}
+
+static void backbone_backward(det_model *model, const det_image *image) {
+    for (int i = DET_GRAPH_STAGES - 1; i >= 0; --i) {
+        det_stage *stage = &model->stages[i];
+        size_t output_count = (size_t)stage->output_channels *
+                              (size_t)stage->output_height * (size_t)stage->output_width;
+        for (size_t j = 0U; j < output_count; ++j) {
+            if (stage->activation[j] <= 0.0f) stage->gradient_output[j] = 0.0f;
+        }
+        det_tensor_f32 input;
+        if (i == 0) {
+            input.data = (float *)image->data;
+            input.channels = image->channels;
+            input.height = image->height;
+            input.width = image->width;
+        } else {
+            det_stage *previous = &model->stages[i - 1];
+            input.data = previous->activation;
+            input.channels = previous->output_channels;
+            input.height = previous->output_height;
+            input.width = previous->output_width;
+        }
+        det_tensor_f32 grad_output = {stage->gradient_output, stage->output_channels,
+                                      stage->output_height, stage->output_width};
+        det_tensor_f32 grad_input = {stage->gradient_input, stage->input_channels,
+                                     stage->input_height, stage->input_width};
+        stage_backward(stage, &input, &grad_output, &grad_input);
+        if (i > 0) accumulate_previous_stage_gradient(stage, &model->stages[i - 1]);
+    }
+}
+
+static void apply_stage_gradient(det_stage *stage, float lr, float momentum, float scale) {
+    size_t weight_count = stage_weight_count(stage);
+    for (size_t i = 0U; i < weight_count; ++i) {
+        float gradient = stage->gradient_w[i] * scale;
+        stage->velocity_w[i] = momentum * stage->velocity_w[i] + gradient;
+        stage->weights[i] -= lr * stage->velocity_w[i];
+    }
+    for (int i = 0; i < stage->output_channels; ++i) {
+        float gradient = stage->gradient_b[i] * scale;
+        stage->velocity_b[i] = momentum * stage->velocity_b[i] + gradient;
+        stage->bias[i] -= lr * stage->velocity_b[i];
+    }
+}
+
+static int stage_box_target(const det_sample *sample, int stage_index, int x, int y,
+                            float target[4]) {
+    for (int i = 0; i < 4; ++i) target[i] = 0.0f;
+    int stride = 1 << (stage_index + 1);
+    for (int b = 0; b < sample->box_count; ++b) {
+        const det_box *box = &sample->boxes[b];
+        if (box->class_id < 0) continue;
+        int tx = (int)(((box->x1 + box->x2) * 0.5f) / (float)stride);
+        int ty = (int)(((box->y1 + box->y2) * 0.5f) / (float)stride);
+        if (tx != x || ty != y) continue;
+        target[0] = 1.0f;
+        target[1] = ((box->x1 + box->x2) * 0.5f) / (float)sample->image.width;
+        target[2] = ((box->y1 + box->y2) * 0.5f) / (float)sample->image.height;
+        target[3] = fmaxf((box->x2 - box->x1) / (float)sample->image.width,
+                          (box->y2 - box->y1) / (float)sample->image.height);
+        return 1;
+    }
+    return 0;
+}
+
+static void local_update_stage(det_model *model, const det_sample *sample, int stage_index,
+                               size_t sample_index, float lr, float momentum,
+                               size_t *updates) {
+    det_stage *stage = &model->stages[stage_index];
+    const float *input_data = stage_index == 0 ? sample->image.data :
+                              model->stages[stage_index - 1].activation;
+    for (int y = 0; y < stage->output_height; ++y) {
+        for (int x = 0; x < stage->output_width; ++x) {
+            float target[4];
+            int positive = stage_box_target(sample, stage_index, x, y, target);
+            if (!positive && ((x + y + (int)sample_index + stage_index) % 64 != 0)) continue;
+            for (int oc = 0; oc < stage->output_channels; ++oc) {
+                size_t output_index = ((size_t)oc * (size_t)stage->output_height + (size_t)y) *
+                                      (size_t)stage->output_width + (size_t)x;
+                float error = stage->activation[output_index] - target[oc];
+                size_t bias_index = (size_t)oc;
+                stage->velocity_b[bias_index] = momentum * stage->velocity_b[bias_index] + error;
+                stage->bias[bias_index] -= lr * stage->velocity_b[bias_index];
+                for (int ic = 0; ic < stage->input_channels; ++ic) {
+                    if (stage->depthwise && ic != oc) continue;
+                    for (int ky = 0; ky < stage->kernel; ++ky) {
+                        int iy = y * stage->stride + ky - stage->padding;
+                        if (iy < 0 || iy >= stage->input_height) continue;
+                        for (int kx = 0; kx < stage->kernel; ++kx) {
+                            int ix = x * stage->stride + kx - stage->padding;
+                            if (ix < 0 || ix >= stage->input_width) continue;
+                            size_t input_index = ((size_t)ic * (size_t)stage->input_height +
+                                                  (size_t)iy) * (size_t)stage->input_width +
+                                                 (size_t)ix;
+                            size_t weight_index = stage_weight_index(stage, oc, ic, ky, kx);
+                            float gradient = error * input_data[input_index];
+                            stage->velocity_w[weight_index] = momentum * stage->velocity_w[weight_index] + gradient;
+                            stage->weights[weight_index] -= lr * stage->velocity_w[weight_index];
+                        }
+                    }
+                }
+            }
+            ++(*updates);
+        }
+    }
+}
+
+static int validate_sample(const det_model *model, const det_sample *sample) {
+    if (model == NULL || sample == NULL || sample->image.data == NULL ||
+        sample->image.channels != model->spec.channels ||
+        sample->image.height != model->spec.height || sample->image.width != model->spec.width ||
+        sample->box_count < 0 || (sample->box_count > 0 && sample->boxes == NULL)) {
+        return 0;
+    }
+    for (int i = 0; i < sample->box_count; ++i) {
+        const det_box *box = &sample->boxes[i];
+        if (box->class_id < 0 || box->class_id >= model->spec.num_classes ||
+            !isfinite(box->x1) || !isfinite(box->y1) || !isfinite(box->x2) ||
+            !isfinite(box->y2) || box->x1 < 0.0f || box->y1 < 0.0f ||
+            box->x2 > (float)model->spec.width || box->y2 > (float)model->spec.height ||
+            box->x2 <= box->x1 || box->y2 <= box->y1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static float train_sample(det_model *model, const det_sample *sample,
                            const det_train_config *config, size_t sample_index,
                            size_t *updates) {
-    build_integrals(model, &sample->image);
-    build_stem(model, &sample->image);
+    backbone_forward(model, &sample->image);
     float loss = 0.0f;
     float target[4 + DET_MAX_CLASSES];
     float prediction[4 + DET_MAX_CLASSES];
     float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4] = {{{0.0f}}};
     float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES] = {{0.0f}};
-    float feature_gradient_w[4][4] = {{0.0f}};
-    float feature_gradient_b[4] = {0.0f};
-    float stem_gradient_w[4][4] = {{0.0f}};
-    float stem_gradient_b[4] = {0.0f};
     int use_global = config->mode == DET_TRAIN_GLOBAL_BP;
+    if (use_global) clear_backbone_gradients(model);
     size_t terms = 0U;
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         det_head *head = &model->heads[s];
@@ -749,8 +991,7 @@ static float train_sample(det_model *model, const det_sample *sample,
         for (int y = 0; y < head->height; ++y) {
             for (int x = 0; x < head->width; ++x) {
                 float features[4];
-                float base_features[4];
-                extract_feature(model, &sample->image, s, y, x, features, base_features);
+                extract_feature(model, &sample->image, s, y, x, features, NULL);
                 for (int o = 0; o < head->outputs; ++o) target[o] = 0.0f;
                 int positive = -1;
                 const det_box *assigned = NULL;
@@ -781,35 +1022,26 @@ static float train_sample(det_model *model, const det_sample *sample,
                     (void)gy;
                 }
                 head_forward(head, features, prediction);
-                for (int o = 0; o < head->outputs; ++o) {
-                    float error = prediction[o] - target[o];
-                    loss += error * error;
-                    if (use_global) {
-                        gradient_b[s][o] += error;
+                float prediction_gradient[4 + DET_MAX_CLASSES];
+                loss += prediction_loss_gradient(prediction, target, head->outputs,
+                                                  positive, prediction_gradient);
+                if (use_global) {
+                    for (int o = 0; o < head->outputs; ++o) {
+                        gradient_b[s][o] += prediction_gradient[o];
                         for (int c = 0; c < 4; ++c) {
-                            gradient_w[s][o][c] += error * features[c];
+                            gradient_w[s][o][c] += prediction_gradient[o] * features[c];
                         }
                     }
                 }
-                int should_update = positive >= 0 || ((x + y + (int)sample_index) % 8 == 0);
+                int should_update = positive >= 0 || ((x + y + (int)sample_index) % 16 == 0);
                 if (use_global) {
                     float feature_gradient[4];
-                    feature_gradient_from_error(head, prediction, target, feature_gradient);
-                    for (int o = 0; o < model->feature_channels; ++o) {
-                        feature_gradient_b[o] += feature_gradient[o];
-                        for (int i = 0; i < 4; ++i) {
-                            feature_gradient_w[o][i] += feature_gradient[o] * base_features[i];
-                        }
-                    }
-                    accumulate_stem_gradient(model, feature_gradient, stem_gradient_w, stem_gradient_b);
+                    feature_gradient_from_error(head, prediction_gradient, feature_gradient);
+                    add_feature_gradient_to_backbone(model, s, y, x, feature_gradient);
                     ++(*updates);
                 } else if (should_update) {
-                    float feature_gradient[4];
-                    feature_gradient_from_error(head, prediction, target, feature_gradient);
-                    update_head(head, features, target, config->learning_rate, config->momentum);
-                    update_feature_adapter(model, base_features, feature_gradient,
-                                           config->learning_rate, config->momentum);
-                    update_stem(model, feature_gradient, config->learning_rate, config->momentum);
+                    update_head(head, features, target, positive, config->learning_rate,
+                                config->momentum);
                     ++(*updates);
                 }
             }
@@ -821,25 +1053,15 @@ static float train_sample(det_model *model, const det_sample *sample,
             apply_head_gradient(&model->heads[s], gradient_w[s], gradient_b[s],
                                 config->learning_rate, config->momentum, scale);
         }
-        for (int o = 0; o < model->feature_channels; ++o) {
-            for (int i = 0; i < 4; ++i) {
-                size_t index = (size_t)o * 4U + (size_t)i;
-                float grad = feature_gradient_w[o][i] * scale;
-                model->feature_velocity_w[index] = config->momentum * model->feature_velocity_w[index] + grad;
-                model->feature_weights[index] -= config->learning_rate * model->feature_velocity_w[index];
-            }
-            model->feature_velocity_b[o] = config->momentum * model->feature_velocity_b[o] +
-                                           feature_gradient_b[o] * scale;
-            model->feature_bias[o] -= config->learning_rate * model->feature_velocity_b[o];
-            for (int i = 0; i < model->spec.channels; ++i) {
-                size_t index = (size_t)o * (size_t)model->spec.channels + (size_t)i;
-                float grad = stem_gradient_w[o][i] * scale;
-                model->stem_velocity_w[index] = config->momentum * model->stem_velocity_w[index] + grad;
-                model->stem_weights[index] -= config->learning_rate * model->stem_velocity_w[index];
-            }
-            model->stem_velocity_b[o] = config->momentum * model->stem_velocity_b[o] +
-                                        stem_gradient_b[o] * scale;
-            model->stem_bias[o] -= config->learning_rate * model->stem_velocity_b[o];
+        backbone_backward(model, &sample->image);
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            apply_stage_gradient(&model->stages[i], config->learning_rate,
+                                  config->momentum, scale);
+        }
+    } else {
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            local_update_stage(model, sample, i, sample_index, config->learning_rate,
+                               config->momentum, updates);
         }
     }
     return terms > 0U ? loss / (float)terms : 0.0f;
@@ -849,11 +1071,14 @@ det_status det_train(det_model *model, const det_dataset *dataset,
                      const det_train_config *config, det_train_report *report) {
     if (model == NULL || dataset == NULL || config == NULL || report == NULL ||
         dataset->next == NULL || config->epochs <= 0 || config->learning_rate <= 0.0f ||
-        config->momentum < 0.0f || config->momentum >= 1.0f) return DET_ERR_ARGUMENT;
+        config->momentum < 0.0f || config->momentum >= 1.0f ||
+        config->reset_weights < 0 || config->reset_weights > 1) return DET_ERR_ARGUMENT;
     if (config->precision != DET_PRECISION_F32) {
         return DET_ERR_UNSUPPORTED;
     }
-    if (det_model_reset(model, config->seed) != DET_OK) return DET_ERR_MEMORY;
+    if (config->reset_weights != 0 && det_model_reset(model, config->seed) != DET_OK) {
+        return DET_ERR_MEMORY;
+    }
     memset(report, 0, sizeof(*report));
     double start = now_ms();
     float loss_sum = 0.0f;
@@ -864,6 +1089,7 @@ det_status det_train(det_model *model, const det_dataset *dataset,
         size_t seen = 0U;
         while ((config->max_samples <= 0 || seen < (size_t)config->max_samples) &&
                dataset->next(dataset->user, &sample) > 0) {
+            if (!validate_sample(model, &sample)) return DET_ERR_ARGUMENT;
             loss_sum += train_sample(model, &sample, config, seen, &updates);
             ++seen;
             ++report->samples_seen;
@@ -914,8 +1140,7 @@ det_status det_predict(const det_model *model, const det_image *image,
         return DET_ERR_ARGUMENT;
     }
     *count = 0;
-    build_integrals((det_model *)model, image);
-    build_stem((det_model *)model, image);
+    backbone_forward((det_model *)model, image);
     float output[4 + DET_MAX_CLASSES];
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         const det_head *head = &model->heads[s];
@@ -963,30 +1188,48 @@ typedef struct {
     uint32_t channels;
     uint32_t classes;
     uint32_t max_detections;
-    uint32_t feature_channels;
+    uint32_t graph_channels;
+    uint32_t stage_count;
 } det_file_header;
 
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
+    for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
+        const det_stage *stage = &model->stages[s];
+        if (!finite_values(stage->weights, stage_weight_count(stage)) ||
+            !finite_values(stage->bias, (size_t)stage->output_channels)) return DET_ERR_FORMAT;
+    }
+    for (int s = 0; s < DET_MAX_SCALES; ++s) {
+        const det_head *head = &model->heads[s];
+        if (!finite_values(head->weights, (size_t)head->channels * (size_t)head->outputs) ||
+            !finite_values(head->bias, (size_t)head->outputs)) return DET_ERR_FORMAT;
+    }
     FILE *file = fopen(path, "wb");
     if (file == NULL) return DET_ERR_IO;
-    det_file_header header = {{'C', 'D', 'E', 'T'}, 1U, (uint32_t)model->spec.width,
+    det_file_header header = {{'C', 'D', 'E', 'T'}, 3U, (uint32_t)model->spec.width,
                               (uint32_t)model->spec.height, (uint32_t)model->spec.channels,
                               (uint32_t)model->spec.num_classes, (uint32_t)model->spec.max_detections,
-                              (uint32_t)model->feature_channels};
+                              DET_GRAPH_CHANNELS, DET_GRAPH_STAGES};
     int ok = fwrite(&header, sizeof(header), 1U, file) == 1U;
     if (ok) {
-        size_t stem_weight_count = (size_t)model->feature_channels * (size_t)model->spec.channels;
-        ok = fwrite(model->feature_weights, sizeof(float),
-                    (size_t)model->feature_channels * 4U, file) ==
-                 (size_t)model->feature_channels * 4U &&
-             fwrite(model->feature_bias, sizeof(float),
-                    (size_t)model->feature_channels, file) ==
-                 (size_t)model->feature_channels &&
-             fwrite(model->stem_weights, sizeof(float), stem_weight_count, file) == stem_weight_count &&
-             fwrite(model->stem_bias, sizeof(float),
-                    (size_t)model->feature_channels, file) ==
-                 (size_t)model->feature_channels;
+        ok = 1;
+    }
+    for (int s = 0; ok && s < DET_GRAPH_STAGES; ++s) {
+        const det_stage *stage = &model->stages[s];
+        size_t wc = stage_weight_count(stage);
+        ok = fwrite(&stage->input_channels, sizeof(stage->input_channels), 1U, file) == 1U &&
+             fwrite(&stage->output_channels, sizeof(stage->output_channels), 1U, file) == 1U &&
+             fwrite(&stage->input_height, sizeof(stage->input_height), 1U, file) == 1U &&
+             fwrite(&stage->input_width, sizeof(stage->input_width), 1U, file) == 1U &&
+             fwrite(&stage->output_height, sizeof(stage->output_height), 1U, file) == 1U &&
+             fwrite(&stage->output_width, sizeof(stage->output_width), 1U, file) == 1U &&
+             fwrite(&stage->kernel, sizeof(stage->kernel), 1U, file) == 1U &&
+             fwrite(&stage->stride, sizeof(stage->stride), 1U, file) == 1U &&
+             fwrite(&stage->padding, sizeof(stage->padding), 1U, file) == 1U &&
+             fwrite(&stage->depthwise, sizeof(stage->depthwise), 1U, file) == 1U &&
+             fwrite(stage->weights, sizeof(float), wc, file) == wc &&
+             fwrite(stage->bias, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels;
     }
     for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
         const det_head *head = &model->heads[s];
@@ -1006,7 +1249,8 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     if (file == NULL) return DET_ERR_IO;
     det_file_header header;
     int ok = fread(&header, sizeof(header), 1U, file) == 1U;
-    if (!ok || memcmp(header.magic, "CDET", 4U) != 0 || header.version != 1U) {
+    if (!ok || memcmp(header.magic, "CDET", 4U) != 0 || header.version != 3U ||
+        header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES) {
         fclose(file);
         return DET_ERR_FORMAT;
     }
@@ -1018,20 +1262,41 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         fclose(file);
         return status;
     }
-    if ((int)header.feature_channels != model->feature_channels) {
-        det_model_destroy(model);
-        fclose(file);
-        return DET_ERR_FORMAT;
+    ok = 1;
+    for (int s = 0; ok && s < DET_GRAPH_STAGES; ++s) {
+        det_stage *stage = &model->stages[s];
+        int input_channels = 0;
+        int output_channels = 0;
+        int input_height = 0;
+        int input_width = 0;
+        int output_height = 0;
+        int output_width = 0;
+        int kernel = 0;
+        int stride = 0;
+        int padding = 0;
+        int depthwise = 0;
+        size_t wc = stage_weight_count(stage);
+        ok = fread(&input_channels, sizeof(input_channels), 1U, file) == 1U &&
+             fread(&output_channels, sizeof(output_channels), 1U, file) == 1U &&
+             fread(&input_height, sizeof(input_height), 1U, file) == 1U &&
+             fread(&input_width, sizeof(input_width), 1U, file) == 1U &&
+             fread(&output_height, sizeof(output_height), 1U, file) == 1U &&
+             fread(&output_width, sizeof(output_width), 1U, file) == 1U &&
+             fread(&kernel, sizeof(kernel), 1U, file) == 1U &&
+             fread(&stride, sizeof(stride), 1U, file) == 1U &&
+             fread(&padding, sizeof(padding), 1U, file) == 1U &&
+             fread(&depthwise, sizeof(depthwise), 1U, file) == 1U &&
+             input_channels == stage->input_channels && output_channels == stage->output_channels &&
+             input_height == stage->input_height && input_width == stage->input_width &&
+             output_height == stage->output_height && output_width == stage->output_width &&
+             kernel == stage->kernel && stride == stage->stride && padding == stage->padding &&
+             depthwise == stage->depthwise &&
+             fread(stage->weights, sizeof(float), wc, file) == wc &&
+             fread(stage->bias, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels &&
+             finite_values(stage->weights, wc) &&
+             finite_values(stage->bias, (size_t)stage->output_channels);
     }
-    size_t feature_weight_count = (size_t)model->feature_channels * 4U;
-    size_t stem_weight_count = (size_t)model->feature_channels * (size_t)model->spec.channels;
-    ok = fread(model->feature_weights, sizeof(float), feature_weight_count, file) ==
-             feature_weight_count &&
-         fread(model->feature_bias, sizeof(float), (size_t)model->feature_channels, file) ==
-             (size_t)model->feature_channels &&
-         fread(model->stem_weights, sizeof(float), stem_weight_count, file) == stem_weight_count &&
-         fread(model->stem_bias, sizeof(float), (size_t)model->feature_channels, file) ==
-             (size_t)model->feature_channels;
     for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
         det_head *head = &model->heads[s];
         int h = 0;
@@ -1040,7 +1305,9 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         ok = fread(&h, sizeof(h), 1U, file) == 1U && fread(&w, sizeof(w), 1U, file) == 1U &&
              h == head->height && w == head->width &&
              fread(head->weights, sizeof(float), wc, file) == wc &&
-             fread(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs;
+             fread(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
+             finite_values(head->weights, wc) &&
+             finite_values(head->bias, (size_t)head->outputs);
     }
     fclose(file);
     if (!ok) {
