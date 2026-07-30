@@ -1,0 +1,160 @@
+#include "det.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+typedef struct {
+    float *pixels;
+    int width;
+    int height;
+    int channels;
+    int total;
+    int index;
+    det_box box;
+} bench_dataset;
+
+static int next_sample(void *user, det_sample *sample) {
+    bench_dataset *dataset = (bench_dataset *)user;
+    if (dataset->index >= dataset->total) return 0;
+    memset(dataset->pixels, 0, (size_t)dataset->width * (size_t)dataset->height *
+           (size_t)dataset->channels * sizeof(float));
+    int x0 = 8 + (dataset->index * 7) % (dataset->width - 32);
+    int y0 = 8 + (dataset->index * 11) % (dataset->height - 32);
+    int size = 12 + dataset->index % 20;
+    if (x0 + size >= dataset->width) size = dataset->width - x0 - 1;
+    if (y0 + size >= dataset->height) size = dataset->height - y0 - 1;
+    for (int y = y0; y < y0 + size; ++y) {
+        for (int x = x0; x < x0 + size; ++x) {
+            dataset->pixels[(size_t)y * (size_t)dataset->width + (size_t)x] = 1.0f;
+        }
+    }
+    dataset->box.x1 = (float)x0;
+    dataset->box.y1 = (float)y0;
+    dataset->box.x2 = (float)(x0 + size);
+    dataset->box.y2 = (float)(y0 + size);
+    dataset->box.class_id = dataset->index % 4;
+    sample->image.data = dataset->pixels;
+    sample->image.channels = dataset->channels;
+    sample->image.height = dataset->height;
+    sample->image.width = dataset->width;
+    sample->boxes = &dataset->box;
+    sample->box_count = 1;
+    ++dataset->index;
+    return 1;
+}
+
+static void reset_dataset(void *user) {
+    ((bench_dataset *)user)->index = 0;
+}
+
+static int parse_int(const char *value, int fallback) {
+    if (value == NULL) return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0 || parsed > 100000000L) return fallback;
+    return (int)parsed;
+}
+
+static double wall_now_ms(void) {
+    struct timespec ts;
+    (void)timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+int main(int argc, char **argv) {
+    int sample_count = 5000;
+    int width = 160;
+    int height = 160;
+    int global = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) sample_count = parse_int(argv[++i], sample_count);
+        else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = parse_int(argv[++i], width);
+        else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = parse_int(argv[++i], height);
+        else if (strcmp(argv[i], "--global") == 0) global = 1;
+    }
+    if (width < 33 || height < 33) {
+        fprintf(stderr, "width and height must be at least 33\n");
+        return EXIT_FAILURE;
+    }
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model_spec spec = {width, height, 1, 4, 100, 1};
+    det_status status = det_context_create(8U << 20, &ctx);
+    if (status == DET_OK) status = det_model_build(ctx, &spec, &model);
+    if (status != DET_OK) {
+        fprintf(stderr, "bench setup failed: %d\n", status);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    float *pixels = (float *)calloc((size_t)width * (size_t)height, sizeof(float));
+    if (pixels == NULL) {
+        fprintf(stderr, "pixel allocation failed\n");
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    bench_dataset storage = {pixels, width, height, 1, sample_count, 0, {0, 0, 0, 0, 0}};
+    det_dataset dataset = {&storage, next_sample, reset_dataset, (size_t)sample_count};
+    det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
+                               DET_PRECISION_F32, 1, 0.01f, 0.8f, 0.1f,
+                               sample_count, 1};
+    det_train_report report;
+    status = det_train(model, &dataset, &config, &report);
+    if (status != DET_OK) {
+        fprintf(stderr, "training failed: %d\n", status);
+        free(pixels);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    storage.index = 0;
+    det_sample inference_sample;
+    if (!next_sample(&storage, &inference_sample)) {
+        fprintf(stderr, "failed to prepare inference sample\n");
+        free(pixels);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    det_detection detections[100];
+    int detection_count = 0;
+    double infer_start = wall_now_ms();
+    status = det_predict(model, &inference_sample.image, 0.25f, detections, 100, &detection_count);
+    double infer_ms = wall_now_ms() - infer_start;
+    if (status != DET_OK) {
+        fprintf(stderr, "inference failed: %d\n", status);
+        free(pixels);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    const char *model_path = "cdet_bench.model";
+    double io_start = wall_now_ms();
+    det_model *loaded = NULL;
+    status = det_save(model, model_path);
+    if (status == DET_OK) status = det_load(ctx, model_path, &loaded);
+    double io_ms = wall_now_ms() - io_start;
+    (void)remove(model_path);
+    if (status != DET_OK) {
+        fprintf(stderr, "model I/O failed: %d\n", status);
+        free(pixels);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    det_model_destroy(loaded);
+    printf("samples=%d input=%dx%d mode=%s train_core_ms=%.3f train_e2e_ms=%.3f "
+           "infer_ms=%.3f io_ms=%.3f "
+           "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
+           sample_count, width, height, global ? "GLOBAL_BP" : "LOCAL_FAST",
+           report.elapsed_ms, report.elapsed_ms + io_ms, infer_ms, io_ms,
+           report.updates, report.mean_loss,
+           report.elapsed_ms > 0.0 ? (double)sample_count * 1000.0 / report.elapsed_ms : 0.0);
+    free(pixels);
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+    return EXIT_SUCCESS;
+}

@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.16)
+project(c_oloy C)
+
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+option(DET_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+add_library(det STATIC src/det.c)
+target_include_directories(det PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(det PRIVATE /W4)
+else()
+  target_compile_options(det PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+if(DET_ENABLE_ASAN AND NOT MSVC)
+  target_compile_options(det PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(det PRIVATE -fsanitize=address,undefined)
+endif()
+
+enable_testing()
+add_executable(det_tests tests/test_det.c)
+target_link_libraries(det_tests PRIVATE det m)
+add_test(NAME det_tests COMMAND det_tests)
+
+add_executable(det_bench tools/bench.c)
+target_link_libraries(det_bench PRIVATE det m)
+
+if(DET_ENABLE_ASAN AND NOT MSVC)
+  target_compile_options(det_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(det_tests PRIVATE -fsanitize=address,undefined)
+  target_compile_options(det_bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(det_bench PRIVATE -fsanitize=address,undefined)
+endif()

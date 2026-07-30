@@ -1,0 +1,11 @@
+/build/
+/build-asan/
+/build-release/
+*.model
+*.exe
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+Testing/
