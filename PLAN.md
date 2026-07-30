@@ -142,7 +142,9 @@ The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
 target, while the heads use the detector loss. It is not being presented as
 full detector-loss backpropagation. The downstream-loss comparison against
-`GLOBAL_BP` is a required acceptance experiment before selecting this rule.
+`GLOBAL_BP` is a required acceptance experiment before selecting this rule. The
+local stage rule currently uses a straight-through ReLU surrogate to recover
+dead channels; this is intentional and must be included in the ablation.
 
 Training is a single forward stream with local updates:
 

@@ -749,17 +749,32 @@ static float centered_distance_iou(const float prediction[4], const float target
     return union_area > 0.0f ? intersection / union_area : 0.0f;
 }
 
+static void centered_iou_gradient(const float prediction[4], const float target[4],
+                                  float gradient[4]) {
+    const float epsilon = 1.0e-3f;
+    for (int i = 0; i < 4; ++i) {
+        float plus[4] = {prediction[0], prediction[1], prediction[2], prediction[3]};
+        float minus[4] = {prediction[0], prediction[1], prediction[2], prediction[3]};
+        plus[i] += epsilon;
+        minus[i] -= epsilon;
+        gradient[i] = (centered_distance_iou(plus, target) -
+                       centered_distance_iou(minus, target)) / (2.0f * epsilon);
+    }
+}
+
 static float prediction_loss_gradient(const float *prediction, const float *target,
                                       int outputs, int positive, float gradient[4 + DET_MAX_CLASSES]) {
     float loss = 0.0f;
     for (int o = 0; o < outputs; ++o) gradient[o] = 0.0f;
     if (positive >= 0) {
         float iou = centered_distance_iou(prediction, target);
+        float iou_gradient[4];
+        centered_iou_gradient(prediction, target, iou_gradient);
         loss += 0.5f * (1.0f - iou);
         for (int o = 0; o < 4; ++o) {
             float difference = prediction[o] - target[o];
             loss += 0.5f * smooth_l1_loss(difference);
-            gradient[o] = 0.5f * smooth_l1_gradient(difference);
+            gradient[o] = 0.5f * smooth_l1_gradient(difference) - 0.5f * iou_gradient[o];
         }
     }
     for (int o = 4; o < outputs; ++o) {
@@ -925,6 +940,8 @@ static void local_update_stage(det_model *model, const det_sample *sample, int s
             for (int oc = 0; oc < stage->output_channels; ++oc) {
                 size_t output_index = ((size_t)oc * (size_t)stage->output_height + (size_t)y) *
                                       (size_t)stage->output_width + (size_t)x;
+                /* LOCAL_FAST uses a straight-through ReLU surrogate so a dead
+                   stage can receive a positive local target and recover. */
                 float error = stage->activation[output_index] - target[oc];
                 size_t bias_index = (size_t)oc;
                 stage->velocity_b[bias_index] = momentum * stage->velocity_b[bias_index] + error;
@@ -970,7 +987,9 @@ static int validate_sample(const det_model *model, const det_sample *sample) {
             return 0;
         }
     }
-    return 1;
+    size_t pixels = (size_t)sample->image.channels * (size_t)sample->image.height *
+                    (size_t)sample->image.width;
+    return finite_values(sample->image.data, pixels);
 }
 
 static float train_sample(det_model *model, const det_sample *sample,
@@ -1010,16 +1029,12 @@ static float train_sample(det_model *model, const det_sample *sample,
                 }
                 if (positive >= 0 && assigned != NULL) {
                     target[positive + 4] = 1.0f;
-                    float gx = ((assigned->x1 + assigned->x2) * 0.5f) / (float)sample->image.width;
-                    float gy = ((assigned->y1 + assigned->y2) * 0.5f) / (float)sample->image.height;
-                    float cx = ((float)x + 0.5f) / (float)head->width;
-                    float cy = ((float)y + 0.5f) / (float)head->height;
-                    target[0] = fmaxf(0.0f, (cx - assigned->x1 / (float)sample->image.width) * (float)head->width);
-                    target[1] = fmaxf(0.0f, (cy - assigned->y1 / (float)sample->image.height) * (float)head->height);
-                    target[2] = fmaxf(0.0f, (assigned->x2 / (float)sample->image.width - cx) * (float)head->width);
-                    target[3] = fmaxf(0.0f, (assigned->y2 / (float)sample->image.height - cy) * (float)head->height);
-                    (void)gx;
-                    (void)gy;
+                    float center_x = ((float)x + 0.5f) * (float)k_strides[s];
+                    float center_y = ((float)y + 0.5f) * (float)k_strides[s];
+                    target[0] = fmaxf(0.0f, (center_x - assigned->x1) / (float)k_strides[s]);
+                    target[1] = fmaxf(0.0f, (center_y - assigned->y1) / (float)k_strides[s]);
+                    target[2] = fmaxf(0.0f, (assigned->x2 - center_x) / (float)k_strides[s]);
+                    target[3] = fmaxf(0.0f, (assigned->y2 - center_y) / (float)k_strides[s]);
                 }
                 head_forward(head, features, prediction);
                 float prediction_gradient[4 + DET_MAX_CLASSES];
@@ -1072,7 +1087,13 @@ det_status det_train(det_model *model, const det_dataset *dataset,
     if (model == NULL || dataset == NULL || config == NULL || report == NULL ||
         dataset->next == NULL || config->epochs <= 0 || config->learning_rate <= 0.0f ||
         config->momentum < 0.0f || config->momentum >= 1.0f ||
-        config->reset_weights < 0 || config->reset_weights > 1) return DET_ERR_ARGUMENT;
+        config->reset_weights < 0 || config->reset_weights > 1 ||
+        (config->mode != DET_TRAIN_LOCAL_FAST && config->mode != DET_TRAIN_GLOBAL_BP) ||
+        (config->precision != DET_PRECISION_F32 && config->precision != DET_PRECISION_INT8 &&
+         config->precision != DET_PRECISION_W4A8) || !isfinite(config->learning_rate) ||
+        !isfinite(config->momentum) || !isfinite(config->score_threshold)) {
+        return DET_ERR_ARGUMENT;
+    }
     if (config->precision != DET_PRECISION_F32) {
         return DET_ERR_UNSUPPORTED;
     }
@@ -1190,6 +1211,7 @@ typedef struct {
     uint32_t max_detections;
     uint32_t graph_channels;
     uint32_t stage_count;
+    uint64_t train_updates;
 } det_file_header;
 
 det_status det_save(const det_model *model, const char *path) {
@@ -1197,19 +1219,24 @@ det_status det_save(const det_model *model, const char *path) {
     for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
         const det_stage *stage = &model->stages[s];
         if (!finite_values(stage->weights, stage_weight_count(stage)) ||
-            !finite_values(stage->bias, (size_t)stage->output_channels)) return DET_ERR_FORMAT;
+            !finite_values(stage->bias, (size_t)stage->output_channels) ||
+            !finite_values(stage->velocity_w, stage_weight_count(stage)) ||
+            !finite_values(stage->velocity_b, (size_t)stage->output_channels)) return DET_ERR_FORMAT;
     }
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         const det_head *head = &model->heads[s];
         if (!finite_values(head->weights, (size_t)head->channels * (size_t)head->outputs) ||
-            !finite_values(head->bias, (size_t)head->outputs)) return DET_ERR_FORMAT;
+            !finite_values(head->bias, (size_t)head->outputs) ||
+            !finite_values(head->velocity_w, (size_t)head->channels * (size_t)head->outputs) ||
+            !finite_values(head->velocity_b, (size_t)head->outputs)) return DET_ERR_FORMAT;
     }
     FILE *file = fopen(path, "wb");
     if (file == NULL) return DET_ERR_IO;
     det_file_header header = {{'C', 'D', 'E', 'T'}, 3U, (uint32_t)model->spec.width,
                               (uint32_t)model->spec.height, (uint32_t)model->spec.channels,
                               (uint32_t)model->spec.num_classes, (uint32_t)model->spec.max_detections,
-                              DET_GRAPH_CHANNELS, DET_GRAPH_STAGES};
+                              DET_GRAPH_CHANNELS, DET_GRAPH_STAGES,
+                              (uint64_t)model->train_updates};
     int ok = fwrite(&header, sizeof(header), 1U, file) == 1U;
     if (ok) {
         ok = 1;
@@ -1229,6 +1256,9 @@ det_status det_save(const det_model *model, const char *path) {
              fwrite(&stage->depthwise, sizeof(stage->depthwise), 1U, file) == 1U &&
              fwrite(stage->weights, sizeof(float), wc, file) == wc &&
              fwrite(stage->bias, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels &&
+             fwrite(stage->velocity_w, sizeof(float), wc, file) == wc &&
+             fwrite(stage->velocity_b, sizeof(float), (size_t)stage->output_channels, file) ==
                  (size_t)stage->output_channels;
     }
     for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
@@ -1237,7 +1267,10 @@ det_status det_save(const det_model *model, const char *path) {
         ok = fwrite(&head->height, sizeof(head->height), 1U, file) == 1U &&
              fwrite(&head->width, sizeof(head->width), 1U, file) == 1U &&
              fwrite(head->weights, sizeof(float), wc, file) == wc &&
-             fwrite(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs;
+             fwrite(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
+             fwrite(head->velocity_w, sizeof(float), wc, file) == wc &&
+             fwrite(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
+                 (size_t)head->outputs;
     }
     int close_result = fclose(file);
     return ok && close_result == 0 ? DET_OK : DET_ERR_IO;
@@ -1294,8 +1327,13 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
              fread(stage->weights, sizeof(float), wc, file) == wc &&
              fread(stage->bias, sizeof(float), (size_t)stage->output_channels, file) ==
                  (size_t)stage->output_channels &&
+             fread(stage->velocity_w, sizeof(float), wc, file) == wc &&
+             fread(stage->velocity_b, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels &&
              finite_values(stage->weights, wc) &&
-             finite_values(stage->bias, (size_t)stage->output_channels);
+             finite_values(stage->bias, (size_t)stage->output_channels) &&
+             finite_values(stage->velocity_w, wc) &&
+             finite_values(stage->velocity_b, (size_t)stage->output_channels);
     }
     for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
         det_head *head = &model->heads[s];
@@ -1306,14 +1344,24 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
              h == head->height && w == head->width &&
              fread(head->weights, sizeof(float), wc, file) == wc &&
              fread(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
+             fread(head->velocity_w, sizeof(float), wc, file) == wc &&
+             fread(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
+                 (size_t)head->outputs &&
              finite_values(head->weights, wc) &&
-             finite_values(head->bias, (size_t)head->outputs);
+             finite_values(head->bias, (size_t)head->outputs) &&
+             finite_values(head->velocity_w, wc) &&
+             finite_values(head->velocity_b, (size_t)head->outputs);
     }
     fclose(file);
     if (!ok) {
         det_model_destroy(model);
         return DET_ERR_FORMAT;
     }
+    if (header.train_updates > SIZE_MAX) {
+        det_model_destroy(model);
+        return DET_ERR_FORMAT;
+    }
+    model->train_updates = (size_t)header.train_updates;
     *out = model;
     return DET_OK;
 }
