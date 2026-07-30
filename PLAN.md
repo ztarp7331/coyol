@@ -61,10 +61,11 @@ larger 16/24/40/64/96-channel research configuration in the table below.
 The sub-second training gate therefore remains open; the next optimization
 checkpoint must reduce measured `train_e2e_ms` below 1,000 ms rather than
 relabel this near-miss as success.
-The current 5,000-image `LOCAL_FAST` smoke benchmark produces detections at a
-0.20 threshold but none at the conventional 0.25 threshold; the synthetic
-overfit test passes, but confidence calibration and the larger functional/
-accuracy gate remain open. The benchmark exposes `--threshold` for this reason.
+The current 5,000-image `LOCAL_FAST` smoke benchmark produces top-K detections
+at the conventional 0.25 threshold after the background-control ablation; the
+synthetic overfit test passes, but localization quality, confidence
+calibration, and the larger functional/accuracy gate remain open. The
+benchmark exposes `--threshold` for repeatable calibration measurements.
 
 Two training times must be published:
 
@@ -164,7 +165,7 @@ full detector-loss backpropagation. The downstream-loss comparison against
 `GLOBAL_BP` is a required acceptance experiment before selecting this rule. The
 local stage rule currently uses a straight-through ReLU surrogate to recover
 dead channels; this is intentional and must be included in the ablation.
-The local head path also down-weights sparse background BCE updates to 0.01 of
+The local head path also down-weights sparse background BCE updates to 0.001 of
 the positive-cell signal; this is a measured imbalance control, not part of
 `GLOBAL_BP`.
 

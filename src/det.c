@@ -1089,7 +1089,7 @@ static void update_head(det_head *head, const float features[4], const float *ta
         /* LOCAL_FAST sees many more background cells than positives. Keep a
            sparse negative signal without allowing BCE bias updates to erase
            the one-to-one class evidence. GLOBAL_BP keeps the full loss. */
-        for (int o = 4; o < head->outputs; ++o) gradient[o] *= 0.01f;
+        for (int o = 4; o < head->outputs; ++o) gradient[o] *= 0.001f;
     }
     for (int o = 0; o < head->outputs; ++o) {
         size_t base = (size_t)o * (size_t)head->channels;
