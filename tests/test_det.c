@@ -6,6 +6,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Assertions in this executable are checks, not optional documentation: keep
+ * their expressions live in Release so setup calls cannot disappear. */
+#ifdef NDEBUG
+#undef assert
+#define assert(expression) \
+    do { \
+        if (!(expression)) { \
+            fprintf(stderr, "test assertion failed: %s (%s:%d)\n", #expression, \
+                    __FILE__, __LINE__); \
+            abort(); \
+        } \
+    } while (0)
+#endif
+
 typedef struct {
     det_sample sample;
     int emitted;
@@ -76,11 +90,18 @@ static void test_math(void) {
     assert(det_quantize_s8(1.0f, 0.01f) == 100);
     assert(det_quantize_s8(3.0f, 0.01f) == 127);
     assert(det_requantize_i32(100, 1, 1, 0) == 50);
+    assert(det_requantize_i32(INT64_MAX, INT32_MAX, 0, 0) == 127);
+    assert(det_requantize_i32(INT64_MIN, INT32_MAX, 0, 0) == -128);
+    assert(det_requantize_i32(1, 1, 1, 0) == 1);
+    assert(det_requantize_i32(-1, 1, 1, 0) == -1);
     float weights[6] = {-2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 0.5f};
     int8_t q8[6];
     float scales8[2];
     assert(det_quantize_per_channel_s8(weights, 2, 3, q8, scales8) == DET_OK);
     assert(q8[0] == -127 && q8[2] == 0);
+    weights[0] = INFINITY;
+    assert(det_quantize_per_channel_s8(weights, 2, 3, q8, scales8) == DET_ERR_ARGUMENT);
+    weights[0] = -2.0f;
     uint8_t q4[4];
     float scales4[2];
     assert(det_quantize_pack_w4(weights, 2, 3, q4, scales4) == DET_OK);
@@ -120,6 +141,10 @@ static void test_train_predict_roundtrip(void) {
     assert(det_predict(model, &image, 0.0f, top_one, 1, &top_count) == DET_OK);
     assert(top_count == 1);
     assert(top_one[0].score >= detections[0].score - 1e-6f);
+    float saved_pixel = image_data[0];
+    image_data[0] = NAN;
+    assert(det_predict(model, &image, 0.1f, detections, 16, &count) == DET_ERR_ARGUMENT);
+    image_data[0] = saved_pixel;
 
     config.mode = DET_TRAIN_GLOBAL_BP;
     config.epochs = 2;
@@ -147,6 +172,47 @@ static void test_train_predict_roundtrip(void) {
         assert(model_detections[i].box.class_id == loaded_detections[i].box.class_id);
     }
     det_model_destroy(loaded);
+    FILE *corrupt = fopen(path, "r+b");
+    assert(corrupt != NULL);
+    assert(fseek(corrupt, 32L, SEEK_SET) == 0);
+    int byte = fgetc(corrupt);
+    assert(byte != EOF);
+    assert(fseek(corrupt, 32L, SEEK_SET) == 0);
+    unsigned char changed = (unsigned char)byte ^ 0x01U;
+    assert(fwrite(&changed, 1U, 1U, corrupt) == 1U);
+    assert(fclose(corrupt) == 0);
+    det_model *corrupt_model = NULL;
+    assert(det_load(ctx, path, &corrupt_model) == DET_ERR_FORMAT);
+    assert(det_model_set_precision(model, DET_PRECISION_INT8) == DET_OK);
+    assert(det_model_precision(model) == DET_PRECISION_INT8);
+    int int8_count = 0;
+    assert(det_predict(model, &image, 0.1f, detections, 16, &int8_count) == DET_OK);
+    assert(int8_count > 0);
+    for (int i = 0; i < int8_count; ++i) assert(isfinite(detections[i].score));
+    assert(det_model_set_precision(model, DET_PRECISION_W4A8) == DET_OK);
+    int w4_count = 0;
+    assert(det_predict(model, &image, 0.1f, detections, 16, &w4_count) == DET_OK);
+    assert(w4_count > 0);
+    for (int i = 0; i < w4_count; ++i) assert(isfinite(detections[i].score));
+    det_detection w4_detections[16];
+    memcpy(w4_detections, detections, (size_t)w4_count * sizeof(*detections));
+    const char *quant_path = "det_test_quantized.cdet";
+    assert(det_save(model, quant_path) == DET_OK);
+    det_model *loaded_quant = NULL;
+    assert(det_load(ctx, quant_path, &loaded_quant) == DET_OK);
+    assert(det_model_precision(loaded_quant) == DET_PRECISION_W4A8);
+    int loaded_quant_count = 0;
+    det_detection loaded_quant_detections[16];
+    assert(det_predict(loaded_quant, &image, 0.1f, loaded_quant_detections, 16,
+                       &loaded_quant_count) == DET_OK);
+    assert(loaded_quant_count == w4_count);
+    for (int i = 0; i < w4_count; ++i) {
+        assert(fabsf(w4_detections[i].score - loaded_quant_detections[i].score) < 1e-6f);
+        assert(fabsf(w4_detections[i].box.x1 - loaded_quant_detections[i].box.x1) < 1e-6f);
+        assert(w4_detections[i].box.class_id == loaded_quant_detections[i].box.class_id);
+    }
+    det_model_destroy(loaded_quant);
+    (void)remove(quant_path);
     (void)remove(path);
     det_model_destroy(model);
     det_context_destroy(ctx);

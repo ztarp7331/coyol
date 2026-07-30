@@ -58,6 +58,16 @@ static int parse_int(const char *value, int fallback) {
     return (int)parsed;
 }
 
+static int parse_precision(const char *value, det_precision *out) {
+    if (value == NULL || out == NULL) return 0;
+    if (strcmp(value, "f32") == 0) *out = DET_PRECISION_F32;
+    else if (strcmp(value, "int8") == 0) *out = DET_PRECISION_INT8;
+    else if (strcmp(value, "w4a8") == 0 || strcmp(value, "int4") == 0) {
+        *out = DET_PRECISION_W4A8;
+    } else return 0;
+    return 1;
+}
+
 static double wall_now_ms(void) {
     struct timespec ts;
     (void)timespec_get(&ts, TIME_UTC);
@@ -69,16 +79,24 @@ int main(int argc, char **argv) {
     int width = 160;
     int height = 160;
     int global = 0;
+    det_precision precision = DET_PRECISION_F32;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) sample_count = parse_int(argv[++i], sample_count);
         else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = parse_int(argv[++i], width);
         else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) height = parse_int(argv[++i], height);
+        else if (strcmp(argv[i], "--precision") == 0) {
+            if (i + 1 >= argc || !parse_precision(argv[++i], &precision)) {
+                fprintf(stderr, "precision must be f32, int8, or w4a8\n");
+                return EXIT_FAILURE;
+            }
+        }
         else if (strcmp(argv[i], "--global") == 0) global = 1;
     }
     if (width < 33 || height < 33) {
         fprintf(stderr, "width and height must be at least 33\n");
         return EXIT_FAILURE;
     }
+    double e2e_start = wall_now_ms();
     det_context *ctx = NULL;
     det_model *model = NULL;
     det_model_spec spec = {width, height, 1, 4, 100, 1};
@@ -110,6 +128,14 @@ int main(int argc, char **argv) {
         det_context_destroy(ctx);
         return EXIT_FAILURE;
     }
+    status = det_model_set_precision(model, precision);
+    if (status != DET_OK) {
+        fprintf(stderr, "precision setup failed: %d\n", status);
+        free(pixels);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
     storage.index = 0;
     det_sample inference_sample;
     if (!next_sample(&storage, &inference_sample)) {
@@ -121,9 +147,17 @@ int main(int argc, char **argv) {
     }
     det_detection detections[100];
     int detection_count = 0;
+    for (int warmup = 0; warmup < 3; ++warmup) {
+        status = det_predict(model, &inference_sample.image, 0.25f, detections, 100,
+                             &detection_count);
+        if (status != DET_OK) break;
+    }
     double infer_start = wall_now_ms();
-    status = det_predict(model, &inference_sample.image, 0.25f, detections, 100, &detection_count);
-    double infer_ms = wall_now_ms() - infer_start;
+    for (int repeat = 0; status == DET_OK && repeat < 10; ++repeat) {
+        status = det_predict(model, &inference_sample.image, 0.25f, detections, 100,
+                             &detection_count);
+    }
+    double infer_ms = (wall_now_ms() - infer_start) / 10.0;
     if (status != DET_OK) {
         fprintf(stderr, "inference failed: %d\n", status);
         free(pixels);
@@ -146,13 +180,17 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     det_model_destroy(loaded);
-    printf("samples=%d input=%dx%d mode=%s train_core_ms=%.3f train_e2e_ms=%.3f "
+    double train_e2e_ms = wall_now_ms() - e2e_start;
+    const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
+                                 (precision == DET_PRECISION_W4A8 ? "W4A8" : "F32");
+    printf("samples=%d input=%dx%d mode=%s precision=%s train_core_ms=%.3f train_e2e_ms=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           sample_count, width, height, global ? "GLOBAL_BP" : "LOCAL_FAST",
-           report.elapsed_ms, report.elapsed_ms + io_ms, infer_ms, io_ms,
+           sample_count, width, height, global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name,
+           report.elapsed_ms, train_e2e_ms, infer_ms, io_ms,
            report.updates, report.mean_loss,
-           report.elapsed_ms > 0.0 ? (double)sample_count * 1000.0 / report.elapsed_ms : 0.0);
+           report.elapsed_ms > 0.0 ? (double)sample_count * 1000.0 / report.elapsed_ms : 0.0,
+           detection_count);
     free(pixels);
     det_model_destroy(model);
     det_context_destroy(ctx);

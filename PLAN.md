@@ -52,12 +52,18 @@ inference and 6.8--21.0 ms model save/load. These are performance baselines,
 not claims that the final detector has already passed the accuracy or
 architecture gates.
 
-After wiring the first spatial backbone, the compact edge profile measured
-915--993 ms `LOCAL_FAST` training, 0.12--0.20 ms inference, and 6.8--23.4 ms save/load for
-the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
+After wiring the first spatial backbone, the compact edge profile has measured
+about 1.13--1.22 s `LOCAL_FAST` end-to-end training, 0.13--1.04 ms repeated
+inference, and 15--31 ms save/load for the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
 channel, one learned 3 x 3 expansion stage, and three depthwise 3 x 3 pyramid
 stages. It is an executable edge variant of the architecture, not yet the
 larger 16/24/40/64/96-channel research configuration in the table below.
+The sub-second training gate therefore remains open; the next optimization
+checkpoint must reduce measured `train_e2e_ms` below 1,000 ms rather than
+relabel this near-miss as success.
+The current 5,000-image `LOCAL_FAST` smoke benchmark also produces zero
+detections at the 0.25 confidence threshold; the synthetic overfit test passes,
+but the larger functional/accuracy gate remains open.
 
 Two training times must be published:
 
@@ -132,6 +138,18 @@ validated. The stage weights are learned from scratch, P3/P4/P5 are real
 spatial feature maps, and `GLOBAL_BP` uses convolutional backward operators.
 The larger channel table remains the next scale-up experiment, not a claim
 about the current binary.
+
+The current deployment API exposes `det_model_set_precision` for FP32, INT8,
+and W4A8. INT8 and W4A8 inference quantize activations per tensor, use
+per-output-channel weight scales, accumulate integer products, and dequantize
+only at each stage output. Training remains FP32 until quantization-aware
+training is added. Quantized accuracy loss still requires the planned
+validation gate.
+
+On the same 160 x 160 Release benchmark, repeated quantized inference has
+measured about 0.8--1.9 ms across INT8 and W4A8 runs. The model file now carries the
+quantized buffers and scales, so a quantized load is self-contained; these are
+latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
 
 ### 2.2 Fast full-model learning
 
@@ -306,10 +324,11 @@ Use per-output-channel symmetric weight scales, per-tensor activation scales,
 INT32 accumulation, and integer multiplier-plus-shift requantization. Precision
 profiles are compiled separately rather than switched at runtime.
 
-The versioned `CDET` model contains graph metadata, tensor shapes, training
-mode, quantization parameters, packed weights, arena requirements, checksums,
-and an architecture hash. It never serializes native pointers or
-compiler-dependent structs.
+The current version-5 `CDET` model contains graph metadata, tensor shapes,
+FP32 optimizer state, quantized buffers/scales, and a CRC32 over the payload.
+It does not serialize pointers. The on-disk integers/floats are still native
+ABI fields; a portable endian-neutral format and atomic replacement are
+explicit follow-up hardening work, not silently assumed properties.
 
 ## 4. Implementation phases
 

@@ -146,6 +146,8 @@ det_status det_upsample_nearest(const det_tensor_f32 *input, int scale,
 
 det_status det_model_build(det_context *ctx, const det_model_spec *spec,
                            det_model **out);
+det_status det_model_set_precision(det_model *model, det_precision precision);
+det_precision det_model_precision(const det_model *model);
 void det_model_destroy(det_model *model);
 det_status det_model_reset(det_model *model, int seed);
 

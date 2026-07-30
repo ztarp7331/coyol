@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 struct det_context {
     uint8_t *arena_memory;
@@ -22,6 +25,9 @@ typedef struct {
     float *bias;
     float *velocity_w;
     float *velocity_b;
+    int8_t *quant_weights;
+    uint8_t *packed_weights;
+    float *quant_scales;
 } det_head;
 
 enum { DET_GRAPH_CHANNELS = 4, DET_GRAPH_STEM_CHANNELS = 1, DET_GRAPH_STAGES = 5 };
@@ -43,6 +49,9 @@ typedef struct {
     float *velocity_b;
     float *gradient_w;
     float *gradient_b;
+    int8_t *quant_weights;
+    uint8_t *packed_weights;
+    float *quant_scales;
     float *activation;
     float *gradient_output;
     float *gradient_input;
@@ -53,12 +62,26 @@ struct det_model {
     det_model_spec spec;
     det_stage stages[DET_GRAPH_STAGES];
     det_head heads[DET_MAX_SCALES];
+    det_precision precision;
     size_t train_updates;
 };
 
 static const int k_strides[DET_MAX_SCALES] = {8, 16, 32};
 
 static double now_ms(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+    if (QueryPerformanceCounter(&counter) && QueryPerformanceFrequency(&frequency) &&
+        frequency.QuadPart > 0) {
+        return (double)counter.QuadPart * 1000.0 / (double)frequency.QuadPart;
+    }
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+    }
+#endif
     struct timespec ts;
     (void)timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
@@ -80,6 +103,12 @@ static size_t align_up_size(size_t value, size_t alignment) {
     size_t mask = alignment - 1U;
     if (value > SIZE_MAX - mask) return SIZE_MAX;
     return (value + mask) & ~mask;
+}
+
+static int checked_add_size(size_t left, size_t right, size_t *out) {
+    if (out == NULL || left > SIZE_MAX - right) return 0;
+    *out = left + right;
+    return 1;
 }
 
 det_status det_context_create(size_t arena_bytes, det_context **out) {
@@ -319,7 +348,7 @@ float det_iou(const det_box *a, const det_box *b) {
 }
 
 int8_t det_quantize_s8(float value, float scale) {
-    if (!(scale > 0.0f) || !isfinite(value)) return 0;
+    if (!(scale > 0.0f) || !isfinite(scale) || !isfinite(value)) return 0;
     float scaled = value / scale;
     if (scaled > 127.0f) scaled = 127.0f;
     if (scaled < -127.0f) scaled = -127.0f;
@@ -332,16 +361,28 @@ int8_t det_quantize_s8(float value, float scale) {
 int8_t det_requantize_i32(int64_t accumulator, int32_t multiplier, int shift,
                           int32_t zero_point) {
     if (shift < 0 || shift > 62) return 0;
-    int64_t scaled = accumulator * (int64_t)multiplier;
-    int64_t rounded = scaled;
+#if defined(__SIZEOF_INT128__)
+    __extension__ typedef __int128 det_int128_t;
+    det_int128_t scaled = (det_int128_t)accumulator * (det_int128_t)multiplier;
+    det_int128_t rounded = scaled;
     if (shift > 0) {
-        int64_t offset = (int64_t)1 << (shift - 1);
-        rounded = scaled >= 0 ? (scaled + offset) >> shift : -((-scaled + offset) >> shift);
+        det_int128_t divisor = (det_int128_t)1 << shift;
+        det_int128_t offset = divisor >> 1;
+        rounded = scaled >= 0 ? (scaled + offset) / divisor
+                              : -((-scaled + offset) / divisor);
     }
-    rounded += (int64_t)zero_point;
+    rounded += (det_int128_t)zero_point;
     if (rounded > 127) rounded = 127;
     if (rounded < -128) rounded = -128;
     return (int8_t)rounded;
+#else
+    long double scaled = (long double)accumulator * (long double)multiplier;
+    if (shift > 0) scaled /= ldexpl(1.0L, shift);
+    long double rounded = roundl(scaled) + (long double)zero_point;
+    if (rounded > 127.0L) rounded = 127.0L;
+    if (rounded < -128.0L) rounded = -128.0L;
+    return (int8_t)rounded;
+#endif
 }
 
 det_status det_quantize_per_channel_s8(const float *weights, int rows, int cols,
@@ -353,9 +394,11 @@ det_status det_quantize_per_channel_s8(const float *weights, int rows, int cols,
         float max_abs = 0.0f;
         for (int col = 0; col < cols; ++col) {
             float value = fabsf(weights[(size_t)row * (size_t)cols + (size_t)col]);
+            if (!isfinite(value)) return DET_ERR_ARGUMENT;
             if (value > max_abs) max_abs = value;
         }
         scales[row] = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        if (!isfinite(scales[row]) || !(scales[row] > 0.0f)) return DET_ERR_ARGUMENT;
         for (int col = 0; col < cols; ++col) {
             quantized[(size_t)row * (size_t)cols + (size_t)col] =
                 det_quantize_s8(weights[(size_t)row * (size_t)cols + (size_t)col], scales[row]);
@@ -374,9 +417,11 @@ det_status det_quantize_pack_w4(const float *weights, int rows, int cols,
         float max_abs = 0.0f;
         for (int col = 0; col < cols; ++col) {
             float value = fabsf(weights[(size_t)row * (size_t)cols + (size_t)col]);
+            if (!isfinite(value)) return DET_ERR_ARGUMENT;
             if (value > max_abs) max_abs = value;
         }
         scales[row] = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
+        if (!isfinite(scales[row]) || !(scales[row] > 0.0f)) return DET_ERR_ARGUMENT;
         for (int byte_index = 0; byte_index < packed_cols; ++byte_index) {
             int col0 = byte_index * 2;
             int col1 = col0 + 1;
@@ -401,6 +446,9 @@ static void free_head(det_head *head) {
     free(head->bias);
     free(head->velocity_w);
     free(head->velocity_b);
+    free(head->quant_weights);
+    free(head->packed_weights);
+    free(head->quant_scales);
     memset(head, 0, sizeof(*head));
 }
 
@@ -412,6 +460,9 @@ static void free_stage(det_stage *stage) {
     free(stage->velocity_b);
     free(stage->gradient_w);
     free(stage->gradient_b);
+    free(stage->quant_weights);
+    free(stage->packed_weights);
+    free(stage->quant_scales);
     free(stage->activation);
     free(stage->gradient_output);
     free(stage->gradient_input);
@@ -422,6 +473,15 @@ static size_t stage_weight_count(const det_stage *stage) {
     size_t channels = stage->depthwise ? (size_t)stage->output_channels :
                       (size_t)stage->output_channels * (size_t)stage->input_channels;
     return channels * (size_t)stage->kernel * (size_t)stage->kernel;
+}
+
+static size_t stage_quant_cols(const det_stage *stage) {
+    return (size_t)(stage->depthwise ? 1 : stage->input_channels) *
+           (size_t)stage->kernel * (size_t)stage->kernel;
+}
+
+static size_t stage_packed_weight_count(const det_stage *stage) {
+    return (size_t)stage->output_channels * ((stage_quant_cols(stage) + 1U) / 2U);
 }
 
 static size_t stage_weight_index(const det_stage *stage, int oc, int ic, int ky, int kx) {
@@ -436,6 +496,26 @@ static int finite_values(const float *values, size_t count) {
         if (!isfinite(values[i])) return 0;
     }
     return 1;
+}
+
+static int positive_finite_values(const float *values, size_t count) {
+    if (values == NULL) return 0;
+    for (size_t i = 0U; i < count; ++i) {
+        if (!(values[i] > 0.0f) || !isfinite(values[i])) return 0;
+    }
+    return 1;
+}
+
+static uint32_t crc32_bytes(const uint8_t *data, size_t length) {
+    uint32_t crc = 0xffffffffU;
+    for (size_t i = 0U; i < length; ++i) {
+        crc ^= (uint32_t)data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
+            crc = (crc >> 1U) ^ (0xedb88320U & mask);
+        }
+    }
+    return ~crc;
 }
 
 static det_status alloc_stage(det_stage *stage, int input_channels, int input_height,
@@ -459,17 +539,25 @@ static det_status alloc_stage(det_stage *stage, int input_channels, int input_he
                           (size_t)output_width;
     size_t input_count = (size_t)input_channels * (size_t)input_height *
                          (size_t)input_width;
+    size_t quant_cols = (size_t)(depthwise ? 1 : input_channels) *
+                        (size_t)kernel * (size_t)kernel;
+    size_t packed_count = (size_t)output_channels * ((quant_cols + 1U) / 2U);
     stage->weights = (float *)calloc(weight_count, sizeof(float));
     stage->bias = (float *)calloc((size_t)output_channels, sizeof(float));
     stage->velocity_w = (float *)calloc(weight_count, sizeof(float));
     stage->velocity_b = (float *)calloc((size_t)output_channels, sizeof(float));
     stage->gradient_w = (float *)calloc(weight_count, sizeof(float));
     stage->gradient_b = (float *)calloc((size_t)output_channels, sizeof(float));
+    stage->quant_weights = (int8_t *)calloc(weight_count, sizeof(int8_t));
+    stage->packed_weights = (uint8_t *)calloc(packed_count, sizeof(uint8_t));
+    stage->quant_scales = (float *)calloc((size_t)output_channels, sizeof(float));
     stage->activation = (float *)calloc(output_count, sizeof(float));
     stage->gradient_output = (float *)calloc(output_count, sizeof(float));
     stage->gradient_input = (float *)calloc(input_count, sizeof(float));
     if (stage->weights == NULL || stage->bias == NULL || stage->velocity_w == NULL ||
         stage->velocity_b == NULL || stage->gradient_w == NULL || stage->gradient_b == NULL ||
+        stage->quant_weights == NULL || stage->packed_weights == NULL ||
+        stage->quant_scales == NULL ||
         stage->activation == NULL || stage->gradient_output == NULL ||
         stage->gradient_input == NULL) {
         free_stage(stage);
@@ -494,12 +582,17 @@ static det_status alloc_head(det_head *head, int height, int width, int channels
         return DET_ERR_ARGUMENT;
     }
     size_t count = (size_t)channels * (size_t)outputs;
+    size_t packed_count = (size_t)outputs * (((size_t)channels + 1U) / 2U);
     head->weights = (float *)calloc(count, sizeof(float));
     head->bias = (float *)calloc((size_t)outputs, sizeof(float));
     head->velocity_w = (float *)calloc(count, sizeof(float));
     head->velocity_b = (float *)calloc((size_t)outputs, sizeof(float));
+    head->quant_weights = (int8_t *)calloc(count, sizeof(int8_t));
+    head->packed_weights = (uint8_t *)calloc(packed_count, sizeof(uint8_t));
+    head->quant_scales = (float *)calloc((size_t)outputs, sizeof(float));
     if (head->weights == NULL || head->bias == NULL || head->velocity_w == NULL ||
-        head->velocity_b == NULL) {
+        head->velocity_b == NULL || head->quant_weights == NULL ||
+        head->packed_weights == NULL || head->quant_scales == NULL) {
         free_head(head);
         return DET_ERR_MEMORY;
     }
@@ -508,6 +601,39 @@ static det_status alloc_head(det_head *head, int height, int width, int channels
     head->channels = channels;
     head->outputs = outputs;
     return DET_OK;
+}
+
+static int valid_precision(det_precision precision) {
+    return precision == DET_PRECISION_F32 || precision == DET_PRECISION_INT8 ||
+           precision == DET_PRECISION_W4A8;
+}
+
+static det_status quantize_stage(det_stage *stage, det_precision precision) {
+    if (precision == DET_PRECISION_F32) return DET_OK;
+    size_t cols = (size_t)(stage->depthwise ? 1 : stage->input_channels) *
+                  (size_t)stage->kernel * (size_t)stage->kernel;
+    if (cols > (size_t)INT_MAX) return DET_ERR_SHAPE;
+    det_status status;
+    if (precision == DET_PRECISION_INT8) {
+        status = det_quantize_per_channel_s8(stage->weights, stage->output_channels,
+                                             (int)cols, stage->quant_weights,
+                                             stage->quant_scales);
+    } else {
+        status = det_quantize_pack_w4(stage->weights, stage->output_channels,
+                                      (int)cols, stage->packed_weights,
+                                      stage->quant_scales);
+    }
+    return status;
+}
+
+static det_status quantize_head(det_head *head, det_precision precision) {
+    if (precision == DET_PRECISION_F32) return DET_OK;
+    if (precision == DET_PRECISION_INT8) {
+        return det_quantize_per_channel_s8(head->weights, head->outputs, head->channels,
+                                           head->quant_weights, head->quant_scales);
+    }
+    return det_quantize_pack_w4(head->weights, head->outputs, head->channels,
+                                head->packed_weights, head->quant_scales);
 }
 
 det_status det_model_build(det_context *ctx, const det_model_spec *spec,
@@ -553,6 +679,39 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
     return DET_OK;
 }
 
+det_status det_model_set_precision(det_model *model, det_precision precision) {
+    if (model == NULL || !valid_precision(precision)) return DET_ERR_ARGUMENT;
+    if (precision != DET_PRECISION_F32) {
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            const det_stage *stage = &model->stages[i];
+            if (!finite_values(stage->weights, stage_weight_count(stage)) ||
+                !finite_values(stage->bias, (size_t)stage->output_channels)) {
+                return DET_ERR_FORMAT;
+            }
+        }
+        for (int i = 0; i < DET_MAX_SCALES; ++i) {
+            const det_head *head = &model->heads[i];
+            size_t count = (size_t)head->channels * (size_t)head->outputs;
+            if (!finite_values(head->weights, count) ||
+                !finite_values(head->bias, (size_t)head->outputs)) return DET_ERR_FORMAT;
+        }
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            det_status status = quantize_stage(&model->stages[i], precision);
+            if (status != DET_OK) return status;
+        }
+        for (int i = 0; i < DET_MAX_SCALES; ++i) {
+            det_status status = quantize_head(&model->heads[i], precision);
+            if (status != DET_OK) return status;
+        }
+    }
+    model->precision = precision;
+    return DET_OK;
+}
+
+det_precision det_model_precision(const det_model *model) {
+    return model == NULL ? DET_PRECISION_F32 : model->precision;
+}
+
 void det_model_destroy(det_model *model) {
     if (model == NULL) return;
     for (int i = 0; i < DET_GRAPH_STAGES; ++i) free_stage(&model->stages[i]);
@@ -562,6 +721,7 @@ void det_model_destroy(det_model *model) {
 
 det_status det_model_reset(det_model *model, int seed) {
     if (model == NULL) return DET_ERR_ARGUMENT;
+    model->precision = DET_PRECISION_F32;
     uint32_t state = (uint32_t)(seed == 0 ? 1 : seed);
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         det_head *head = &model->heads[s];
@@ -633,6 +793,95 @@ static void stage_forward(det_stage *stage, const det_tensor_f32 *input) {
     }
 }
 
+static int quantized_stage_weight(const det_stage *stage, det_precision precision,
+                                  size_t index) {
+    if (precision == DET_PRECISION_INT8) return (int)stage->quant_weights[index];
+    size_t cols = (size_t)(stage->depthwise ? 1 : stage->input_channels) *
+                  (size_t)stage->kernel * (size_t)stage->kernel;
+    size_t row = index / cols;
+    size_t col = index % cols;
+    size_t packed_index = row * ((cols + 1U) / 2U) + col / 2U;
+    unsigned int packed = (unsigned int)stage->packed_weights[packed_index];
+    int value = (int)((packed >> ((col & 1U) * 4U)) & 0x0fU);
+    return value >= 8 ? value - 16 : value;
+}
+
+static float tensor_quant_scale(const det_tensor_f32 *tensor) {
+    size_t count = (size_t)tensor->channels * (size_t)tensor->height *
+                   (size_t)tensor->width;
+    float maximum = 0.0f;
+    for (size_t i = 0U; i < count; ++i) {
+        float value = fabsf(tensor->data[i]);
+        if (value > maximum) maximum = value;
+    }
+    return maximum > 0.0f ? maximum / 127.0f : 1.0f;
+}
+
+static void stage_forward_quant(const det_stage *stage, const det_tensor_f32 *input,
+                                det_precision precision, float *output_data) {
+    det_tensor_f32 output = {output_data, stage->output_channels,
+                             stage->output_height, stage->output_width};
+    float input_scale = tensor_quant_scale(input);
+    for (int oc = 0; oc < stage->output_channels; ++oc) {
+        for (int oy = 0; oy < stage->output_height; ++oy) {
+            for (int ox = 0; ox < stage->output_width; ++ox) {
+                int32_t accumulator = 0;
+                int channel_start = stage->depthwise ? oc : 0;
+                int channel_end = stage->depthwise ? oc + 1 : stage->input_channels;
+                for (int ic = channel_start; ic < channel_end; ++ic) {
+                    for (int ky = 0; ky < stage->kernel; ++ky) {
+                        int iy = oy * stage->stride + ky - stage->padding;
+                        if (iy < 0 || iy >= stage->input_height) continue;
+                        for (int kx = 0; kx < stage->kernel; ++kx) {
+                            int ix = ox * stage->stride + kx - stage->padding;
+                            if (ix < 0 || ix >= stage->input_width) continue;
+                            size_t weight_index = stage_weight_index(stage, oc, ic, ky, kx);
+                            int input_q = (int)det_quantize_s8(
+                                input->data[tensor_index(input, ic, iy, ix)], input_scale);
+                            accumulator += input_q * quantized_stage_weight(stage, precision,
+                                                                             weight_index);
+                        }
+                    }
+                }
+                float value = (float)accumulator * input_scale * stage->quant_scales[oc] +
+                              stage->bias[oc];
+                if (value < 0.0f) value = 0.0f;
+                output.data[tensor_index(&output, oc, oy, ox)] = value;
+            }
+        }
+    }
+}
+
+static int quantized_head_weight(const det_head *head, det_precision precision,
+                                 size_t index) {
+    if (precision == DET_PRECISION_INT8) return (int)head->quant_weights[index];
+    size_t col = index % (size_t)head->channels;
+    size_t row = index / (size_t)head->channels;
+    size_t packed_index = row * (((size_t)head->channels + 1U) / 2U) + col / 2U;
+    unsigned int packed = (unsigned int)head->packed_weights[packed_index];
+    int value = (int)((packed >> ((col & 1U) * 4U)) & 0x0fU);
+    return value >= 8 ? value - 16 : value;
+}
+
+static void head_forward_quant(const det_head *head, const float features[4],
+                               det_precision precision, float *output) {
+    float maximum = 0.0f;
+    for (int c = 0; c < head->channels; ++c) {
+        float value = fabsf(features[c]);
+        if (value > maximum) maximum = value;
+    }
+    float input_scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    for (int o = 0; o < head->outputs; ++o) {
+        int32_t accumulator = 0;
+        for (int c = 0; c < head->channels; ++c) {
+            int input_q = (int)det_quantize_s8(features[c], input_scale);
+            size_t weight_index = (size_t)o * (size_t)head->channels + (size_t)c;
+            accumulator += input_q * quantized_head_weight(head, precision, weight_index);
+        }
+        output[o] = (float)accumulator * input_scale * head->quant_scales[o] + head->bias[o];
+    }
+}
+
 static void stage_backward(det_stage *stage, const det_tensor_f32 *input,
                            const det_tensor_f32 *grad_output,
                            det_tensor_f32 *grad_input) {
@@ -687,7 +936,11 @@ static void backbone_forward(det_model *model, const det_image *image) {
             input.height = previous->output_height;
             input.width = previous->output_width;
         }
-        stage_forward(stage, &input);
+        if (model->precision == DET_PRECISION_F32) {
+            stage_forward(stage, &input);
+        } else {
+            stage_forward_quant(stage, &input, model->precision, stage->activation);
+        }
     }
 }
 
@@ -1097,6 +1350,7 @@ det_status det_train(det_model *model, const det_dataset *dataset,
     if (config->precision != DET_PRECISION_F32) {
         return DET_ERR_UNSUPPORTED;
     }
+    if (model->precision != DET_PRECISION_F32) return DET_ERR_UNSUPPORTED;
     if (config->reset_weights != 0 && det_model_reset(model, config->seed) != DET_OK) {
         return DET_ERR_MEMORY;
     }
@@ -1156,10 +1410,14 @@ det_status det_predict(const det_model *model, const det_image *image,
                        float score_threshold, det_detection *detections,
                        int capacity, int *count) {
     if (model == NULL || image == NULL || image->data == NULL || detections == NULL ||
-        count == NULL || capacity < 0 || image->channels != model->spec.channels ||
+        count == NULL || capacity < 0 || !isfinite(score_threshold) ||
+        image->channels != model->spec.channels ||
         image->width != model->spec.width || image->height != model->spec.height) {
         return DET_ERR_ARGUMENT;
     }
+    size_t image_elements = 0U;
+    if (!checked_size3(image->channels, image->height, image->width, &image_elements) ||
+        !finite_values(image->data, image_elements)) return DET_ERR_ARGUMENT;
     *count = 0;
     backbone_forward((det_model *)model, image);
     float output[4 + DET_MAX_CLASSES];
@@ -1169,7 +1427,11 @@ det_status det_predict(const det_model *model, const det_image *image,
             for (int x = 0; x < head->width; ++x) {
                 float features[4];
                 extract_feature(model, image, s, y, x, features, NULL);
-                head_forward(head, features, output);
+                if (model->precision == DET_PRECISION_F32) {
+                    head_forward(head, features, output);
+                } else {
+                    head_forward_quant(head, features, model->precision, output);
+                }
                 int class_id = 0;
                 float best = output[4];
                 for (int c = 1; c < model->spec.num_classes; ++c) {
@@ -1211,36 +1473,43 @@ typedef struct {
     uint32_t max_detections;
     uint32_t graph_channels;
     uint32_t stage_count;
+    uint32_t precision;
     uint64_t train_updates;
 } det_file_header;
 
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
+    if (!valid_precision(model->precision)) return DET_ERR_FORMAT;
     for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
         const det_stage *stage = &model->stages[s];
         if (!finite_values(stage->weights, stage_weight_count(stage)) ||
             !finite_values(stage->bias, (size_t)stage->output_channels) ||
             !finite_values(stage->velocity_w, stage_weight_count(stage)) ||
-            !finite_values(stage->velocity_b, (size_t)stage->output_channels)) return DET_ERR_FORMAT;
+            !finite_values(stage->velocity_b, (size_t)stage->output_channels) ||
+            (model->precision != DET_PRECISION_F32 &&
+             !positive_finite_values(stage->quant_scales, (size_t)stage->output_channels))) {
+            return DET_ERR_FORMAT;
+        }
     }
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
         const det_head *head = &model->heads[s];
         if (!finite_values(head->weights, (size_t)head->channels * (size_t)head->outputs) ||
             !finite_values(head->bias, (size_t)head->outputs) ||
             !finite_values(head->velocity_w, (size_t)head->channels * (size_t)head->outputs) ||
-            !finite_values(head->velocity_b, (size_t)head->outputs)) return DET_ERR_FORMAT;
+            !finite_values(head->velocity_b, (size_t)head->outputs) ||
+            (model->precision != DET_PRECISION_F32 &&
+             !positive_finite_values(head->quant_scales, (size_t)head->outputs))) {
+            return DET_ERR_FORMAT;
+        }
     }
     FILE *file = fopen(path, "wb");
     if (file == NULL) return DET_ERR_IO;
-    det_file_header header = {{'C', 'D', 'E', 'T'}, 3U, (uint32_t)model->spec.width,
+    det_file_header header = {{'C', 'D', 'E', 'T'}, 5U, (uint32_t)model->spec.width,
                               (uint32_t)model->spec.height, (uint32_t)model->spec.channels,
                               (uint32_t)model->spec.num_classes, (uint32_t)model->spec.max_detections,
-                              DET_GRAPH_CHANNELS, DET_GRAPH_STAGES,
+                              DET_GRAPH_CHANNELS, DET_GRAPH_STAGES, (uint32_t)model->precision,
                               (uint64_t)model->train_updates};
     int ok = fwrite(&header, sizeof(header), 1U, file) == 1U;
-    if (ok) {
-        ok = 1;
-    }
     for (int s = 0; ok && s < DET_GRAPH_STAGES; ++s) {
         const det_stage *stage = &model->stages[s];
         size_t wc = stage_weight_count(stage);
@@ -1259,6 +1528,11 @@ det_status det_save(const det_model *model, const char *path) {
                  (size_t)stage->output_channels &&
              fwrite(stage->velocity_w, sizeof(float), wc, file) == wc &&
              fwrite(stage->velocity_b, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels &&
+             fwrite(stage->quant_weights, sizeof(int8_t), wc, file) == wc &&
+             fwrite(stage->packed_weights, sizeof(uint8_t), stage_packed_weight_count(stage), file) ==
+                 stage_packed_weight_count(stage) &&
+             fwrite(stage->quant_scales, sizeof(float), (size_t)stage->output_channels, file) ==
                  (size_t)stage->output_channels;
     }
     for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
@@ -1270,20 +1544,85 @@ det_status det_save(const det_model *model, const char *path) {
              fwrite(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
              fwrite(head->velocity_w, sizeof(float), wc, file) == wc &&
              fwrite(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
+                 (size_t)head->outputs &&
+             fwrite(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
+             fwrite(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
+                    (((size_t)head->channels + 1U) / 2U), file) ==
+                 (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
+             fwrite(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
                  (size_t)head->outputs;
     }
     int close_result = fclose(file);
-    return ok && close_result == 0 ? DET_OK : DET_ERR_IO;
+    if (!ok || close_result != 0) return DET_ERR_IO;
+    FILE *check = fopen(path, "rb");
+    if (check == NULL || fseek(check, 0L, SEEK_END) != 0) {
+        if (check != NULL) fclose(check);
+        return DET_ERR_IO;
+    }
+    long length = ftell(check);
+    if (length < 0L || (unsigned long)length > 256UL * 1024UL * 1024UL) {
+        fclose(check);
+        return DET_ERR_IO;
+    }
+    size_t payload_length = (size_t)length;
+    uint8_t *payload = (uint8_t *)malloc(payload_length == 0U ? 1U : payload_length);
+    if (payload == NULL || fseek(check, 0L, SEEK_SET) != 0 ||
+        fread(payload, 1U, payload_length, check) != payload_length) {
+        free(payload);
+        fclose(check);
+        return DET_ERR_IO;
+    }
+    fclose(check);
+    uint32_t checksum = crc32_bytes(payload, payload_length);
+    free(payload);
+    FILE *append = fopen(path, "ab");
+    if (append == NULL || fwrite(&checksum, sizeof(checksum), 1U, append) != 1U) {
+        if (append != NULL) fclose(append);
+        return DET_ERR_IO;
+    }
+    return fclose(append) == 0 ? DET_OK : DET_ERR_IO;
 }
 
 det_status det_load(det_context *ctx, const char *path, det_model **out) {
     if (ctx == NULL || path == NULL || out == NULL) return DET_ERR_ARGUMENT;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return DET_ERR_IO;
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    long file_length = ftell(file);
+    if (file_length < (long)(sizeof(det_file_header) + sizeof(uint32_t)) ||
+        (unsigned long)file_length > 256UL * 1024UL * 1024UL) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    size_t encoded_length = (size_t)file_length;
+    size_t payload_length = encoded_length - sizeof(uint32_t);
+    uint8_t *encoded = (uint8_t *)malloc(payload_length);
+    if (encoded == NULL || fseek(file, 0L, SEEK_SET) != 0 ||
+        fread(encoded, 1U, payload_length, file) != payload_length) {
+        free(encoded);
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    uint32_t stored_checksum = 0U;
+    if (fread(&stored_checksum, sizeof(stored_checksum), 1U, file) != 1U ||
+        crc32_bytes(encoded, payload_length) != stored_checksum) {
+        free(encoded);
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    free(encoded);
+    if (fseek(file, 0L, SEEK_SET) != 0) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
     det_file_header header;
     int ok = fread(&header, sizeof(header), 1U, file) == 1U;
-    if (!ok || memcmp(header.magic, "CDET", 4U) != 0 || header.version != 3U ||
-        header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES) {
+    if (!ok || memcmp(header.magic, "CDET", 4U) != 0 || header.version != 5U ||
+        header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES ||
+        !valid_precision((det_precision)header.precision)) {
         fclose(file);
         return DET_ERR_FORMAT;
     }
@@ -1294,6 +1633,44 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     if (status != DET_OK) {
         fclose(file);
         return status;
+    }
+    size_t expected_payload = sizeof(det_file_header);
+    for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
+        const det_stage *stage = &model->stages[s];
+        size_t wc = stage_weight_count(stage);
+        size_t packed = stage_packed_weight_count(stage);
+        size_t stage_bytes = 10U * sizeof(int);
+        if (!checked_add_size(stage_bytes, (2U * wc + 2U * (size_t)stage->output_channels) *
+                                      sizeof(float), &stage_bytes) ||
+            !checked_add_size(stage_bytes, wc * sizeof(int8_t), &stage_bytes) ||
+            !checked_add_size(stage_bytes, packed * sizeof(uint8_t), &stage_bytes) ||
+            !checked_add_size(stage_bytes, (size_t)stage->output_channels * sizeof(float), &stage_bytes) ||
+            !checked_add_size(expected_payload, stage_bytes, &expected_payload)) {
+            det_model_destroy(model);
+            fclose(file);
+            return DET_ERR_FORMAT;
+        }
+    }
+    for (int s = 0; s < DET_MAX_SCALES; ++s) {
+        const det_head *head = &model->heads[s];
+        size_t wc = (size_t)head->channels * (size_t)head->outputs;
+        size_t packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
+        size_t head_bytes = 2U * sizeof(int);
+        if (!checked_add_size(head_bytes, (2U * wc + 2U * (size_t)head->outputs) *
+                                    sizeof(float), &head_bytes) ||
+            !checked_add_size(head_bytes, wc * sizeof(int8_t), &head_bytes) ||
+            !checked_add_size(head_bytes, packed * sizeof(uint8_t), &head_bytes) ||
+            !checked_add_size(head_bytes, (size_t)head->outputs * sizeof(float), &head_bytes) ||
+            !checked_add_size(expected_payload, head_bytes, &expected_payload)) {
+            det_model_destroy(model);
+            fclose(file);
+            return DET_ERR_FORMAT;
+        }
+    }
+    if (expected_payload != payload_length) {
+        det_model_destroy(model);
+        fclose(file);
+        return DET_ERR_FORMAT;
     }
     ok = 1;
     for (int s = 0; ok && s < DET_GRAPH_STAGES; ++s) {
@@ -1330,6 +1707,11 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
              fread(stage->velocity_w, sizeof(float), wc, file) == wc &&
              fread(stage->velocity_b, sizeof(float), (size_t)stage->output_channels, file) ==
                  (size_t)stage->output_channels &&
+             fread(stage->quant_weights, sizeof(int8_t), wc, file) == wc &&
+             fread(stage->packed_weights, sizeof(uint8_t), stage_packed_weight_count(stage), file) ==
+                 stage_packed_weight_count(stage) &&
+             fread(stage->quant_scales, sizeof(float), (size_t)stage->output_channels, file) ==
+                 (size_t)stage->output_channels &&
              finite_values(stage->weights, wc) &&
              finite_values(stage->bias, (size_t)stage->output_channels) &&
              finite_values(stage->velocity_w, wc) &&
@@ -1347,6 +1729,12 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
              fread(head->velocity_w, sizeof(float), wc, file) == wc &&
              fread(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
                  (size_t)head->outputs &&
+             fread(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
+             fread(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
+                   (((size_t)head->channels + 1U) / 2U), file) ==
+                 (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
+             fread(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
+                 (size_t)head->outputs &&
              finite_values(head->weights, wc) &&
              finite_values(head->bias, (size_t)head->outputs) &&
              finite_values(head->velocity_w, wc) &&
@@ -1362,6 +1750,23 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         return DET_ERR_FORMAT;
     }
     model->train_updates = (size_t)header.train_updates;
+    model->precision = (det_precision)header.precision;
+    if (model->precision != DET_PRECISION_F32) {
+        for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
+            if (!positive_finite_values(model->stages[s].quant_scales,
+                               (size_t)model->stages[s].output_channels)) {
+                det_model_destroy(model);
+                return DET_ERR_FORMAT;
+            }
+        }
+        for (int s = 0; s < DET_MAX_SCALES; ++s) {
+            if (!positive_finite_values(model->heads[s].quant_scales,
+                               (size_t)model->heads[s].outputs)) {
+                det_model_destroy(model);
+                return DET_ERR_FORMAT;
+            }
+        }
+    }
     *out = model;
     return DET_OK;
 }
