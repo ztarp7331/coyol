@@ -58,6 +58,17 @@ static int parse_int(const char *value, int fallback) {
     return (int)parsed;
 }
 
+static int parse_threshold(const char *value, float *out) {
+    if (value == NULL || out == NULL) return 0;
+    char *end = NULL;
+    float parsed = strtof(value, &end);
+    if (end == value || *end != '\0' || !isfinite(parsed) || parsed < 0.0f || parsed > 1.0f) {
+        return 0;
+    }
+    *out = parsed;
+    return 1;
+}
+
 static int parse_precision(const char *value, det_precision *out) {
     if (value == NULL || out == NULL) return 0;
     if (strcmp(value, "f32") == 0) *out = DET_PRECISION_F32;
@@ -80,6 +91,7 @@ int main(int argc, char **argv) {
     int height = 160;
     int global = 0;
     det_precision precision = DET_PRECISION_F32;
+    float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) sample_count = parse_int(argv[++i], sample_count);
         else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = parse_int(argv[++i], width);
@@ -87,6 +99,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--precision") == 0) {
             if (i + 1 >= argc || !parse_precision(argv[++i], &precision)) {
                 fprintf(stderr, "precision must be f32, int8, or w4a8\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--threshold") == 0) {
+            if (i + 1 >= argc || !parse_threshold(argv[++i], &threshold)) {
+                fprintf(stderr, "threshold must be a finite value in [0,1]\n");
                 return EXIT_FAILURE;
             }
         }
@@ -148,13 +166,13 @@ int main(int argc, char **argv) {
     det_detection detections[100];
     int detection_count = 0;
     for (int warmup = 0; warmup < 3; ++warmup) {
-        status = det_predict(model, &inference_sample.image, 0.25f, detections, 100,
+        status = det_predict(model, &inference_sample.image, threshold, detections, 100,
                              &detection_count);
         if (status != DET_OK) break;
     }
     double infer_start = wall_now_ms();
     for (int repeat = 0; status == DET_OK && repeat < 10; ++repeat) {
-        status = det_predict(model, &inference_sample.image, 0.25f, detections, 100,
+        status = det_predict(model, &inference_sample.image, threshold, detections, 100,
                              &detection_count);
     }
     double infer_ms = (wall_now_ms() - infer_start) / 10.0;
@@ -183,10 +201,11 @@ int main(int argc, char **argv) {
     double train_e2e_ms = wall_now_ms() - e2e_start;
     const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" : "F32");
-    printf("samples=%d input=%dx%d mode=%s precision=%s train_core_ms=%.3f train_e2e_ms=%.3f "
+    printf("samples=%d input=%dx%d mode=%s precision=%s threshold=%.3f train_core_ms=%.3f train_e2e_ms=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
            sample_count, width, height, global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name,
+           threshold,
            report.elapsed_ms, train_e2e_ms, infer_ms, io_ms,
            report.updates, report.mean_loss,
            report.elapsed_ms > 0.0 ? (double)sample_count * 1000.0 / report.elapsed_ms : 0.0,

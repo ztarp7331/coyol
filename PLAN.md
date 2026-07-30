@@ -53,17 +53,18 @@ not claims that the final detector has already passed the accuracy or
 architecture gates.
 
 After wiring the first spatial backbone, the compact edge profile has measured
-about 1.13--1.22 s `LOCAL_FAST` end-to-end training, 0.13--1.04 ms repeated
-inference, and 15--31 ms save/load for the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
+about 0.98--1.22 s `LOCAL_FAST` end-to-end training, 0.13--1.04 ms repeated
+inference, and 8--42 ms save/load for the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
 channel, one learned 3 x 3 expansion stage, and three depthwise 3 x 3 pyramid
 stages. It is an executable edge variant of the architecture, not yet the
 larger 16/24/40/64/96-channel research configuration in the table below.
 The sub-second training gate therefore remains open; the next optimization
 checkpoint must reduce measured `train_e2e_ms` below 1,000 ms rather than
 relabel this near-miss as success.
-The current 5,000-image `LOCAL_FAST` smoke benchmark also produces zero
-detections at the 0.25 confidence threshold; the synthetic overfit test passes,
-but the larger functional/accuracy gate remains open.
+The current 5,000-image `LOCAL_FAST` smoke benchmark produces detections at a
+0.20 threshold but none at the conventional 0.25 threshold; the synthetic
+overfit test passes, but confidence calibration and the larger functional/
+accuracy gate remain open. The benchmark exposes `--threshold` for this reason.
 
 Two training times must be published:
 
@@ -163,7 +164,7 @@ full detector-loss backpropagation. The downstream-loss comparison against
 `GLOBAL_BP` is a required acceptance experiment before selecting this rule. The
 local stage rule currently uses a straight-through ReLU surrogate to recover
 dead channels; this is intentional and must be included in the ablation.
-The local head path also down-weights sparse background BCE updates to 0.1 of
+The local head path also down-weights sparse background BCE updates to 0.01 of
 the positive-cell signal; this is a measured imbalance control, not part of
 `GLOBAL_BP`.
 

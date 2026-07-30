@@ -703,6 +703,45 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
             det_status status = quantize_head(&model->heads[i], precision);
             if (status != DET_OK) return status;
         }
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            det_stage *stage = &model->stages[i];
+            size_t wc = stage_weight_count(stage);
+            if (precision == DET_PRECISION_INT8) {
+                memset(stage->packed_weights, 0,
+                       stage_packed_weight_count(stage) * sizeof(*stage->packed_weights));
+            } else {
+                memset(stage->quant_weights, 0, wc * sizeof(*stage->quant_weights));
+            }
+        }
+        for (int i = 0; i < DET_MAX_SCALES; ++i) {
+            det_head *head = &model->heads[i];
+            size_t wc = (size_t)head->channels * (size_t)head->outputs;
+            size_t packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
+            if (precision == DET_PRECISION_INT8) {
+                memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
+            } else {
+                memset(head->quant_weights, 0, wc * sizeof(*head->quant_weights));
+            }
+        }
+    } else {
+        for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+            det_stage *stage = &model->stages[i];
+            memset(stage->quant_weights, 0,
+                   stage_weight_count(stage) * sizeof(*stage->quant_weights));
+            memset(stage->packed_weights, 0,
+                   stage_packed_weight_count(stage) * sizeof(*stage->packed_weights));
+            memset(stage->quant_scales, 0,
+                   (size_t)stage->output_channels * sizeof(*stage->quant_scales));
+        }
+        for (int i = 0; i < DET_MAX_SCALES; ++i) {
+            det_head *head = &model->heads[i];
+            size_t wc = (size_t)head->channels * (size_t)head->outputs;
+            size_t packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
+            memset(head->quant_weights, 0, wc * sizeof(*head->quant_weights));
+            memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
+            memset(head->quant_scales, 0,
+                   (size_t)head->outputs * sizeof(*head->quant_scales));
+        }
     }
     model->precision = precision;
     return DET_OK;
@@ -758,7 +797,7 @@ det_status det_model_reset(det_model *model, int seed) {
         memset(stage->gradient_output, 0, out_count * sizeof(float));
     }
     model->train_updates = 0U;
-    return DET_OK;
+    return det_model_set_precision(model, DET_PRECISION_F32);
 }
 
 static void stage_forward(det_stage *stage, const det_tensor_f32 *input) {
@@ -1050,7 +1089,7 @@ static void update_head(det_head *head, const float features[4], const float *ta
         /* LOCAL_FAST sees many more background cells than positives. Keep a
            sparse negative signal without allowing BCE bias updates to erase
            the one-to-one class evidence. GLOBAL_BP keeps the full loss. */
-        for (int o = 4; o < head->outputs; ++o) gradient[o] *= 0.1f;
+        for (int o = 4; o < head->outputs; ++o) gradient[o] *= 0.01f;
     }
     for (int o = 0; o < head->outputs; ++o) {
         size_t base = (size_t)o * (size_t)head->channels;
