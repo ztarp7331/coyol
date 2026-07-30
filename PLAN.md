@@ -163,6 +163,9 @@ full detector-loss backpropagation. The downstream-loss comparison against
 `GLOBAL_BP` is a required acceptance experiment before selecting this rule. The
 local stage rule currently uses a straight-through ReLU surrogate to recover
 dead channels; this is intentional and must be included in the ablation.
+The local head path also down-weights sparse background BCE updates to 0.1 of
+the positive-cell signal; this is a measured imbalance control, not part of
+`GLOBAL_BP`.
 
 Training is a single forward stream with local updates:
 
