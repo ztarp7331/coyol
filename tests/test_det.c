@@ -183,17 +183,29 @@ static void test_train_predict_roundtrip(void) {
     assert(fclose(corrupt) == 0);
     det_model *corrupt_model = NULL;
     assert(det_load(ctx, path, &corrupt_model) == DET_ERR_FORMAT);
+    det_detection f32_detections[16];
+    int f32_count = 0;
+    assert(det_predict(model, &image, 0.1f, f32_detections, 16, &f32_count) == DET_OK);
+    assert(f32_count > 0);
     assert(det_model_set_precision(model, DET_PRECISION_INT8) == DET_OK);
     assert(det_model_precision(model) == DET_PRECISION_INT8);
     int int8_count = 0;
     assert(det_predict(model, &image, 0.1f, detections, 16, &int8_count) == DET_OK);
     assert(int8_count > 0);
     for (int i = 0; i < int8_count; ++i) assert(isfinite(detections[i].score));
+    int int8_compare = f32_count < int8_count ? f32_count : int8_count;
+    for (int i = 0; i < int8_compare; ++i) {
+        assert(fabsf(f32_detections[i].score - detections[i].score) < 0.35f);
+    }
     assert(det_model_set_precision(model, DET_PRECISION_W4A8) == DET_OK);
     int w4_count = 0;
     assert(det_predict(model, &image, 0.1f, detections, 16, &w4_count) == DET_OK);
     assert(w4_count > 0);
     for (int i = 0; i < w4_count; ++i) assert(isfinite(detections[i].score));
+    int w4_compare = f32_count < w4_count ? f32_count : w4_count;
+    for (int i = 0; i < w4_compare; ++i) {
+        assert(fabsf(f32_detections[i].score - detections[i].score) < 0.5f);
+    }
     det_detection w4_detections[16];
     memcpy(w4_detections, detections, (size_t)w4_count * sizeof(*detections));
     const char *quant_path = "det_test_quantized.cdet";
