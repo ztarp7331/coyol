@@ -25,6 +25,20 @@ typedef struct {
     int emitted;
 } one_sample_dataset;
 
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    uint32_t classes;
+    uint32_t max_detections;
+    uint32_t graph_channels;
+    uint32_t stage_count;
+    uint32_t precision;
+    uint64_t train_updates;
+} test_file_header;
+
 static uint32_t test_crc32(const unsigned char *data, size_t length) {
     uint32_t crc = 0xffffffffU;
     for (size_t i = 0U; i < length; ++i) {
@@ -64,6 +78,30 @@ static int rewrite_crc32(const char *path) {
     return ok && close_result == 0;
 }
 
+static int files_equal(const char *left_path, const char *right_path) {
+    FILE *left = fopen(left_path, "rb");
+    FILE *right = fopen(right_path, "rb");
+    if (left == NULL || right == NULL) {
+        if (left != NULL) fclose(left);
+        if (right != NULL) fclose(right);
+        return 0;
+    }
+    int equal = 1;
+    for (;;) {
+        unsigned char left_buffer[4096];
+        unsigned char right_buffer[4096];
+        size_t left_size = fread(left_buffer, 1U, sizeof(left_buffer), left);
+        size_t right_size = fread(right_buffer, 1U, sizeof(right_buffer), right);
+        if (left_size != right_size || memcmp(left_buffer, right_buffer, left_size) != 0) {
+            equal = 0;
+            break;
+        }
+        if (left_size == 0U) break;
+    }
+    if (fclose(left) != 0 || fclose(right) != 0) equal = 0;
+    return equal;
+}
+
 static int write_truncated_copy(const char *source, const char *destination) {
     FILE *input = fopen(source, "rb");
     if (input == NULL || fseek(input, 0L, SEEK_END) != 0) {
@@ -91,6 +129,59 @@ static int write_truncated_copy(const char *source, const char *destination) {
     if (output != NULL && fclose(output) != 0) ok = 0;
     free(payload);
     return ok;
+}
+
+static size_t test_stage_bytes(int input_channels, int output_channels, int depthwise) {
+    size_t weights = (size_t)(depthwise ? output_channels : output_channels * input_channels) * 9U;
+    size_t packed = (size_t)output_channels *
+                    ((((size_t)(depthwise ? 1 : input_channels) * 9U) + 1U) / 2U);
+    return 10U * sizeof(int) +
+           (2U * weights + 2U * (size_t)output_channels) * sizeof(float) +
+           weights * sizeof(int8_t) + packed * sizeof(uint8_t) +
+           (size_t)output_channels * sizeof(float);
+}
+
+static size_t test_head_bytes(int classes) {
+    size_t outputs = (size_t)4 + (size_t)classes;
+    size_t weights = 4U * outputs;
+    size_t packed = outputs * ((4U + 1U) / 2U);
+    return 2U * sizeof(int) +
+           (2U * weights + 2U * outputs) * sizeof(float) +
+           weights * sizeof(int8_t) + packed * sizeof(uint8_t) +
+           outputs * sizeof(float);
+}
+
+static int mutate_auxiliary_weight(const char *path, int width, int height,
+                                   int channels, int classes) {
+    size_t offset = sizeof(test_file_header);
+    int input_channels = channels;
+    int stage_height = height;
+    int stage_width = width;
+    for (int s = 0; s < 5; ++s) {
+        int output_channels = s == 0 ? 1 : 4;
+        int depthwise = s > 1;
+        offset += test_stage_bytes(input_channels, output_channels, depthwise);
+        input_channels = output_channels;
+        stage_height = (stage_height + 1) / 2;
+        stage_width = (stage_width + 1) / 2;
+    }
+    (void)stage_height;
+    (void)stage_width;
+    offset += 3U * test_head_bytes(classes);
+    offset += 2U * sizeof(int);
+    FILE *file = fopen(path, "r+b");
+    if (file == NULL || fseek(file, (long)offset, SEEK_SET) != 0) {
+        if (file != NULL) fclose(file);
+        return 0;
+    }
+    float replacement = 0.1234567f;
+    if (fseek(file, (long)offset, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+    int ok = fwrite(&replacement, sizeof(replacement), 1U, file) == 1U &&
+             fclose(file) == 0;
+    return ok && rewrite_crc32(path);
 }
 
 static int next_one(void *user, det_sample *sample) {
@@ -314,7 +405,53 @@ static void test_train_predict_roundtrip(void) {
         assert(fabsf(model_detections[i].box.y2 - loaded_detections[i].box.y2) < 1e-6f);
         assert(model_detections[i].box.class_id == loaded_detections[i].box.class_id);
     }
+
+    /* Resume both copies for one deterministic local step.  Matching output
+       after this step covers serialized auxiliary weights and optimizer state,
+       not only the deployed inference bank. */
+    det_train_config continuation = config;
+    continuation.mode = DET_TRAIN_LOCAL_FAST;
+    continuation.epochs = 1;
+    continuation.reset_weights = 0;
+    det_train_report continuation_report;
+    assert(det_train(model, &dataset, &continuation, &continuation_report) == DET_OK);
+    assert(det_train(loaded, &dataset, &continuation, &continuation_report) == DET_OK);
+    assert(det_save(model, path) == DET_OK);
+    const char *continuation_path = "det_test_continuation.cdet";
+    assert(det_save(loaded, continuation_path) == DET_OK);
+    assert(files_equal(path, continuation_path));
+    (void)remove(continuation_path);
+    assert(det_predict(model, &image, 0.1f, model_detections, 16, &current_count) == DET_OK);
+    assert(det_predict(loaded, &image, 0.1f, loaded_detections, 16, &loaded_count) == DET_OK);
+    assert(loaded_count == current_count);
+    for (int i = 0; i < current_count; ++i) {
+        assert(fabsf(model_detections[i].score - loaded_detections[i].score) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x1 - loaded_detections[i].box.x1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y1 - loaded_detections[i].box.y1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x2 - loaded_detections[i].box.x2) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y2 - loaded_detections[i].box.y2) < 1e-6f);
+        assert(model_detections[i].box.class_id == loaded_detections[i].box.class_id);
+    }
     det_model_destroy(loaded);
+    /* The auxiliary bank is training-only: changing its authoritative FP32
+       weight must not alter deployed one-to-one inference. */
+    assert(mutate_auxiliary_weight(path, 32, 32, 1, 1));
+    det_model *aux_mutated = NULL;
+    assert(det_load(ctx, path, &aux_mutated) == DET_OK);
+    det_detection aux_detections[16];
+    int aux_count = 0;
+    assert(det_predict(aux_mutated, &image, 0.1f, aux_detections, 16,
+                       &aux_count) == DET_OK);
+    assert(aux_count == current_count);
+    for (int i = 0; i < current_count; ++i) {
+        assert(fabsf(model_detections[i].score - aux_detections[i].score) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x1 - aux_detections[i].box.x1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y1 - aux_detections[i].box.y1) < 1e-6f);
+        assert(fabsf(model_detections[i].box.x2 - aux_detections[i].box.x2) < 1e-6f);
+        assert(fabsf(model_detections[i].box.y2 - aux_detections[i].box.y2) < 1e-6f);
+        assert(model_detections[i].box.class_id == aux_detections[i].box.class_id);
+    }
+    det_model_destroy(aux_mutated);
     const char *truncated_path = "det_test_truncated.cdet";
     assert(write_truncated_copy(path, truncated_path));
     det_model *truncated = NULL;

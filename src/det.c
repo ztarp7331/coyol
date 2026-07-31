@@ -62,6 +62,7 @@ struct det_model {
     det_model_spec spec;
     det_stage stages[DET_GRAPH_STAGES];
     det_head heads[DET_MAX_SCALES];
+    det_head aux_heads[DET_MAX_SCALES];
     det_precision precision;
     size_t train_updates;
 };
@@ -718,6 +719,11 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
             det_model_destroy(model);
             return status;
         }
+        status = alloc_head(&model->aux_heads[i], h, w, DET_GRAPH_CHANNELS, outputs);
+        if (status != DET_OK) {
+            det_model_destroy(model);
+            return status;
+        }
     }
     *out = model;
     return DET_OK;
@@ -738,6 +744,10 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
             size_t count = (size_t)head->channels * (size_t)head->outputs;
             if (!finite_values(head->weights, count) ||
                 !finite_values(head->bias, (size_t)head->outputs)) return DET_ERR_FORMAT;
+            head = &model->aux_heads[i];
+            count = (size_t)head->channels * (size_t)head->outputs;
+            if (!finite_values(head->weights, count) ||
+                !finite_values(head->bias, (size_t)head->outputs)) return DET_ERR_FORMAT;
         }
         for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
             det_status status = quantize_stage(&model->stages[i], precision);
@@ -745,6 +755,8 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
         }
         for (int i = 0; i < DET_MAX_SCALES; ++i) {
             det_status status = quantize_head(&model->heads[i], precision);
+            if (status != DET_OK) return status;
+            status = quantize_head(&model->aux_heads[i], precision);
             if (status != DET_OK) return status;
         }
         for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
@@ -761,6 +773,14 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
             det_head *head = &model->heads[i];
             size_t wc = (size_t)head->channels * (size_t)head->outputs;
             size_t packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
+            if (precision == DET_PRECISION_INT8) {
+                memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
+            } else {
+                memset(head->quant_weights, 0, wc * sizeof(*head->quant_weights));
+            }
+            head = &model->aux_heads[i];
+            wc = (size_t)head->channels * (size_t)head->outputs;
+            packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
             if (precision == DET_PRECISION_INT8) {
                 memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
             } else {
@@ -785,6 +805,13 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
             memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
             memset(head->quant_scales, 0,
                    (size_t)head->outputs * sizeof(*head->quant_scales));
+            head = &model->aux_heads[i];
+            wc = (size_t)head->channels * (size_t)head->outputs;
+            packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
+            memset(head->quant_weights, 0, wc * sizeof(*head->quant_weights));
+            memset(head->packed_weights, 0, packed * sizeof(*head->packed_weights));
+            memset(head->quant_scales, 0,
+                   (size_t)head->outputs * sizeof(*head->quant_scales));
         }
     }
     model->precision = precision;
@@ -799,6 +826,7 @@ void det_model_destroy(det_model *model) {
     if (model == NULL) return;
     for (int i = 0; i < DET_GRAPH_STAGES; ++i) free_stage(&model->stages[i]);
     for (int i = 0; i < DET_MAX_SCALES; ++i) free_head(&model->heads[i]);
+    for (int i = 0; i < DET_MAX_SCALES; ++i) free_head(&model->aux_heads[i]);
     free(model);
 }
 
@@ -807,17 +835,20 @@ det_status det_model_reset(det_model *model, int seed) {
     model->precision = DET_PRECISION_F32;
     uint32_t state = (uint32_t)(seed == 0 ? 1 : seed);
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
-        det_head *head = &model->heads[s];
-        size_t wc = (size_t)head->channels * (size_t)head->outputs;
-        for (size_t i = 0U; i < wc; ++i) {
-            state = state * 1664525U + 1013904223U;
-            float r = (float)(state & 0xffffU) / 65535.0f;
-            head->weights[i] = (r - 0.5f) * 0.02f;
-            head->velocity_w[i] = 0.0f;
-        }
-        for (int i = 0; i < head->outputs; ++i) {
-            head->bias[i] = 0.0f;
-            head->velocity_b[i] = 0.0f;
+        det_head *head_banks[2] = {&model->heads[s], &model->aux_heads[s]};
+        for (int bank = 0; bank < 2; ++bank) {
+            det_head *head = head_banks[bank];
+            size_t wc = (size_t)head->channels * (size_t)head->outputs;
+            for (size_t i = 0U; i < wc; ++i) {
+                state = state * 1664525U + 1013904223U;
+                float r = (float)(state & 0xffffU) / 65535.0f;
+                head->weights[i] = (r - 0.5f) * 0.02f;
+                head->velocity_w[i] = 0.0f;
+            }
+            for (int i = 0; i < head->outputs; ++i) {
+                head->bias[i] = 0.0f;
+                head->velocity_b[i] = 0.0f;
+            }
         }
     }
     for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
@@ -1099,10 +1130,11 @@ static void centered_iou_gradient(const float prediction[4], const float target[
 }
 
 static float prediction_loss_gradient(const float *prediction, const float *target,
-                                      int outputs, int positive, float gradient[4 + DET_MAX_CLASSES]) {
+                                      int outputs, int positive, int regression_enabled,
+                                      float gradient[4 + DET_MAX_CLASSES]) {
     float loss = 0.0f;
     for (int o = 0; o < outputs; ++o) gradient[o] = 0.0f;
-    if (positive >= 0) {
+    if (positive >= 0 && regression_enabled) {
         float iou = centered_distance_iou(prediction, target);
         float iou_gradient[4];
         centered_iou_gradient(prediction, target, iou_gradient);
@@ -1124,11 +1156,12 @@ static float prediction_loss_gradient(const float *prediction, const float *targ
 }
 
 static void update_head(det_head *head, const float features[4], const float *target,
-                        int positive, float lr, float momentum) {
-    float prediction[4 + DET_MAX_CLASSES];
+                        int positive, int regression_enabled, float lr, float momentum) {
+    float prediction[4 + DET_MAX_CLASSES] = {0.0f};
     float gradient[4 + DET_MAX_CLASSES];
     head_forward(head, features, prediction);
-    (void)prediction_loss_gradient(prediction, target, head->outputs, positive, gradient);
+    (void)prediction_loss_gradient(prediction, target, head->outputs, positive,
+                                   regression_enabled, gradient);
     if (positive < 0) {
         /* LOCAL_FAST sees many more background cells than positives. Keep a
            sparse negative signal without allowing BCE bias updates to erase
@@ -1334,21 +1367,93 @@ static int validate_sample(const det_model *model, const det_sample *sample) {
     return finite_values(sample->image.data, pixels);
 }
 
-static float train_sample(det_model *model, const det_sample *sample,
-                           const det_train_config *config, size_t sample_index,
-                           size_t *updates) {
-    backbone_forward(model, &sample->image);
+static const det_box *assigned_training_box(const det_sample *sample, int scale,
+                                             int cell_x, int cell_y, int radius,
+                                             int image_width, int image_height) {
+    const det_box *best = NULL;
+    int best_distance = INT_MAX;
+    for (int b = 0; b < sample->box_count; ++b) {
+        const det_box *box = &sample->boxes[b];
+        if (choose_scale(box, image_width, image_height) != scale) continue;
+        int target_x = (int)(((box->x1 + box->x2) * 0.5f) /
+                             (float)k_strides[scale]);
+        int target_y = (int)(((box->y1 + box->y2) * 0.5f) /
+                             (float)k_strides[scale]);
+        int distance = abs(cell_x - target_x) + abs(cell_y - target_y);
+        if (abs(cell_x - target_x) > radius || abs(cell_y - target_y) > radius ||
+            distance >= best_distance) continue;
+        best = box;
+        best_distance = distance;
+    }
+    return best;
+}
+
+static int fill_head_target(const det_box *box, int scale, int cell_x, int cell_y,
+                            int classes, float *target) {
+    for (int o = 0; o < 4 + DET_MAX_CLASSES; ++o) target[o] = 0.0f;
+    if (box == NULL || box->class_id < 0 || box->class_id >= classes) return -1;
+    target[box->class_id + 4] = 1.0f;
+    float center_x = ((float)cell_x + 0.5f) * (float)k_strides[scale];
+    float center_y = ((float)cell_y + 0.5f) * (float)k_strides[scale];
+    target[0] = fmaxf(0.0f, (center_x - box->x1) / (float)k_strides[scale]);
+    target[1] = fmaxf(0.0f, (center_y - box->y1) / (float)k_strides[scale]);
+    target[2] = fmaxf(0.0f, (box->x2 - center_x) / (float)k_strides[scale]);
+    target[3] = fmaxf(0.0f, (box->y2 - center_y) / (float)k_strides[scale]);
+    return box->class_id;
+}
+
+static float train_head_cell(det_model *model, const det_sample *sample,
+                             det_head *head, int scale, int cell_x, int cell_y,
+                             const det_box *assigned, size_t sample_index,
+                             int regression_enabled, int force_update, int use_global,
+                             float learning_rate, float momentum,
+                             float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4],
+                             float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES],
+                             size_t *terms, size_t *updates) {
+    float features[4];
+    float target[4 + DET_MAX_CLASSES];
+    float prediction[4 + DET_MAX_CLASSES] = {0.0f};
+    extract_feature(model, &sample->image, scale, cell_y, cell_x, features, NULL);
+    int positive = fill_head_target(assigned, scale, cell_x, cell_y,
+                                    model->spec.num_classes, target);
+    head_forward(head, features, prediction);
+    float prediction_gradient[4 + DET_MAX_CLASSES];
+    float loss = prediction_loss_gradient(prediction, target, head->outputs,
+                                          positive, regression_enabled, prediction_gradient);
+    *terms += (size_t)head->outputs;
+    if (use_global) {
+        for (int o = 0; o < head->outputs; ++o) {
+            gradient_b[scale][o] += prediction_gradient[o];
+            for (int c = 0; c < 4; ++c) {
+                gradient_w[scale][o][c] += prediction_gradient[o] * features[c];
+            }
+        }
+        float feature_gradient[4];
+        feature_gradient_from_error(head, prediction_gradient, feature_gradient);
+        add_feature_gradient_to_backbone(model, scale, cell_y, cell_x, feature_gradient);
+        ++(*updates);
+    } else if (positive >= 0 || force_update ||
+               ((cell_x + cell_y + (int)sample_index + scale) % 16 == 0)) {
+        update_head(head, features, target, positive, regression_enabled,
+                    learning_rate, momentum);
+        ++(*updates);
+    }
+    return loss;
+}
+
+static float train_head_bank(det_model *model, const det_sample *sample,
+                             det_head *heads, int assignment_radius,
+                             size_t sample_index, int use_global,
+                             float learning_rate, float momentum,
+                             float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4],
+                             float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES],
+                             size_t *terms, size_t *updates) {
     float loss = 0.0f;
     float target[4 + DET_MAX_CLASSES];
-    float prediction[4 + DET_MAX_CLASSES];
-    float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4] = {{{0.0f}}};
-    float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES] = {{0.0f}};
-    int use_global = config->mode == DET_TRAIN_GLOBAL_BP;
-    if (use_global) clear_backbone_gradients(model);
-    size_t terms = 0U;
+    float prediction[4 + DET_MAX_CLASSES] = {0.0f};
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
-        det_head *head = &model->heads[s];
-        terms += (size_t)head->height * (size_t)head->width * (size_t)head->outputs;
+        det_head *head = &heads[s];
+        *terms += (size_t)head->height * (size_t)head->width * (size_t)head->outputs;
         for (int y = 0; y < head->height; ++y) {
             for (int x = 0; x < head->width; ++x) {
                 float features[4];
@@ -1357,31 +1462,38 @@ static float train_sample(det_model *model, const det_sample *sample,
                 int positive = -1;
                 const det_box *assigned = NULL;
                 for (int b = 0; b < sample->box_count; ++b) {
-                    if (sample->boxes[b].class_id < 0 || sample->boxes[b].class_id >= model->spec.num_classes) continue;
-                    if (choose_scale(&sample->boxes[b], sample->image.width, sample->image.height) != s) continue;
+                    if (sample->boxes[b].class_id < 0 ||
+                        sample->boxes[b].class_id >= model->spec.num_classes ||
+                        choose_scale(&sample->boxes[b], sample->image.width,
+                                     sample->image.height) != s) continue;
                     int tx = (int)(((sample->boxes[b].x1 + sample->boxes[b].x2) * 0.5f) /
                                    (float)k_strides[s]);
                     int ty = (int)(((sample->boxes[b].y1 + sample->boxes[b].y2) * 0.5f) /
                                    (float)k_strides[s]);
-                    if (tx == x && ty == y) {
+                    if (abs(x - tx) <= assignment_radius &&
+                        abs(y - ty) <= assignment_radius) {
                         positive = sample->boxes[b].class_id;
                         assigned = &sample->boxes[b];
                         break;
                     }
                 }
                 if (positive >= 0 && assigned != NULL) {
-                    target[positive + 4] = 1.0f;
                     float center_x = ((float)x + 0.5f) * (float)k_strides[s];
                     float center_y = ((float)y + 0.5f) * (float)k_strides[s];
-                    target[0] = fmaxf(0.0f, (center_x - assigned->x1) / (float)k_strides[s]);
-                    target[1] = fmaxf(0.0f, (center_y - assigned->y1) / (float)k_strides[s]);
-                    target[2] = fmaxf(0.0f, (assigned->x2 - center_x) / (float)k_strides[s]);
-                    target[3] = fmaxf(0.0f, (assigned->y2 - center_y) / (float)k_strides[s]);
+                    target[positive + 4] = 1.0f;
+                    target[0] = fmaxf(0.0f, (center_x - assigned->x1) /
+                                      (float)k_strides[s]);
+                    target[1] = fmaxf(0.0f, (center_y - assigned->y1) /
+                                      (float)k_strides[s]);
+                    target[2] = fmaxf(0.0f, (assigned->x2 - center_x) /
+                                      (float)k_strides[s]);
+                    target[3] = fmaxf(0.0f, (assigned->y2 - center_y) /
+                                      (float)k_strides[s]);
                 }
                 head_forward(head, features, prediction);
                 float prediction_gradient[4 + DET_MAX_CLASSES];
                 loss += prediction_loss_gradient(prediction, target, head->outputs,
-                                                  positive, prediction_gradient);
+                                                  positive, 1, prediction_gradient);
                 if (use_global) {
                     for (int o = 0; o < head->outputs; ++o) {
                         gradient_b[s][o] += prediction_gradient[o];
@@ -1389,26 +1501,112 @@ static float train_sample(det_model *model, const det_sample *sample,
                             gradient_w[s][o][c] += prediction_gradient[o] * features[c];
                         }
                     }
-                }
-                int should_update = positive >= 0 || ((x + y + (int)sample_index) % 16 == 0);
-                if (use_global) {
                     float feature_gradient[4];
                     feature_gradient_from_error(head, prediction_gradient, feature_gradient);
                     add_feature_gradient_to_backbone(model, s, y, x, feature_gradient);
                     ++(*updates);
-                } else if (should_update) {
-                    update_head(head, features, target, positive, config->learning_rate,
-                                config->momentum);
+                } else if (positive >= 0 ||
+                           ((x + y + (int)sample_index) % 16 == 0)) {
+                    update_head(head, features, target, positive, 1,
+                                learning_rate, momentum);
                     ++(*updates);
                 }
             }
         }
+    }
+    return loss;
+}
+
+static float train_auxiliary_head_bank(det_model *model, const det_sample *sample,
+                                       size_t sample_index, int use_global,
+                                       float learning_rate, float momentum,
+                                       float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4],
+                                       float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES],
+                                       size_t *terms, size_t *updates) {
+    float loss = 0.0f;
+    for (int s = 0; s < DET_MAX_SCALES; ++s) {
+        det_head *head = &model->aux_heads[s];
+        for (int b = 0; b < sample->box_count; ++b) {
+            const det_box *box = &sample->boxes[b];
+            if (choose_scale(box, sample->image.width, sample->image.height) != s) continue;
+            int target_x = (int)(((box->x1 + box->x2) * 0.5f) /
+                                 (float)k_strides[s]);
+            int target_y = (int)(((box->y1 + box->y2) * 0.5f) /
+                                 (float)k_strides[s]);
+            for (int y = target_y - 1; y <= target_y + 1; ++y) {
+                if (y < 0 || y >= head->height) continue;
+                for (int x = target_x - 1; x <= target_x + 1; ++x) {
+                    if (x < 0 || x >= head->width) continue;
+                    const det_box *assigned = assigned_training_box(
+                        sample, s, x, y, 1,
+                        sample->image.width, sample->image.height);
+                    if (assigned != box) continue;
+                    float center_x = ((float)x + 0.5f) * (float)k_strides[s];
+                    float center_y = ((float)y + 0.5f) * (float)k_strides[s];
+                    int center_inside = center_x >= assigned->x1 && center_x <= assigned->x2 &&
+                                        center_y >= assigned->y1 && center_y <= assigned->y2;
+                    if (!center_inside && (x != target_x || y != target_y)) continue;
+                    loss += train_head_cell(model, sample, head, s, x, y, assigned,
+                                            sample_index, center_inside, 0, use_global,
+                                            learning_rate, momentum,
+                                            gradient_w, gradient_b, terms, updates);
+                }
+            }
+        }
+        int cell_count = head->height * head->width;
+        int negatives = 0;
+        size_t start = sample_index * 17U + (size_t)s * 313U;
+        for (int step = 0; step < cell_count && negatives < 4; ++step) {
+            int flat = (int)((start + (size_t)step) % (size_t)cell_count);
+            int x = flat % head->width;
+            int y = flat / head->width;
+            if (assigned_training_box(sample, s, x, y, 1,
+                                      sample->image.width, sample->image.height) != NULL) {
+                continue;
+            }
+            loss += train_head_cell(model, sample, head, s, x, y, NULL,
+                                    sample_index, 0, 1, use_global,
+                                    learning_rate, momentum,
+                                    gradient_w, gradient_b, terms, updates);
+            ++negatives;
+        }
+    }
+    return loss;
+}
+
+static float train_sample(det_model *model, const det_sample *sample,
+                           const det_train_config *config, size_t sample_index,
+                           size_t *updates) {
+    backbone_forward(model, &sample->image);
+    float loss = 0.0f;
+    float gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4] = {{{0.0f}}};
+    float gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES] = {{0.0f}};
+    float aux_gradient_w[DET_MAX_SCALES][4 + DET_MAX_CLASSES][4] = {{{0.0f}}};
+    float aux_gradient_b[DET_MAX_SCALES][4 + DET_MAX_CLASSES] = {{0.0f}};
+    int use_global = config->mode == DET_TRAIN_GLOBAL_BP;
+    int aux_sampled = (sample_index & 15U) == 0U;
+    if (use_global) clear_backbone_gradients(model);
+    size_t terms = 0U;
+    loss += train_head_bank(model, sample, model->heads, 0, sample_index, use_global,
+                            config->learning_rate, config->momentum,
+                            gradient_w, gradient_b, &terms, updates);
+    /* The auxiliary one-to-many bank is a training-only regularizer. Updating
+       it every sixteenth sample bounds its CPU cost while preserving a full
+       one-to-many neighborhood whenever the bank is sampled. */
+    if (aux_sampled) {
+        loss += train_auxiliary_head_bank(model, sample, sample_index, use_global,
+                                          config->learning_rate, config->momentum,
+                                          aux_gradient_w, aux_gradient_b, &terms, updates);
     }
     if (use_global && terms > 0U) {
         float scale = 1.0f / (float)terms;
         for (int s = 0; s < DET_MAX_SCALES; ++s) {
             apply_head_gradient(&model->heads[s], gradient_w[s], gradient_b[s],
                                 config->learning_rate, config->momentum, scale);
+            if (aux_sampled) {
+                apply_head_gradient(&model->aux_heads[s], aux_gradient_w[s], aux_gradient_b[s],
+                                    config->learning_rate, config->momentum, scale);
+            }
         }
         backbone_backward(model, &sample->image);
         for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
@@ -1598,19 +1796,21 @@ static int expected_payload_size(const det_file_header *header, size_t *out) {
         input_channels = output_channels;
     }
     int outputs = 4 + (int)header->classes;
-    for (int s = 0; s < DET_MAX_SCALES; ++s) {
-        int height = ((int)header->height + k_strides[s] - 1) / k_strides[s];
-        int width = ((int)header->width + k_strides[s] - 1) / k_strides[s];
-        size_t wc = (size_t)DET_GRAPH_CHANNELS * (size_t)outputs;
-        size_t packed = (size_t)outputs * ((DET_GRAPH_CHANNELS + 1U) / 2U);
-        size_t bytes = 2U * sizeof(int);
-        if (!checked_add_size(bytes, (2U * wc + 2U * (size_t)outputs) * sizeof(float), &bytes) ||
-            !checked_add_size(bytes, wc * sizeof(int8_t), &bytes) ||
-            !checked_add_size(bytes, packed * sizeof(uint8_t), &bytes) ||
-            !checked_add_size(bytes, (size_t)outputs * sizeof(float), &bytes) ||
-            !checked_add_size(total, bytes, &total)) return 0;
-        (void)height;
-        (void)width;
+    for (int bank = 0; bank < 2; ++bank) {
+        for (int s = 0; s < DET_MAX_SCALES; ++s) {
+            int height = ((int)header->height + k_strides[s] - 1) / k_strides[s];
+            int width = ((int)header->width + k_strides[s] - 1) / k_strides[s];
+            size_t wc = (size_t)DET_GRAPH_CHANNELS * (size_t)outputs;
+            size_t packed = (size_t)outputs * ((DET_GRAPH_CHANNELS + 1U) / 2U);
+            size_t bytes = 2U * sizeof(int);
+            if (!checked_add_size(bytes, (2U * wc + 2U * (size_t)outputs) * sizeof(float), &bytes) ||
+                !checked_add_size(bytes, wc * sizeof(int8_t), &bytes) ||
+                !checked_add_size(bytes, packed * sizeof(uint8_t), &bytes) ||
+                !checked_add_size(bytes, (size_t)outputs * sizeof(float), &bytes) ||
+                !checked_add_size(total, bytes, &total)) return 0;
+            (void)height;
+            (void)width;
+        }
     }
     *out = total;
     return 1;
@@ -1631,19 +1831,22 @@ det_status det_save(const det_model *model, const char *path) {
         }
     }
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
-        const det_head *head = &model->heads[s];
-        if (!finite_values(head->weights, (size_t)head->channels * (size_t)head->outputs) ||
-            !finite_values(head->bias, (size_t)head->outputs) ||
-            !finite_values(head->velocity_w, (size_t)head->channels * (size_t)head->outputs) ||
-            !finite_values(head->velocity_b, (size_t)head->outputs) ||
-            (model->precision != DET_PRECISION_F32 &&
-             !positive_finite_values(head->quant_scales, (size_t)head->outputs))) {
-            return DET_ERR_FORMAT;
+        const det_head *head_banks[2] = {&model->heads[s], &model->aux_heads[s]};
+        for (int bank = 0; bank < 2; ++bank) {
+            const det_head *head = head_banks[bank];
+            if (!finite_values(head->weights, (size_t)head->channels * (size_t)head->outputs) ||
+                !finite_values(head->bias, (size_t)head->outputs) ||
+                !finite_values(head->velocity_w, (size_t)head->channels * (size_t)head->outputs) ||
+                !finite_values(head->velocity_b, (size_t)head->outputs) ||
+                (model->precision != DET_PRECISION_F32 &&
+                 !positive_finite_values(head->quant_scales, (size_t)head->outputs))) {
+                return DET_ERR_FORMAT;
+            }
         }
     }
     FILE *file = fopen(path, "wb");
     if (file == NULL) return DET_ERR_IO;
-    det_file_header header = {{'C', 'D', 'E', 'T'}, 5U, (uint32_t)model->spec.width,
+    det_file_header header = {{'C', 'D', 'E', 'T'}, 6U, (uint32_t)model->spec.width,
                               (uint32_t)model->spec.height, (uint32_t)model->spec.channels,
                               (uint32_t)model->spec.num_classes, (uint32_t)model->spec.max_detections,
                               DET_GRAPH_CHANNELS, DET_GRAPH_STAGES, (uint32_t)model->precision,
@@ -1674,22 +1877,24 @@ det_status det_save(const det_model *model, const char *path) {
              fwrite(stage->quant_scales, sizeof(float), (size_t)stage->output_channels, file) ==
                  (size_t)stage->output_channels;
     }
-    for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
-        const det_head *head = &model->heads[s];
-        size_t wc = (size_t)head->channels * (size_t)head->outputs;
-        ok = fwrite(&head->height, sizeof(head->height), 1U, file) == 1U &&
-             fwrite(&head->width, sizeof(head->width), 1U, file) == 1U &&
-             fwrite(head->weights, sizeof(float), wc, file) == wc &&
-             fwrite(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
-             fwrite(head->velocity_w, sizeof(float), wc, file) == wc &&
-             fwrite(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
-                 (size_t)head->outputs &&
-             fwrite(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
-             fwrite(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
-                    (((size_t)head->channels + 1U) / 2U), file) ==
-                 (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
-             fwrite(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
-                 (size_t)head->outputs;
+    for (int bank = 0; ok && bank < 2; ++bank) {
+        for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
+            const det_head *head = bank == 0 ? &model->heads[s] : &model->aux_heads[s];
+            size_t wc = (size_t)head->channels * (size_t)head->outputs;
+            ok = fwrite(&head->height, sizeof(head->height), 1U, file) == 1U &&
+                 fwrite(&head->width, sizeof(head->width), 1U, file) == 1U &&
+                 fwrite(head->weights, sizeof(float), wc, file) == wc &&
+                 fwrite(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
+                 fwrite(head->velocity_w, sizeof(float), wc, file) == wc &&
+                 fwrite(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
+                     (size_t)head->outputs &&
+                 fwrite(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
+                 fwrite(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
+                        (((size_t)head->channels + 1U) / 2U), file) ==
+                     (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
+                 fwrite(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
+                     (size_t)head->outputs;
+        }
     }
     int close_result = fclose(file);
     if (!ok || close_result != 0) return DET_ERR_IO;
@@ -1741,7 +1946,7 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     det_file_header header;
     if (fseek(file, 0L, SEEK_SET) != 0 ||
         fread(&header, sizeof(header), 1U, file) != 1U ||
-        memcmp(header.magic, "CDET", 4U) != 0 || header.version != 5U ||
+        memcmp(header.magic, "CDET", 4U) != 0 || header.version != 6U ||
         header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES ||
         !valid_precision((det_precision)header.precision)) {
         fclose(file);
@@ -1824,28 +2029,30 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
              finite_values(stage->velocity_w, wc) &&
              finite_values(stage->velocity_b, (size_t)stage->output_channels);
     }
-    for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
-        det_head *head = &model->heads[s];
-        int h = 0;
-        int w = 0;
-        size_t wc = (size_t)head->channels * (size_t)head->outputs;
-        ok = fread(&h, sizeof(h), 1U, file) == 1U && fread(&w, sizeof(w), 1U, file) == 1U &&
-             h == head->height && w == head->width &&
-             fread(head->weights, sizeof(float), wc, file) == wc &&
-             fread(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
-             fread(head->velocity_w, sizeof(float), wc, file) == wc &&
-             fread(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
-                 (size_t)head->outputs &&
-             fread(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
-             fread(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
-                   (((size_t)head->channels + 1U) / 2U), file) ==
-                 (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
-             fread(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
-                 (size_t)head->outputs &&
-             finite_values(head->weights, wc) &&
-             finite_values(head->bias, (size_t)head->outputs) &&
-             finite_values(head->velocity_w, wc) &&
-             finite_values(head->velocity_b, (size_t)head->outputs);
+    for (int bank = 0; ok && bank < 2; ++bank) {
+        for (int s = 0; ok && s < DET_MAX_SCALES; ++s) {
+            det_head *head = bank == 0 ? &model->heads[s] : &model->aux_heads[s];
+            int h = 0;
+            int w = 0;
+            size_t wc = (size_t)head->channels * (size_t)head->outputs;
+            ok = fread(&h, sizeof(h), 1U, file) == 1U && fread(&w, sizeof(w), 1U, file) == 1U &&
+                 h == head->height && w == head->width &&
+                 fread(head->weights, sizeof(float), wc, file) == wc &&
+                 fread(head->bias, sizeof(float), (size_t)head->outputs, file) == (size_t)head->outputs &&
+                 fread(head->velocity_w, sizeof(float), wc, file) == wc &&
+                 fread(head->velocity_b, sizeof(float), (size_t)head->outputs, file) ==
+                     (size_t)head->outputs &&
+                 fread(head->quant_weights, sizeof(int8_t), wc, file) == wc &&
+                 fread(head->packed_weights, sizeof(uint8_t), (size_t)head->outputs *
+                       (((size_t)head->channels + 1U) / 2U), file) ==
+                     (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U) &&
+                 fread(head->quant_scales, sizeof(float), (size_t)head->outputs, file) ==
+                     (size_t)head->outputs &&
+                 finite_values(head->weights, wc) &&
+                 finite_values(head->bias, (size_t)head->outputs) &&
+                 finite_values(head->velocity_w, wc) &&
+                 finite_values(head->velocity_b, (size_t)head->outputs);
+        }
     }
     fclose(file);
     if (!ok) {

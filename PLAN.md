@@ -71,6 +71,13 @@ at the conventional 0.25 threshold after the background-control ablation; the
 synthetic overfit test passes, but localization quality, confidence
 calibration, and the larger functional/accuracy gate remain open. The
 benchmark exposes `--threshold` for repeatable calibration measurements.
+With the auxiliary one-to-many bank enabled, repeated post-fix runs on the
+development CPU measured 0.951--0.988 s F32, 0.933--0.974 s INT8, and
+0.935--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples positive
+3 x 3 neighborhoods plus up to four deterministic negatives per scale every
+sixteenth image and does not change inference. The occasional W4A8 overrun
+shows why the one-second result is still a stretch target, not a qualified
+guarantee.
 
 Two training times must be published:
 
@@ -90,11 +97,11 @@ are reported separately. It reserves a unique checkpoint path per process and
 malformed or unknown benchmark options fail closed.
 
 Verification status for this checkpoint: fresh Release, Debug, and ASan builds
-pass CTest; 5,000-image Release LOCAL_FAST runs pass through the F32, INT8, and
-W4A8 profiles; GLOBAL_BP remains the reference run; and boundary smoke tests
-cover the minimum and odd/even image sizes. This specialization is still an
-verified and pushed in commit `e47afc1`; the official raw/full-architecture
-training gate remains open.
+pass CTest; 5,000-image Release LOCAL_FAST runs cover F32, INT8, and W4A8;
+GLOBAL_BP remains the reference run; and boundary smoke tests cover minimum and
+odd/even image sizes. This specialization is verified and pushed in the current
+dual-assignment checkpoint; the official raw/full-architecture training gate
+remains open.
 
 COCO is not part of the core API or the first timing contract. COCO 2017 becomes
 an optional 80-class scalability and accuracy test after the 5,000-image gate
@@ -144,10 +151,10 @@ The shared detection tower produces, at every scale:
 - per-scale integer gain and bias.
 
 There is no DFL. The deployed one-to-one output requires thresholding, box
-decoding, and fixed-size top-K selection but no NMS. A one-to-many head remains
-planned as a training-only auxiliary head; the current compact implementation
-has one learned head per scale and therefore has not yet delivered dual
-assignment.
+decoding, and fixed-size top-K selection but no NMS. The current model carries
+a serialized training-only one-to-many auxiliary head per scale. It supervises
+a 3 x 3 neighborhood periodically during training; inference reads only the
+one-to-one bank, so the deployment path remains NMS-free.
 
 These choices retain YOLO26's useful deployment ideas—DFL-free regression and
 dual-head NMS-free detection—without copying its complete architecture:
@@ -156,8 +163,10 @@ dual-head NMS-free detection—without copying its complete architecture:
 
 The current C implementation has the same five-resolution topology but uses a
 compact 1/4-channel edge variant while the kernels and training path are being
-validated. The stage weights are learned from scratch, P3/P4/P5 are real
-spatial feature maps, and `GLOBAL_BP` uses convolutional backward operators.
+validated. The stage weights and both head banks are learned from scratch,
+P3/P4/P5 are real spatial feature maps, and `GLOBAL_BP` uses convolutional
+backward operators. The auxiliary bank is training-only and is never read by
+`det_predict`.
 The larger channel table remains the next scale-up experiment, not a claim
 about the current binary.
 
@@ -175,10 +184,11 @@ latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
 
 ### 2.2 Fast full-model learning
 
-`LOCAL_FAST` must update the convolutional backbone, neck, and head once the
-neck is present. It must not use a frozen or pretrained detector. The current
-compact graph has no learned neck yet, so its measured LOCAL_FAST path updates
-the backbone and heads only.
+`LOCAL_FAST` must update the convolutional backbone, neck, and both assignment
+heads once the neck is present. It must not use a frozen or pretrained detector.
+The current compact graph has no learned neck yet; its measured LOCAL_FAST path
+updates the backbone, the deployed one-to-one heads, and the periodic
+training-only one-to-many bank.
 
 The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
@@ -231,11 +241,10 @@ This framework treats the timing as a falsifiable experiment:
 
 `GLOBAL_BP` trains the identical current graph with ordinary end-to-end
 backpropagation. It provides the gradient and convergence reference needed
-before adding the planned neck and auxiliary assignment head:
+before adding the planned neck:
 
 - gradient and convergence truth for `LOCAL_FAST`;
-- one-to-one assignment in the current head, with one-to-many plus one-to-one
-  consistent assignment reserved for the dual-head increment;
+- one-to-many auxiliary plus one-to-one deployment assignment;
 - Progressive Loss moving from `(0.8, 0.2)` to `(0.1, 0.9)`;
 - tiny-object assignment protection;
 - BCE classification loss;
@@ -353,9 +362,10 @@ Use per-output-channel symmetric weight scales, per-tensor activation scales,
 INT32 accumulation, and integer multiplier-plus-shift requantization. Precision
 profiles are compiled separately rather than switched at runtime.
 
-The current version-5 `CDET` model contains graph metadata, tensor shapes,
+The current version-6 `CDET` model contains graph metadata, tensor shapes,
 FP32 optimizer state, quantized buffers/scales, and a CRC32 over the payload.
-It does not serialize pointers. On load, FP32 weights are authoritative and
+It contains both the deployed one-to-one and training-only one-to-many head
+banks and does not serialize pointers. On load, FP32 weights are authoritative and
 quantized caches are regenerated, preventing contradictory CRC-valid cache
 state. The on-disk integers/floats are still native ABI fields; a portable
 endian-neutral format and atomic replacement are explicit follow-up hardening
@@ -398,8 +408,10 @@ before accepting very large edge-hosted dimensions.
 
 ### Phase 4: global accuracy path
 
-- Add dual assignment, Progressive Loss, tiny-object assignment protection,
-  and optional contextual convolution at P4/P5.
+- Dual assignment is implemented in CDET v6 as a serialized auxiliary
+  one-to-many training bank plus one-to-one deployment bank.
+- Add Progressive Loss, tiny-object assignment protection, and optional
+  contextual convolution at P4/P5.
 - Compare `LOCAL_FAST` and `GLOBAL_BP` on the same architecture and data.
 - Keep contextual convolution only if its accuracy gain exceeds its measured
   CPU and memory penalty:
