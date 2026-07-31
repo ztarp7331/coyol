@@ -102,6 +102,34 @@ static int files_equal(const char *left_path, const char *right_path) {
     return equal;
 }
 
+static int file_regions_differ(const char *left_path, const char *right_path,
+                               size_t offset, size_t length) {
+    FILE *left = fopen(left_path, "rb");
+    FILE *right = fopen(right_path, "rb");
+    unsigned char *left_data = NULL;
+    unsigned char *right_data = NULL;
+    int different = 0;
+    if (left == NULL || right == NULL || length == 0U ||
+        fseek(left, (long)offset, SEEK_SET) != 0 ||
+        fseek(right, (long)offset, SEEK_SET) != 0) {
+        if (left != NULL) fclose(left);
+        if (right != NULL) fclose(right);
+        return 0;
+    }
+    left_data = (unsigned char *)malloc(length);
+    right_data = (unsigned char *)malloc(length);
+    if (left_data != NULL && right_data != NULL &&
+        fread(left_data, 1U, length, left) == length &&
+        fread(right_data, 1U, length, right) == length) {
+        different = memcmp(left_data, right_data, length) != 0;
+    }
+    free(left_data);
+    free(right_data);
+    fclose(left);
+    fclose(right);
+    return different;
+}
+
 static int write_truncated_copy(const char *source, const char *destination) {
     FILE *input = fopen(source, "rb");
     if (input == NULL || fseek(input, 0L, SEEK_END) != 0) {
@@ -131,14 +159,21 @@ static int write_truncated_copy(const char *source, const char *destination) {
     return ok;
 }
 
-static size_t test_stage_bytes(int input_channels, int output_channels, int depthwise) {
-    size_t weights = (size_t)(depthwise ? output_channels : output_channels * input_channels) * 9U;
+static size_t test_stage_bytes_kernel(int input_channels, int output_channels, int depthwise,
+                                      int kernel) {
+    size_t weights = (size_t)(depthwise ? output_channels : output_channels * input_channels) *
+                     (size_t)kernel * (size_t)kernel;
     size_t packed = (size_t)output_channels *
-                    ((((size_t)(depthwise ? 1 : input_channels) * 9U) + 1U) / 2U);
+                    ((((size_t)(depthwise ? 1 : input_channels) * (size_t)kernel *
+                       (size_t)kernel) + 1U) / 2U);
     return 10U * sizeof(int) +
            (2U * weights + 2U * (size_t)output_channels) * sizeof(float) +
            weights * sizeof(int8_t) + packed * sizeof(uint8_t) +
            (size_t)output_channels * sizeof(float);
+}
+
+static size_t test_stage_bytes(int input_channels, int output_channels, int depthwise) {
+    return test_stage_bytes_kernel(input_channels, output_channels, depthwise, 3);
 }
 
 static size_t test_head_bytes(int classes) {
@@ -660,6 +695,9 @@ static void test_odd_shape_neck_roundtrip(void) {
     det_model *loaded = NULL;
     det_model_spec spec = {33, 31, 1, 1, 8, 3};
     float pixels[33 * 31] = {0.0f};
+    for (int y = 4; y < 12; ++y) {
+        for (int x = 4; x < 12; ++x) pixels[y * 33 + x] = 1.0f;
+    }
     det_image image = {pixels, 1, 31, 33};
     det_detection before[8];
     det_detection trained[8];
@@ -685,6 +723,18 @@ static void test_odd_shape_neck_roundtrip(void) {
     assert(det_predict(model, &image, 0.1f, trained, 8, &trained_count) == DET_OK);
     assert(det_save(model, path) == DET_OK);
     assert(!files_equal(before_path, path));
+    size_t bottomup_offset = sizeof(test_file_header);
+    int input_channels = 1;
+    for (int stage = 0; stage < 5; ++stage) {
+        int output_channels = stage == 0 ? 1 : 4;
+        bottomup_offset += test_stage_bytes(input_channels, output_channels, stage > 1);
+        input_channels = output_channels;
+    }
+    bottomup_offset += 6U * test_head_bytes(1);
+    bottomup_offset += 3U * test_stage_bytes_kernel(4, 4, 0, 1);
+    bottomup_offset += 10U * sizeof(int);
+    assert(file_regions_differ(before_path, path, bottomup_offset,
+                               4U * 9U * sizeof(float)));
     assert(det_load(ctx, path, &loaded) == DET_OK);
     assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
     assert(after_count == trained_count);

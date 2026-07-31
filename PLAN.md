@@ -78,12 +78,16 @@ INT8, and 0.906--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples p
 sixteenth image and does not change inference. The occasional W4A8 overrun
 shows why the one-second result is still a stretch target, not a qualified
 guarantee.
-The first top-down-neck build with its local update measured 1.147 s F32,
-1.201 s INT8, and 1.132 s W4A8 for 5,000 synthetic 160 x 160 images on the
-development CPU; the same compact graph at 33 x 33 measured 101--111 ms.
+The top-down plus bottom-up build measured 1.137 s F32, 1.202 s INT8, and
+1.109 s W4A8 for 5,000 synthetic 160 x 160 images on the development CPU; the
+same compact graph at 33 x 33 remains about 100--118 ms.
 These are timing checkpoints, not accuracy claims. The 160 x 160 local path is
 currently above the one-second stretch gate, so the neck must be optimized or
 the gate must be qualified on a documented lower-resolution edge profile.
+The bottom-up extension is now wired as two depthwise 3 x 3 stride-2 stages;
+its zero initialization preserves the validated local path while `GLOBAL_BP`
+can learn the new fusion weights. LOCAL_FAST bottom-up learning is an explicit
+next ablation because the naive local target destabilized the compact detector.
 
 Two training times must be published:
 
@@ -123,9 +127,9 @@ malformed or unknown benchmark options fail closed.
 Verification status for this checkpoint: fresh Release, Debug, and ASan builds
 pass CTest; 5,000-image Release LOCAL_FAST runs cover F32, INT8, and W4A8;
 GLOBAL_BP remains the reference run; and boundary smoke tests cover minimum and
-odd/even image sizes. This specialization is verified and pushed in the current
-evaluation checkpoint; the official raw/full-architecture training gate remains
-open.
+odd/even image sizes, including a serialized proof that bottom-up weights change
+under global training. This specialization is verified; the official raw/full-
+architecture training gate remains open.
 
 The first raw-manifest smoke on a 33 x 33 P2 image completed successfully in
 9.529--47.100 ms end-to-end across repeated runs (including decode, resize,
@@ -215,12 +219,13 @@ latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
 
 `LOCAL_FAST` must update the convolutional backbone, neck, and both assignment
 heads once the neck is present. It must not use a frozen or pretrained detector.
-The compact graph now has three learned 1 x 1 lateral projections and a
-top-down P5-to-P3 nearest-neighbor fusion path. `GLOBAL_BP` propagates through
-the fusion and updates the lateral weights; `LOCAL_FAST` applies the same
-deterministic sparse local rule to the three lateral stages. This is
-intentionally smaller than the research table's 48-channel PAN target and does
-not yet claim the bottom-up pass.
+The compact graph now has three learned 1 x 1 lateral projections, a top-down
+P5-to-P3 nearest-neighbor fusion path, and two depthwise bottom-up stages
+(P3-to-P4 and P4-to-P5). `GLOBAL_BP` propagates through both directions and
+updates all neck stages; `LOCAL_FAST` applies the deterministic sparse local
+rule to the three lateral stages while bottom-up local learning remains an
+ablation. This is intentionally smaller than the research table's 48-channel
+PAN target.
 
 The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
@@ -394,7 +399,7 @@ Use per-output-channel symmetric weight scales, per-tensor activation scales,
 INT32 accumulation, and integer multiplier-plus-shift requantization. Precision
 profiles are compiled separately rather than switched at runtime.
 
-The current version-7 `CDET` model contains graph metadata, tensor shapes,
+The current version-8 `CDET` model contains graph metadata, tensor shapes,
 FP32 optimizer state, quantized buffers/scales, and a CRC32 over the payload.
 It contains both the deployed one-to-one and training-only one-to-many head
 banks and does not serialize pointers. On load, FP32 weights are authoritative and
@@ -440,7 +445,7 @@ before accepting very large edge-hosted dimensions.
 
 ### Phase 4: global accuracy path
 
-- Dual assignment is implemented in CDET v6 as a serialized auxiliary
+- Dual assignment is implemented in CDET v8 as a serialized auxiliary
   one-to-many training bank plus one-to-one deployment bank.
 - Add Progressive Loss, tiny-object assignment protection, and optional
   contextual convolution at P4/P5.
