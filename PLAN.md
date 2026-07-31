@@ -78,12 +78,17 @@ INT8, and 0.906--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples p
 sixteenth image and does not change inference. The occasional W4A8 overrun
 shows why the one-second result is still a stretch target, not a qualified
 guarantee.
-The top-down plus bottom-up build measured 1.137 s F32, 1.202 s INT8, and
-1.109 s W4A8 for 5,000 synthetic 160 x 160 images on the development CPU; the
-same compact graph at 33 x 33 remains about 100--118 ms.
-These are timing checkpoints, not accuracy claims. The 160 x 160 local path is
-currently above the one-second stretch gate, so the neck must be optimized or
-the gate must be qualified on a documented lower-resolution edge profile.
+The top-down plus bottom-up build with the one-box local-update fast path
+measured 0.974 s F32, 0.997 s INT8, and 1.045 s W4A8 for 5,000 synthetic
+160 x 160 images on a pinned development CPU; repeated runs remain host-load
+sensitive. The same compact graph at 33 x 33 remains about 100--118 ms.
+These are timing checkpoints, not accuracy claims. The 160 x 160 local path
+currently meets the one-second stretch gate for F32/INT8 on the pinned host;
+W4A8 remains just above it and needs a separate packed-weight optimization.
+The fast path preserves the original row-major target/update order for the
+common one-box stream and retains the original multi-box fallback. The C
+convolution API now has dedicated 1-channel stride-2 and 1 x 1 kernels; generic
+shape behavior remains covered by the parity tests.
 The bottom-up extension is now wired as two depthwise 3 x 3 stride-2 stages;
 its zero initialization preserves the validated local path while `GLOBAL_BP`
 can learn the new fusion weights. LOCAL_FAST bottom-up learning is an explicit

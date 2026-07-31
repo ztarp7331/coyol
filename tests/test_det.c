@@ -349,6 +349,21 @@ static void test_arena_and_conv(void) {
     assert(det_conv2d_f32(&input, weights, bias, 1, 3, 1, 0, &output) == DET_OK);
     assert(fabsf(output.data[0] + 6.0f) < 1e-6f);
 
+    det_tensor_f32 point_input;
+    det_tensor_f32 point_output;
+    assert(det_tensor_alloc(&arena, 2, 2, 2, &point_input) == DET_OK);
+    assert(det_tensor_alloc(&arena, 2, 2, 2, &point_output) == DET_OK);
+    for (int i = 0; i < 4; ++i) {
+        point_input.data[i] = (float)(i + 1);
+        point_input.data[4 + i] = (float)(i + 5);
+    }
+    const float point_weights[4] = {1.0f, 2.0f, -1.0f, 0.5f};
+    const float point_bias[2] = {0.25f, -0.5f};
+    assert(det_conv2d_f32(&point_input, point_weights, point_bias, 2, 1, 1, 0,
+                          &point_output) == DET_OK);
+    assert(fabsf(point_output.data[0] - 11.25f) < 1e-6f);
+    assert(fabsf(point_output.data[4] - 1.0f) < 1e-6f);
+
     det_tensor_f32 grad_output;
     det_tensor_f32 grad_input;
     assert(det_tensor_alloc(&arena, 1, 1, 1, &grad_output) == DET_OK);

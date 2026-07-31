@@ -214,6 +214,40 @@ det_status det_conv2d_f32(const det_tensor_f32 *input, const float *weights,
     if (kernel == 3 && stride == 2 && padding == 1) {
         size_t input_plane = (size_t)input->height * (size_t)input->width;
         size_t output_plane = (size_t)expected_h * (size_t)expected_w;
+        if (input->channels == 1) {
+            for (int oc = 0; oc < out_channels; ++oc) {
+                const float *output_weights = weights + (size_t)oc * 9U;
+                float *output_channel = output->data + (size_t)oc * output_plane;
+                for (int oy = 0; oy < expected_h; ++oy) {
+                    int iy_base = oy * 2 - 1;
+                    int ky_start = iy_base < 0 ? -iy_base : 0;
+                    int ky_end = input->height - iy_base;
+                    if (ky_end > 3) ky_end = 3;
+                    if (ky_start > ky_end) ky_start = ky_end;
+                    for (int ox = 0; ox < expected_w; ++ox) {
+                        int ix_base = ox * 2 - 1;
+                        int kx_start = ix_base < 0 ? -ix_base : 0;
+                        int kx_end = input->width - ix_base;
+                        if (kx_end > 3) kx_end = 3;
+                        if (kx_start > kx_end) kx_start = kx_end;
+                        float sum = bias[oc];
+                        for (int ky = ky_start; ky < ky_end; ++ky) {
+                            const float *input_row = input->data +
+                                (size_t)(iy_base + ky) * (size_t)input->width +
+                                (size_t)(ix_base + kx_start);
+                            const float *weight_row = output_weights + (size_t)ky * 3U +
+                                (size_t)kx_start;
+                            for (int kx = kx_start; kx < kx_end; ++kx) {
+                                sum += weight_row[kx - kx_start] *
+                                       input_row[kx - kx_start];
+                            }
+                        }
+                        output_channel[(size_t)oy * (size_t)expected_w + (size_t)ox] = sum;
+                    }
+                }
+            }
+            return DET_OK;
+        }
         for (int oc = 0; oc < out_channels; ++oc) {
             const float *output_weights = weights +
                 (size_t)oc * (size_t)input->channels * 9U;
@@ -249,6 +283,23 @@ det_status det_conv2d_f32(const det_tensor_f32 *input, const float *weights,
                     }
                     output_channel[(size_t)oy * (size_t)expected_w + (size_t)ox] = sum;
                 }
+            }
+        }
+        return DET_OK;
+    }
+    if (kernel == 1 && stride == 1 && padding == 0) {
+        size_t input_plane = (size_t)input->height * (size_t)input->width;
+        for (int oc = 0; oc < out_channels; ++oc) {
+            const float *output_weights = weights +
+                (size_t)oc * (size_t)input->channels;
+            float *output_channel = output->data + (size_t)oc * input_plane;
+            for (size_t index = 0U; index < input_plane; ++index) {
+                float sum = bias[oc];
+                for (int ic = 0; ic < input->channels; ++ic) {
+                    sum += output_weights[ic] * input->data[
+                        (size_t)ic * input_plane + index];
+                }
+                output_channel[index] = sum;
             }
         }
         return DET_OK;
@@ -1610,44 +1661,82 @@ static int stage_box_target(const det_sample *sample, int stage_index, int x, in
     return 0;
 }
 
+static void local_update_stage_cell(det_stage *stage, const float *input_data,
+                                    int y, int x, const float target[4],
+                                    float lr, float momentum, size_t *updates) {
+    for (int oc = 0; oc < stage->output_channels; ++oc) {
+        size_t output_index = ((size_t)oc * (size_t)stage->output_height + (size_t)y) *
+                              (size_t)stage->output_width + (size_t)x;
+        /* LOCAL_FAST uses a straight-through ReLU surrogate so a dead stage
+           can receive a positive local target and recover. */
+        float error = stage->activation[output_index] - target[oc];
+        size_t bias_index = (size_t)oc;
+        stage->velocity_b[bias_index] = momentum * stage->velocity_b[bias_index] + error;
+        stage->bias[bias_index] -= lr * stage->velocity_b[bias_index];
+        for (int ic = 0; ic < stage->input_channels; ++ic) {
+            if (stage->depthwise && ic != oc) continue;
+            for (int ky = 0; ky < stage->kernel; ++ky) {
+                int iy = y * stage->stride + ky - stage->padding;
+                if (iy < 0 || iy >= stage->input_height) continue;
+                for (int kx = 0; kx < stage->kernel; ++kx) {
+                    int ix = x * stage->stride + kx - stage->padding;
+                    if (ix < 0 || ix >= stage->input_width) continue;
+                    size_t input_index = ((size_t)ic * (size_t)stage->input_height +
+                                          (size_t)iy) * (size_t)stage->input_width +
+                                         (size_t)ix;
+                    size_t weight_index = stage_weight_index(stage, oc, ic, ky, kx);
+                    float gradient = error * input_data[input_index];
+                    stage->velocity_w[weight_index] = momentum * stage->velocity_w[weight_index] + gradient;
+                    stage->weights[weight_index] -= lr * stage->velocity_w[weight_index];
+                }
+            }
+        }
+    }
+    ++(*updates);
+}
+
 static void local_update_stage_data(det_stage *stage, const float *input_data,
                                     const det_sample *sample, int target_stage_index,
                                     size_t sample_index, float lr, float momentum,
                                     size_t *updates) {
+    if (sample->box_count == 1) {
+        const det_box *box = &sample->boxes[0];
+        int stride = 1 << (target_stage_index + 1);
+        int target_x = (int)(((box->x1 + box->x2) * 0.5f) / (float)stride);
+        int target_y = (int)(((box->y1 + box->y2) * 0.5f) / (float)stride);
+        float positive_target[4] = {
+            1.0f,
+            ((box->x1 + box->x2) * 0.5f) / (float)sample->image.width,
+            ((box->y1 + box->y2) * 0.5f) / (float)sample->image.height,
+            fmaxf((box->x2 - box->x1) / (float)sample->image.width,
+                  (box->y2 - box->y1) / (float)sample->image.height)
+        };
+        for (int y = 0; y < stage->output_height; ++y) {
+            for (int x = 0; x < stage->output_width; ++x) {
+                int positive = x == target_x && y == target_y;
+                if (!positive && ((x + y + (int)sample_index + target_stage_index) % 64 != 0)) {
+                    continue;
+                }
+                float target[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (positive) {
+                    for (int i = 0; i < 4; ++i) target[i] = positive_target[i];
+                }
+                local_update_stage_cell(stage, input_data, y, x, target,
+                                        lr, momentum, updates);
+            }
+        }
+        return;
+    }
+    /* Preserve the original target ordering for multi-box samples. */
     for (int y = 0; y < stage->output_height; ++y) {
         for (int x = 0; x < stage->output_width; ++x) {
             float target[4];
             int positive = stage_box_target(sample, target_stage_index, x, y, target);
-            if (!positive && ((x + y + (int)sample_index + target_stage_index) % 64 != 0)) continue;
-            for (int oc = 0; oc < stage->output_channels; ++oc) {
-                size_t output_index = ((size_t)oc * (size_t)stage->output_height + (size_t)y) *
-                                      (size_t)stage->output_width + (size_t)x;
-                /* LOCAL_FAST uses a straight-through ReLU surrogate so a dead
-                   stage can receive a positive local target and recover. */
-                float error = stage->activation[output_index] - target[oc];
-                size_t bias_index = (size_t)oc;
-                stage->velocity_b[bias_index] = momentum * stage->velocity_b[bias_index] + error;
-                stage->bias[bias_index] -= lr * stage->velocity_b[bias_index];
-                for (int ic = 0; ic < stage->input_channels; ++ic) {
-                    if (stage->depthwise && ic != oc) continue;
-                    for (int ky = 0; ky < stage->kernel; ++ky) {
-                        int iy = y * stage->stride + ky - stage->padding;
-                        if (iy < 0 || iy >= stage->input_height) continue;
-                        for (int kx = 0; kx < stage->kernel; ++kx) {
-                            int ix = x * stage->stride + kx - stage->padding;
-                            if (ix < 0 || ix >= stage->input_width) continue;
-                            size_t input_index = ((size_t)ic * (size_t)stage->input_height +
-                                                  (size_t)iy) * (size_t)stage->input_width +
-                                                 (size_t)ix;
-                            size_t weight_index = stage_weight_index(stage, oc, ic, ky, kx);
-                            float gradient = error * input_data[input_index];
-                            stage->velocity_w[weight_index] = momentum * stage->velocity_w[weight_index] + gradient;
-                            stage->weights[weight_index] -= lr * stage->velocity_w[weight_index];
-                        }
-                    }
-                }
+            if (!positive && ((x + y + (int)sample_index + target_stage_index) % 64 != 0)) {
+                continue;
             }
-            ++(*updates);
+            local_update_stage_cell(stage, input_data, y, x, target,
+                                    lr, momentum, updates);
         }
     }
 }
