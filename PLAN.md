@@ -127,7 +127,8 @@ not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
 implementation. Manifest runs now also emit streamed precision/recall, mean
 IoU, AP50, mAP50:95, and small/medium/large ground-truth counts after the
 serialized model is reloaded, keeping timing and detector quality visible
-together.
+together. `--eval-manifest` can select a separate streamed validation manifest;
+without it, a supplied training manifest is replayed for the smoke report.
 The public `det_evaluate` path performs greedy class-aware point matching and
 reports precision, recall, mean IoU, TP/FP/FN counts, class-macro 101-point
 AP50/AP75, mAP50:95, and class-macro small/medium/large AP50 buckets in one

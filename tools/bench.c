@@ -132,6 +132,7 @@ int main(int argc, char **argv) {
     int height = 160;
     int global = 0;
     const char *manifest_path = NULL;
+    const char *eval_manifest_path = NULL;
     det_precision precision = DET_PRECISION_F32;
     float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
@@ -171,6 +172,13 @@ int main(int argc, char **argv) {
                 return EXIT_FAILURE;
             }
             manifest_path = argv[i];
+        }
+        else if (strcmp(argv[i], "--eval-manifest") == 0) {
+            if (i + 1 >= argc || argv[++i][0] == '\0') {
+                fprintf(stderr, "eval manifest must be a non-empty path\n");
+                return EXIT_FAILURE;
+            }
+            eval_manifest_path = argv[i];
         }
         else if (strcmp(argv[i], "--global") == 0) global = 1;
         else {
@@ -302,11 +310,31 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     det_eval_report evaluation = {0};
-    if (manifest_path != NULL) {
-        status = det_evaluate(loaded, &dataset, threshold, &evaluation);
+    det_manifest_dataset *eval_manifest_dataset = NULL;
+    det_dataset eval_dataset = dataset;
+    if (eval_manifest_path != NULL) {
+        status = det_manifest_open(eval_manifest_path, width, height, 1, 100,
+                                   &eval_manifest_dataset);
+        if (status == DET_OK) {
+            status = det_manifest_dataset_view(eval_manifest_dataset, &eval_dataset);
+        }
+        if (status != DET_OK || eval_dataset.sample_count == 0U) {
+            fprintf(stderr, "eval manifest setup failed: %d\n", status);
+            det_manifest_close(eval_manifest_dataset);
+            free(pixels);
+            det_manifest_close(manifest_dataset);
+            det_model_destroy(loaded);
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
+    }
+    if (manifest_path != NULL || eval_manifest_path != NULL) {
+        status = det_evaluate(loaded, &eval_dataset, threshold, &evaluation);
         if (status != DET_OK) {
             fprintf(stderr, "evaluation failed: %d\n", status);
             free(pixels);
+            det_manifest_close(eval_manifest_dataset);
             det_manifest_close(manifest_dataset);
             det_model_destroy(loaded);
             det_model_destroy(model);
@@ -328,7 +356,7 @@ int main(int argc, char **argv) {
            report.updates, report.mean_loss,
            train_core_ms > 0.0 ? (double)report.samples_seen * 1000.0 / train_core_ms : 0.0,
            detection_count);
-    if (manifest_path != NULL) {
+    if (manifest_path != NULL || eval_manifest_path != NULL) {
         printf("eval_samples=%zu eval_ground_truths=%zu eval_predictions=%zu eval_tp=%zu "
                "eval_fp=%zu eval_fn=%zu precision=%.4f recall=%.4f mean_iou=%.4f "
                "ap50=%.4f map50_95=%.4f size_gt=%zu,%zu,%zu\n",
@@ -340,6 +368,7 @@ int main(int argc, char **argv) {
                evaluation.size_ground_truths[2]);
     }
     free(pixels);
+    det_manifest_close(eval_manifest_dataset);
     det_manifest_close(manifest_dataset);
     det_model_destroy(model);
     det_context_destroy(ctx);
