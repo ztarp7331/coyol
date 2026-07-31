@@ -53,13 +53,14 @@ not claims that the final detector has already passed the accuracy or
 architecture gates.
 
 After wiring the first spatial backbone, the compact edge profile has measured
-about 0.98--1.22 s `LOCAL_FAST` end-to-end training, 0.13--1.04 ms repeated
-inference, and 8--42 ms save/load for the same 5,000-image Release run. This profile uses one learned 3 x 3 stem
+about 1.19--1.36 s `LOCAL_FAST` synthetic end-to-end training, 0.14--1.10 ms
+repeated inference, and 9--13 ms save/load for the same 5,000-image Release
+run. This profile uses one learned 3 x 3 stem
 channel, one learned 3 x 3 expansion stage, and three depthwise 3 x 3 pyramid
 stages. It is an executable edge variant of the architecture, not yet the
 larger 16/24/40/64/96-channel research configuration in the table below.
 The sub-second training gate therefore remains open; the next optimization
-checkpoint must reduce measured `train_e2e_ms` below 1,000 ms rather than
+checkpoint must reduce measured `synthetic_e2e_ms` below 1,000 ms rather than
 relabel this near-miss as success.
 The current 5,000-image `LOCAL_FAST` smoke benchmark produces top-K detections
 at the conventional 0.25 threshold after the background-control ablation; the
@@ -72,11 +73,24 @@ Two training times must be published:
 1. `train_core_ms`: prepared low-resolution tensors through final learned
    weights and model serialization;
 2. `train_e2e_ms`: raw files, decoding, resizing, labels, training, and model
-   serialization.
+   serialization. The current synthetic benchmark reports this boundary as
+   `synthetic_e2e_ms` until a raw-file adapter is present.
 
 Both target one second. Separating them is diagnostic, not an exclusion:
-`train_e2e_ms` is the complete user-visible result, while `train_core_ms`
-identifies whether the bottleneck is learning or input I/O.
+`train_e2e_ms` will be the complete user-visible result once raw input exists,
+while `train_core_ms` identifies whether the bottleneck is learning or input
+I/O. Until then, `synthetic_e2e_ms` is explicitly not a raw-input claim.
+The benchmark now stops both training timers immediately after checkpoint
+serialization; inference warmups and repeated inference, plus save/load I/O,
+are reported separately. It reserves a unique checkpoint path per process and
+malformed or unknown benchmark options fail closed.
+
+Verification status for this checkpoint: the loader and benchmark hardening
+has passed static diff review, but a fresh C build is pending because the
+current Windows session has no native C compiler/CMake and WSL returns
+`E_ACCESSDENIED`. The last pushed commit remains the prior verified baseline;
+this pending diff must not be reported as pushed until the toolchain and Git
+index permissions are restored.
 
 COCO is not part of the core API or the first timing contract. COCO 2017 becomes
 an optional 80-class scalability and accuracy test after the 5,000-image gate
@@ -331,9 +345,14 @@ profiles are compiled separately rather than switched at runtime.
 
 The current version-5 `CDET` model contains graph metadata, tensor shapes,
 FP32 optimizer state, quantized buffers/scales, and a CRC32 over the payload.
-It does not serialize pointers. The on-disk integers/floats are still native
-ABI fields; a portable endian-neutral format and atomic replacement are
-explicit follow-up hardening work, not silently assumed properties.
+It does not serialize pointers. On load, FP32 weights are authoritative and
+quantized caches are regenerated, preventing contradictory CRC-valid cache
+state. The on-disk integers/floats are still native ABI fields; a portable
+endian-neutral format and atomic replacement are explicit follow-up hardening
+work, not silently assumed properties.
+The loader validates the fixed header and exact payload length before its CRC
+buffer allocation. A separate device-memory budget check remains required
+before accepting very large edge-hosted dimensions.
 
 ## 4. Implementation phases
 
@@ -402,6 +421,8 @@ explicit follow-up hardening work, not silently assumed properties.
 - Empty images, crowded images, overlapping boxes, tiny boxes, and invalid
   labels are covered.
 - Saving and reloading produces identical detections.
+- CRC-valid truncated payloads are rejected, and inactive-cache mutations are
+  canonicalized from FP32 weights on load.
 - Arena instrumentation proves zero hot-loop allocations.
 - Corrupt and truncated model files fail closed.
 

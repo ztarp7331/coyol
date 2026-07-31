@@ -25,6 +25,74 @@ typedef struct {
     int emitted;
 } one_sample_dataset;
 
+static uint32_t test_crc32(const unsigned char *data, size_t length) {
+    uint32_t crc = 0xffffffffU;
+    for (size_t i = 0U; i < length; ++i) {
+        crc ^= (uint32_t)data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
+            crc = (crc >> 1U) ^ (0xedb88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+static int rewrite_crc32(const char *path) {
+    FILE *file = fopen(path, "r+b");
+    if (file == NULL || fseek(file, 0L, SEEK_END) != 0) {
+        if (file != NULL) fclose(file);
+        return 0;
+    }
+    long length = ftell(file);
+    if (length <= (long)sizeof(uint32_t)) {
+        fclose(file);
+        return 0;
+    }
+    size_t payload_length = (size_t)length - sizeof(uint32_t);
+    unsigned char *payload = (unsigned char *)malloc(payload_length);
+    if (payload == NULL || fseek(file, 0L, SEEK_SET) != 0 ||
+        fread(payload, 1U, payload_length, file) != payload_length) {
+        free(payload);
+        fclose(file);
+        return 0;
+    }
+    uint32_t checksum = test_crc32(payload, payload_length);
+    free(payload);
+    int ok = fseek(file, (long)payload_length, SEEK_SET) == 0 &&
+             fwrite(&checksum, sizeof(checksum), 1U, file) == 1U;
+    int close_result = fclose(file);
+    return ok && close_result == 0;
+}
+
+static int write_truncated_copy(const char *source, const char *destination) {
+    FILE *input = fopen(source, "rb");
+    if (input == NULL || fseek(input, 0L, SEEK_END) != 0) {
+        if (input != NULL) fclose(input);
+        return 0;
+    }
+    long length = ftell(input);
+    if (length <= (long)(2U * sizeof(uint32_t)) || fseek(input, 0L, SEEK_SET) != 0) {
+        fclose(input);
+        return 0;
+    }
+    size_t payload_length = (size_t)length - sizeof(uint32_t);
+    unsigned char *payload = (unsigned char *)malloc(payload_length);
+    if (payload == NULL || fread(payload, 1U, payload_length, input) != payload_length) {
+        free(payload);
+        fclose(input);
+        return 0;
+    }
+    fclose(input);
+    size_t shortened = payload_length - 1U;
+    uint32_t checksum = test_crc32(payload, shortened);
+    FILE *output = fopen(destination, "wb");
+    int ok = output != NULL && fwrite(payload, 1U, shortened, output) == shortened &&
+             fwrite(&checksum, sizeof(checksum), 1U, output) == 1U;
+    if (output != NULL && fclose(output) != 0) ok = 0;
+    free(payload);
+    return ok;
+}
+
 static int next_one(void *user, det_sample *sample) {
     one_sample_dataset *dataset = (one_sample_dataset *)user;
     if (dataset->emitted != 0) return 0;
@@ -155,7 +223,8 @@ static void test_train_predict_roundtrip(void) {
     const char *path = "det_test_model.cdet";
     assert(det_save(model, path) == DET_OK);
     det_model *loaded = NULL;
-    assert(det_load(ctx, path, &loaded) == DET_OK);
+    det_status load_status = det_load(ctx, path, &loaded);
+    assert(load_status == DET_OK);
     det_detection model_detections[16];
     det_detection loaded_detections[16];
     int current_count = 0;
@@ -172,6 +241,35 @@ static void test_train_predict_roundtrip(void) {
         assert(model_detections[i].box.class_id == loaded_detections[i].box.class_id);
     }
     det_model_destroy(loaded);
+    const char *truncated_path = "det_test_truncated.cdet";
+    assert(write_truncated_copy(path, truncated_path));
+    det_model *truncated = NULL;
+    assert(det_load(ctx, truncated_path, &truncated) == DET_ERR_FORMAT);
+    (void)remove(truncated_path);
+
+    /* A CRC-valid mutation of an inactive FP32 cache must not affect the
+       canonical model reconstructed from the learned FP32 tensors. */
+    FILE *cache_mutation = fopen(path, "r+b");
+    assert(cache_mutation != NULL);
+    assert(fseek(cache_mutation, -(long)sizeof(uint32_t) - 1L, SEEK_END) == 0);
+    int cache_byte = fgetc(cache_mutation);
+    assert(cache_byte != EOF);
+    assert(fseek(cache_mutation, -(long)sizeof(uint32_t) - 1L, SEEK_END) == 0);
+    unsigned char mutated_cache = (unsigned char)cache_byte ^ 0x7fU;
+    assert(fwrite(&mutated_cache, 1U, 1U, cache_mutation) == 1U);
+    assert(fclose(cache_mutation) == 0);
+    assert(rewrite_crc32(path));
+    det_model *canonical = NULL;
+    assert(det_load(ctx, path, &canonical) == DET_OK);
+    det_detection canonical_detections[16];
+    int canonical_count = 0;
+    assert(det_predict(canonical, &image, 0.1f, canonical_detections, 16,
+                       &canonical_count) == DET_OK);
+    assert(canonical_count == current_count);
+    for (int i = 0; i < current_count; ++i) {
+        assert(fabsf(model_detections[i].score - canonical_detections[i].score) < 1e-6f);
+    }
+    det_model_destroy(canonical);
     FILE *corrupt = fopen(path, "r+b");
     assert(corrupt != NULL);
     assert(fseek(corrupt, 32L, SEEK_SET) == 0);

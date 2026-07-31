@@ -5,7 +5,9 @@
 /build-review/
 /build-review-release/
 /build-a0-review/
+/build-*/
 *.model
+det_test*.cdet
 *.exe
 *.obj
 *.o

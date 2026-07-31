@@ -77,14 +77,16 @@ static double now_ms(void) {
         return (double)counter.QuadPart * 1000.0 / (double)frequency.QuadPart;
     }
 #elif defined(CLOCK_MONOTONIC)
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+    struct timespec monotonic_ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic_ts) == 0) {
+        return (double)monotonic_ts.tv_sec * 1000.0 +
+               (double)monotonic_ts.tv_nsec / 1000000.0;
     }
 #endif
-    struct timespec ts;
-    (void)timespec_get(&ts, TIME_UTC);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+    struct timespec fallback_ts;
+    (void)timespec_get(&fallback_ts, TIME_UTC);
+    return (double)fallback_ts.tv_sec * 1000.0 +
+           (double)fallback_ts.tv_nsec / 1000000.0;
 }
 
 static int checked_size3(int a, int b, int c, size_t *out) {
@@ -1522,6 +1524,56 @@ typedef struct {
     uint64_t train_updates;
 } det_file_header;
 
+static int expected_payload_size(const det_file_header *header, size_t *out) {
+    if (header == NULL || out == NULL || header->width == 0U || header->height == 0U ||
+        header->width > 4096U || header->height > 4096U || header->channels == 0U ||
+        header->channels > 4U || header->classes == 0U || header->classes > DET_MAX_CLASSES ||
+        header->max_detections == 0U || header->max_detections > (uint32_t)INT_MAX) {
+        return 0;
+    }
+    int input_height = (int)header->height;
+    int input_width = (int)header->width;
+    int input_channels = (int)header->channels;
+    size_t total = sizeof(det_file_header);
+    for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
+        int output_channels = s == 0 ? DET_GRAPH_STEM_CHANNELS : DET_GRAPH_CHANNELS;
+        int output_height = 0;
+        int output_width = 0;
+        int depthwise = s > 1;
+        if (!convolution_output_dim(input_height, 3, 2, 1, &output_height) ||
+            !convolution_output_dim(input_width, 3, 2, 1, &output_width)) return 0;
+        size_t wc = (size_t)(depthwise ? output_channels : output_channels * input_channels) * 9U;
+        size_t packed = (size_t)output_channels *
+                        ((((size_t)(depthwise ? 1 : input_channels) * 9U) + 1U) / 2U);
+        size_t bytes = 10U * sizeof(int);
+        if (!checked_add_size(bytes, (2U * wc + 2U * (size_t)output_channels) * sizeof(float), &bytes) ||
+            !checked_add_size(bytes, wc * sizeof(int8_t), &bytes) ||
+            !checked_add_size(bytes, packed * sizeof(uint8_t), &bytes) ||
+            !checked_add_size(bytes, (size_t)output_channels * sizeof(float), &bytes) ||
+            !checked_add_size(total, bytes, &total)) return 0;
+        input_height = output_height;
+        input_width = output_width;
+        input_channels = output_channels;
+    }
+    int outputs = 4 + (int)header->classes;
+    for (int s = 0; s < DET_MAX_SCALES; ++s) {
+        int height = ((int)header->height + k_strides[s] - 1) / k_strides[s];
+        int width = ((int)header->width + k_strides[s] - 1) / k_strides[s];
+        size_t wc = (size_t)DET_GRAPH_CHANNELS * (size_t)outputs;
+        size_t packed = (size_t)outputs * ((DET_GRAPH_CHANNELS + 1U) / 2U);
+        size_t bytes = 2U * sizeof(int);
+        if (!checked_add_size(bytes, (2U * wc + 2U * (size_t)outputs) * sizeof(float), &bytes) ||
+            !checked_add_size(bytes, wc * sizeof(int8_t), &bytes) ||
+            !checked_add_size(bytes, packed * sizeof(uint8_t), &bytes) ||
+            !checked_add_size(bytes, (size_t)outputs * sizeof(float), &bytes) ||
+            !checked_add_size(total, bytes, &total)) return 0;
+        (void)height;
+        (void)width;
+    }
+    *out = total;
+    return 1;
+}
+
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
     if (!valid_precision(model->precision)) return DET_ERR_FORMAT;
@@ -1644,6 +1696,20 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     }
     size_t encoded_length = (size_t)file_length;
     size_t payload_length = encoded_length - sizeof(uint32_t);
+    det_file_header header;
+    if (fseek(file, 0L, SEEK_SET) != 0 ||
+        fread(&header, sizeof(header), 1U, file) != 1U ||
+        memcmp(header.magic, "CDET", 4U) != 0 || header.version != 5U ||
+        header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES ||
+        !valid_precision((det_precision)header.precision)) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    size_t expected_payload = 0U;
+    if (!expected_payload_size(&header, &expected_payload) || expected_payload != payload_length) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
     uint8_t *encoded = (uint8_t *)malloc(payload_length);
     if (encoded == NULL || fseek(file, 0L, SEEK_SET) != 0 ||
         fread(encoded, 1U, payload_length, file) != payload_length) {
@@ -1659,15 +1725,7 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         return DET_ERR_FORMAT;
     }
     free(encoded);
-    if (fseek(file, 0L, SEEK_SET) != 0) {
-        fclose(file);
-        return DET_ERR_FORMAT;
-    }
-    det_file_header header;
-    int ok = fread(&header, sizeof(header), 1U, file) == 1U;
-    if (!ok || memcmp(header.magic, "CDET", 4U) != 0 || header.version != 5U ||
-        header.graph_channels != DET_GRAPH_CHANNELS || header.stage_count != DET_GRAPH_STAGES ||
-        !valid_precision((det_precision)header.precision)) {
+    if (fseek(file, (long)sizeof(det_file_header), SEEK_SET) != 0) {
         fclose(file);
         return DET_ERR_FORMAT;
     }
@@ -1679,45 +1737,7 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         fclose(file);
         return status;
     }
-    size_t expected_payload = sizeof(det_file_header);
-    for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
-        const det_stage *stage = &model->stages[s];
-        size_t wc = stage_weight_count(stage);
-        size_t packed = stage_packed_weight_count(stage);
-        size_t stage_bytes = 10U * sizeof(int);
-        if (!checked_add_size(stage_bytes, (2U * wc + 2U * (size_t)stage->output_channels) *
-                                      sizeof(float), &stage_bytes) ||
-            !checked_add_size(stage_bytes, wc * sizeof(int8_t), &stage_bytes) ||
-            !checked_add_size(stage_bytes, packed * sizeof(uint8_t), &stage_bytes) ||
-            !checked_add_size(stage_bytes, (size_t)stage->output_channels * sizeof(float), &stage_bytes) ||
-            !checked_add_size(expected_payload, stage_bytes, &expected_payload)) {
-            det_model_destroy(model);
-            fclose(file);
-            return DET_ERR_FORMAT;
-        }
-    }
-    for (int s = 0; s < DET_MAX_SCALES; ++s) {
-        const det_head *head = &model->heads[s];
-        size_t wc = (size_t)head->channels * (size_t)head->outputs;
-        size_t packed = (size_t)head->outputs * (((size_t)head->channels + 1U) / 2U);
-        size_t head_bytes = 2U * sizeof(int);
-        if (!checked_add_size(head_bytes, (2U * wc + 2U * (size_t)head->outputs) *
-                                    sizeof(float), &head_bytes) ||
-            !checked_add_size(head_bytes, wc * sizeof(int8_t), &head_bytes) ||
-            !checked_add_size(head_bytes, packed * sizeof(uint8_t), &head_bytes) ||
-            !checked_add_size(head_bytes, (size_t)head->outputs * sizeof(float), &head_bytes) ||
-            !checked_add_size(expected_payload, head_bytes, &expected_payload)) {
-            det_model_destroy(model);
-            fclose(file);
-            return DET_ERR_FORMAT;
-        }
-    }
-    if (expected_payload != payload_length) {
-        det_model_destroy(model);
-        fclose(file);
-        return DET_ERR_FORMAT;
-    }
-    ok = 1;
+    int ok = 1;
     for (int s = 0; ok && s < DET_GRAPH_STAGES; ++s) {
         det_stage *stage = &model->stages[s];
         int input_channels = 0;
@@ -1795,22 +1815,12 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         return DET_ERR_FORMAT;
     }
     model->train_updates = (size_t)header.train_updates;
-    model->precision = (det_precision)header.precision;
-    if (model->precision != DET_PRECISION_F32) {
-        for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
-            if (!positive_finite_values(model->stages[s].quant_scales,
-                               (size_t)model->stages[s].output_channels)) {
-                det_model_destroy(model);
-                return DET_ERR_FORMAT;
-            }
-        }
-        for (int s = 0; s < DET_MAX_SCALES; ++s) {
-            if (!positive_finite_values(model->heads[s].quant_scales,
-                               (size_t)model->heads[s].outputs)) {
-                det_model_destroy(model);
-                return DET_ERR_FORMAT;
-            }
-        }
+    /* FP32 weights are canonical; regenerate caches so a CRC-valid file cannot
+       carry a contradictory quantized representation or inactive garbage. */
+    status = det_model_set_precision(model, (det_precision)header.precision);
+    if (status != DET_OK) {
+        det_model_destroy(model);
+        return status;
     }
     *out = model;
     return DET_OK;
