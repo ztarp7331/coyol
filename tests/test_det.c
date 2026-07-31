@@ -208,7 +208,7 @@ static void test_manifest_adapter(void) {
     const unsigned char pixels[] = {0U, 64U, 128U, 255U};
     FILE *image = fopen(image_path, "wb");
     assert(image != NULL);
-    assert(fputs("P5\n2 2\n255\n", image) >= 0);
+    assert(fputs("P5\r\n2 2\r\n255\r\n", image) >= 0);
     assert(fwrite(pixels, 1U, sizeof(pixels), image) == sizeof(pixels));
     assert(fclose(image) == 0);
     FILE *manifest = fopen(manifest_path, "wb");

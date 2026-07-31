@@ -10,6 +10,7 @@
 
 #define DET_MANIFEST_LINE 8192
 #define DET_MANIFEST_PATH 4096
+#define DET_MANIFEST_MAX_RAW_BYTES (64U << 20)
 
 struct det_manifest_dataset {
     FILE *manifest;
@@ -172,6 +173,7 @@ static int decode_pnm(det_manifest_dataset *dataset, const char *path,
     pixels = (size_t)width * (size_t)height;
     if (pixels > SIZE_MAX / (size_t)source_channels) goto fail;
     bytes = pixels * (size_t)source_channels;
+    if (bytes > DET_MANIFEST_MAX_RAW_BYTES) goto fail;
     if (!ensure_raw_capacity(dataset, bytes)) goto fail;
     if (ascii_samples) {
         for (size_t i = 0U; i < bytes; ++i) {
@@ -189,10 +191,10 @@ static int decode_pnm(det_manifest_dataset *dataset, const char *path,
     }
     if (fclose(file) != 0) return 0;
     for (int y = 0; y < dataset->height; ++y) {
-        int source_y = y * height / dataset->height;
+        size_t source_y = (size_t)y * (size_t)height / (size_t)dataset->height;
         for (int x = 0; x < dataset->width; ++x) {
-            int source_x = x * width / dataset->width;
-            size_t source_index = ((size_t)source_y * (size_t)width + (size_t)source_x) *
+            size_t source_x = (size_t)x * (size_t)width / (size_t)dataset->width;
+            size_t source_index = (source_y * (size_t)width + source_x) *
                                    (size_t)source_channels;
             for (int c = 0; c < dataset->channels; ++c) {
                 float value;
@@ -305,6 +307,7 @@ det_status det_manifest_open(const char *manifest_path, int width, int height,
     det_manifest_dataset *dataset;
     char line[DET_MANIFEST_LINE];
     if (manifest_path == NULL || out == NULL || width <= 0 || height <= 0 ||
+        width > 4096 || height > 4096 ||
         (channels != 1 && channels != 3) || max_boxes <= 0) return DET_ERR_ARGUMENT;
     if ((size_t)width > SIZE_MAX / (size_t)height ||
         (size_t)width * (size_t)height > SIZE_MAX / (size_t)channels ||
@@ -358,6 +361,10 @@ det_status det_manifest_open(const char *manifest_path, int width, int height,
             return DET_ERR_FORMAT;
         }
         if (text != NULL && *text != '\0' && *text != '#') ++dataset->sample_count;
+    }
+    if (ferror(dataset->manifest)) {
+        det_manifest_close(dataset);
+        return DET_ERR_IO;
     }
     rewind(dataset->manifest);
     clearerr(dataset->manifest);
