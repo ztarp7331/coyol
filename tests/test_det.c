@@ -37,6 +37,12 @@ typedef struct {
 } multi_box_dataset;
 
 typedef struct {
+    const det_sample *samples;
+    int count;
+    int index;
+} stream_dataset;
+
+typedef struct {
     char magic[4];
     uint32_t version;
     uint32_t width;
@@ -278,6 +284,17 @@ static int next_multi_box(void *user, det_sample *sample) {
 
 static void reset_multi_box(void *user) {
     ((multi_box_dataset *)user)->emitted = 0;
+}
+
+static int next_stream(void *user, det_sample *sample) {
+    stream_dataset *dataset = (stream_dataset *)user;
+    if (dataset->index >= dataset->count) return 0;
+    *sample = dataset->samples[dataset->index++];
+    return 1;
+}
+
+static void reset_stream(void *user) {
+    ((stream_dataset *)user)->index = 0;
 }
 
 static int next_io_error(void *user, det_sample *sample) {
@@ -902,6 +919,65 @@ static void test_multi_box_quantization_gate(void) {
     det_context_destroy(ctx);
 }
 
+static void test_streamed_size_class_stress(void) {
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model_spec spec = {128, 128, 1, 3, 32, 37};
+    float pixels[3][128 * 128] = {{0.0f}};
+    det_box boxes[3] = {{4.0f, 4.0f, 12.0f, 12.0f, 0},
+                        {16.0f, 16.0f, 56.0f, 56.0f, 1},
+                        {20.0f, 20.0f, 120.0f, 120.0f, 2}};
+    det_sample samples[3];
+    for (int sample_index = 0; sample_index < 3; ++sample_index) {
+        const det_box *box = &boxes[sample_index];
+        for (int y = (int)box->y1; y < (int)box->y2; ++y) {
+            for (int x = (int)box->x1; x < (int)box->x2; ++x) {
+                pixels[sample_index][y * 128 + x] = 0.5f + 0.2f * (float)sample_index;
+            }
+        }
+        samples[sample_index] = (det_sample){{pixels[sample_index], 1, 128, 128},
+                                              box, 1};
+    }
+    stream_dataset storage = {samples, 3, 0};
+    det_dataset dataset = {&storage, next_stream, reset_stream, 3};
+    det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 20,
+                               0.01f, 0.8f, 0.1f, 3, 37, 1};
+    det_train_report train_report;
+    det_eval_report evaluation;
+    assert(det_context_create(8U << 20, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    assert(det_train(model, &dataset, &config, &train_report) == DET_OK);
+    assert(train_report.samples_seen == 60U && train_report.updates > 0U);
+    assert(det_evaluate(model, &dataset, 0.1f, &evaluation) == DET_OK);
+    assert(evaluation.samples_seen == 3U && evaluation.ground_truths == 3U);
+    assert(evaluation.size_ground_truths[0] == 1U &&
+           evaluation.size_ground_truths[1] == 1U &&
+           evaluation.size_ground_truths[2] == 1U);
+    assert(evaluation.precision >= 0.0f && evaluation.precision <= 1.0f);
+    assert(evaluation.recall >= 0.0f && evaluation.recall <= 1.0f);
+    assert(evaluation.mean_iou >= 0.0f && evaluation.mean_iou <= 1.0f);
+    assert(evaluation.ap50 >= 0.0f && evaluation.ap50 <= 1.0f);
+    assert(evaluation.map50_95 >= 0.0f && evaluation.map50_95 <= 1.0f);
+    for (int class_id = 0; class_id < 3; ++class_id) {
+        assert(evaluation.class_ap50[class_id] >= 0.0f &&
+               evaluation.class_ap50[class_id] <= 1.0f);
+    }
+    for (int size_group = 0; size_group < 3; ++size_group) {
+        assert(evaluation.size_ap50[size_group] >= 0.0f &&
+               evaluation.size_ap50[size_group] <= 1.0f);
+    }
+    assert(det_model_set_precision(model, DET_PRECISION_INT8) == DET_OK);
+    assert(det_evaluate(model, &dataset, 0.1f, &evaluation) == DET_OK);
+    assert(evaluation.samples_seen == 3U && evaluation.ground_truths == 3U);
+    assert(isfinite(evaluation.mean_iou) && isfinite(evaluation.map50_95));
+    assert(det_model_set_precision(model, DET_PRECISION_W4A8) == DET_OK);
+    assert(det_evaluate(model, &dataset, 0.1f, &evaluation) == DET_OK);
+    assert(evaluation.samples_seen == 3U && evaluation.ground_truths == 3U);
+    assert(isfinite(evaluation.mean_iou) && isfinite(evaluation.map50_95));
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+}
+
 int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
@@ -911,6 +987,7 @@ int main(void) {
     test_train_predict_roundtrip();
     test_odd_shape_neck_roundtrip();
     test_multi_box_quantization_gate();
+    test_streamed_size_class_stress();
     puts("all det tests passed");
     return 0;
 }

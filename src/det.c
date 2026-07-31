@@ -2500,6 +2500,7 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
                 status = DET_ERR_MEMORY;
                 break;
             }
+            ++report->size_ground_truths[eval_box_size_group(&sample.boxes[b])];
         }
         if (status != DET_OK) break;
         if (!append_eval_range(&ranges, &range_count, &range_capacity,

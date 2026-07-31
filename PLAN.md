@@ -229,8 +229,11 @@ two-class 64 x 64 streamed fixture: it requires two FP32 true positives with
 finite IoU/AP, then requires INT8 and W4A8 to retain every true positive and
 false negative, stay within a small false-positive/recall/precision allowance,
 and remain within the 2-point and 5-point mAP-loss limits respectively. This
-is a qualification smoke gate, not a COCO-scale accuracy claim; the broader
-multi-size, multi-class validation set remains outstanding.
+is a qualification smoke gate, not a COCO-scale accuracy claim. A separate
+three-sample stream now exercises small, medium, and large boxes across three
+classes through FP32, INT8, and W4A8 evaluation, including reset/replay and
+finite per-class/per-size AP checks; larger real-data validation remains
+outstanding.
 
 ### 2.2 Fast full-model learning
 

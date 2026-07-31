@@ -107,6 +107,9 @@ typedef struct {
     float map50_95;
     float class_ap50[DET_MAX_CLASSES];
     float size_ap50[3];
+    /* Number of streamed ground-truth boxes in small, medium, and large
+       COCO-style area buckets. */
+    size_t size_ground_truths[3];
 } det_eval_report;
 
 typedef struct {
