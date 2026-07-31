@@ -474,11 +474,25 @@ static void test_train_predict_roundtrip(void) {
     assert(det_evaluate(model, &dataset, 0.1f, &evaluation) == DET_OK);
     assert(evaluation.samples_seen == 1U && evaluation.ground_truths == 1U);
     assert(evaluation.predictions > 0U);
+    assert(evaluation.true_positives == 1U && evaluation.false_positives == 15U &&
+           evaluation.false_negatives == 0U);
+    assert(fabsf(evaluation.ap50 - 1.0f) < 1e-6f);
+    assert(fabsf(evaluation.ap75) < 1e-6f);
+    assert(fabsf(evaluation.map50_95 - 0.4f) < 1e-6f);
+    assert(fabsf(evaluation.class_ap50[0] - 1.0f) < 1e-6f);
+    assert(fabsf(evaluation.size_ap50[0] - 1.0f) < 1e-6f);
     assert(evaluation.true_positives + evaluation.false_positives == evaluation.predictions);
     assert(evaluation.true_positives + evaluation.false_negatives == evaluation.ground_truths);
     assert(evaluation.precision >= 0.0f && evaluation.precision <= 1.0f);
     assert(evaluation.recall >= 0.0f && evaluation.recall <= 1.0f);
     assert(evaluation.ap50 >= 0.0f && evaluation.ap50 <= 1.0f);
+    assert(evaluation.ap75 >= 0.0f && evaluation.ap75 <= 1.0f);
+    assert(evaluation.map50_95 >= 0.0f && evaluation.map50_95 <= 1.0f);
+    assert(evaluation.class_ap50[0] >= 0.0f && evaluation.class_ap50[0] <= 1.0f);
+    for (int size_group = 0; size_group < 3; ++size_group) {
+        assert(evaluation.size_ap50[size_group] >= 0.0f &&
+               evaluation.size_ap50[size_group] <= 1.0f);
+    }
     assert(isfinite(evaluation.precision) && isfinite(evaluation.recall) &&
            isfinite(evaluation.mean_iou) && isfinite(evaluation.ap50));
 

@@ -72,8 +72,8 @@ synthetic overfit test passes, but localization quality, confidence
 calibration, and the larger functional/accuracy gate remain open. The
 benchmark exposes `--threshold` for repeatable calibration measurements.
 With the auxiliary one-to-many bank enabled, repeated post-fix runs on the
-development CPU measured 0.951--0.988 s F32, 0.933--0.974 s INT8, and
-0.935--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples positive
+development CPU have measured approximately 0.923--0.988 s F32, 0.933--1.052 s
+INT8, and 0.906--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples positive
 3 x 3 neighborhoods plus up to four deterministic negatives per scale every
 sixteenth image and does not change inference. The occasional W4A8 overrun
 shows why the one-second result is still a stretch target, not a qualified
@@ -104,10 +104,11 @@ failure cannot be reported as a short successful epoch. The benchmark accepts
 streamed inside training, its companion is explicitly `train_plus_decode_ms`,
 not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
 implementation.
-The public `det_evaluate` path now performs greedy class-aware IoU@0.50 matching
-over any streamed dataset and reports precision, recall, mean IoU, TP/FP/FN
-counts, and ranked AP50 when the stream can be reset. It remains a single-IoU
-evaluation primitive; full multi-IoU mAP and per-class buckets are still open.
+The public `det_evaluate` path performs greedy class-aware point matching and
+reports precision, recall, mean IoU, TP/FP/FN counts, class-macro 101-point
+AP50/AP75, mAP50:95, and class-macro small/medium/large AP50 buckets in one
+threshold-zero stream. The metric implementation is dataset-neutral;
+COCO-specific adapters remain out of the core API.
 The benchmark now stops both training timers immediately after checkpoint
 serialization; inference warmups and repeated inference, plus save/load I/O,
 are reported separately. It reserves a unique checkpoint path per process and
@@ -117,8 +118,8 @@ Verification status for this checkpoint: fresh Release, Debug, and ASan builds
 pass CTest; 5,000-image Release LOCAL_FAST runs cover F32, INT8, and W4A8;
 GLOBAL_BP remains the reference run; and boundary smoke tests cover minimum and
 odd/even image sizes. This specialization is verified and pushed in the current
-dual-assignment checkpoint; the official raw/full-architecture training gate
-remains open.
+evaluation checkpoint; the official raw/full-architecture training gate remains
+open.
 
 The first raw-manifest smoke on a 33 x 33 P2 image completed successfully in
 9.529--47.100 ms end-to-end across repeated runs (including decode, resize,

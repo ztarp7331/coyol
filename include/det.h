@@ -103,6 +103,10 @@ typedef struct {
     float recall;
     float mean_iou;
     float ap50;
+    float ap75;
+    float map50_95;
+    float class_ap50[DET_MAX_CLASSES];
+    float size_ap50[3];
 } det_eval_report;
 
 typedef struct {
@@ -167,7 +171,9 @@ det_status det_model_reset(det_model *model, int seed);
 
 det_status det_train(det_model *model, const det_dataset *dataset,
                      const det_train_config *config, det_train_report *report);
-/* Greedy class-aware IoU@0.50 matching over a streamed validation dataset. */
+/* Greedy class-aware matching over a streamed validation dataset. AP fields use
+   class-macro AP at IoU .50, .75, and .50:.05:.95; size buckets use COCO pixel
+   area cutoffs (small, medium, large). */
 det_status det_evaluate(const det_model *model, const det_dataset *dataset,
                         float score_threshold, det_eval_report *report);
 det_status det_predict(const det_model *model, const det_image *image,
