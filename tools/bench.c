@@ -301,6 +301,19 @@ int main(int argc, char **argv) {
         det_context_destroy(ctx);
         return EXIT_FAILURE;
     }
+    det_eval_report evaluation = {0};
+    if (manifest_path != NULL) {
+        status = det_evaluate(loaded, &dataset, threshold, &evaluation);
+        if (status != DET_OK) {
+            fprintf(stderr, "evaluation failed: %d\n", status);
+            free(pixels);
+            det_manifest_close(manifest_dataset);
+            det_model_destroy(loaded);
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
+    }
     det_model_destroy(loaded);
     const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" : "F32");
@@ -315,6 +328,17 @@ int main(int argc, char **argv) {
            report.updates, report.mean_loss,
            train_core_ms > 0.0 ? (double)report.samples_seen * 1000.0 / train_core_ms : 0.0,
            detection_count);
+    if (manifest_path != NULL) {
+        printf("eval_samples=%zu eval_ground_truths=%zu eval_predictions=%zu eval_tp=%zu "
+               "eval_fp=%zu eval_fn=%zu precision=%.4f recall=%.4f mean_iou=%.4f "
+               "ap50=%.4f map50_95=%.4f size_gt=%zu,%zu,%zu\n",
+               evaluation.samples_seen, evaluation.ground_truths, evaluation.predictions,
+               evaluation.true_positives, evaluation.false_positives,
+               evaluation.false_negatives, evaluation.precision, evaluation.recall,
+               evaluation.mean_iou, evaluation.ap50, evaluation.map50_95,
+               evaluation.size_ground_truths[0], evaluation.size_ground_truths[1],
+               evaluation.size_ground_truths[2]);
+    }
     free(pixels);
     det_manifest_close(manifest_dataset);
     det_model_destroy(model);

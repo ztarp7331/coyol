@@ -124,7 +124,10 @@ failure cannot be reported as a short successful epoch. The benchmark accepts
 `--manifest` and labels the full timer `train_e2e_ms`; because decoding is
 streamed inside training, its companion is explicitly `train_plus_decode_ms`,
 not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
-implementation.
+implementation. Manifest runs now also emit streamed precision/recall, mean
+IoU, AP50, mAP50:95, and small/medium/large ground-truth counts after the
+serialized model is reloaded, keeping timing and detector quality visible
+together.
 The public `det_evaluate` path performs greedy class-aware point matching and
 reports precision, recall, mean IoU, TP/FP/FN counts, class-macro 101-point
 AP50/AP75, mAP50:95, and class-macro small/medium/large AP50 buckets in one
