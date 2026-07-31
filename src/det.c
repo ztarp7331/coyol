@@ -1839,14 +1839,11 @@ static float compute_ranked_ap(const det_eval_prediction *predictions, size_t pr
         precisions[index] = envelope;
     }
     double ap = 0.0;
+    size_t recall_index = 0U;
     for (int sample = 0; sample <= 100; ++sample) {
         double recall_threshold = (double)sample / 100.0;
-        double best_precision = 0.0;
-        for (size_t i = 0U; i < used; ++i) {
-            if (recalls[i] >= recall_threshold && precisions[i] > best_precision) {
-                best_precision = precisions[i];
-            }
-        }
+        while (recall_index < used && recalls[recall_index] < recall_threshold) ++recall_index;
+        double best_precision = recall_index < used ? precisions[recall_index] : 0.0;
         ap += best_precision / 101.0;
     }
     return (float)ap;
