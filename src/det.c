@@ -204,6 +204,48 @@ det_status det_conv2d_f32(const det_tensor_f32 *input, const float *weights,
     }
     if (output->channels != out_channels || output->height != expected_h ||
         output->width != expected_w) return DET_ERR_SHAPE;
+    if (kernel == 3 && stride == 2 && padding == 1) {
+        size_t input_plane = (size_t)input->height * (size_t)input->width;
+        size_t output_plane = (size_t)expected_h * (size_t)expected_w;
+        for (int oc = 0; oc < out_channels; ++oc) {
+            const float *output_weights = weights +
+                (size_t)oc * (size_t)input->channels * 9U;
+            float *output_channel = output->data + (size_t)oc * output_plane;
+            for (int oy = 0; oy < expected_h; ++oy) {
+                int iy_base = oy * 2 - 1;
+                int ky_start = iy_base < 0 ? -iy_base : 0;
+                int ky_end = input->height - iy_base;
+                if (ky_end > 3) ky_end = 3;
+                if (ky_start > ky_end) ky_start = ky_end;
+                for (int ox = 0; ox < expected_w; ++ox) {
+                    int ix_base = ox * 2 - 1;
+                    int kx_start = ix_base < 0 ? -ix_base : 0;
+                    int kx_end = input->width - ix_base;
+                    if (kx_end > 3) kx_end = 3;
+                    if (kx_start > kx_end) kx_start = kx_end;
+                    float sum = bias[oc];
+                    for (int ic = 0; ic < input->channels; ++ic) {
+                        const float *input_channel = input->data +
+                            (size_t)ic * input_plane;
+                        const float *channel_weights = output_weights + (size_t)ic * 9U;
+                        for (int ky = ky_start; ky < ky_end; ++ky) {
+                            const float *input_row = input_channel +
+                                (size_t)(iy_base + ky) * (size_t)input->width +
+                                (size_t)(ix_base + kx_start);
+                            const float *weight_row = channel_weights + (size_t)ky * 3U +
+                                (size_t)kx_start;
+                            for (int kx = kx_start; kx < kx_end; ++kx) {
+                                sum += weight_row[kx - kx_start] *
+                                       input_row[kx - kx_start];
+                            }
+                        }
+                    }
+                    output_channel[(size_t)oy * (size_t)expected_w + (size_t)ox] = sum;
+                }
+            }
+        }
+        return DET_OK;
+    }
     size_t weight_count = (size_t)out_channels * (size_t)input->channels *
                           (size_t)kernel * (size_t)kernel;
     (void)weight_count;

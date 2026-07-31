@@ -52,16 +52,20 @@ inference and 6.8--21.0 ms model save/load. These are performance baselines,
 not claims that the final detector has already passed the accuracy or
 architecture gates.
 
-After wiring the first spatial backbone, the compact edge profile has measured
-about 1.19--1.36 s `LOCAL_FAST` synthetic end-to-end training, 0.14--1.10 ms
-repeated inference, and 9--13 ms save/load for the same 5,000-image Release
-run. This profile uses one learned 3 x 3 stem
-channel, one learned 3 x 3 expansion stage, and three depthwise 3 x 3 pyramid
-stages. It is an executable edge variant of the architecture, not yet the
-larger 16/24/40/64/96-channel research configuration in the table below.
-The sub-second training gate therefore remains open; the next optimization
-checkpoint must reduce measured `synthetic_e2e_ms` below 1,000 ms rather than
-relabel this near-miss as success.
+After wiring the first spatial backbone, the compact edge profile initially
+measured about 1.19--1.36 s `LOCAL_FAST` synthetic end-to-end training. A
+specialized 3 x 3 stride-2 kernel for the two dense backbone stages now measures
+0.874--0.958 s `synthetic_e2e_ms` across repeated 5,000-image Release runs,
+with 0.08--0.16 ms repeated inference and 9--15 ms save/load. The optimization
+keeps the generic convolution API for callers and only specializes the fixed
+backbone shape. This is the first sub-second synthetic timing milestone; the
+official training gate remains open until raw-input timing, pinned-target
+repeatability, accuracy qualification, and the larger detector profile are
+also measured.
+The profile uses one learned 3 x 3 stem channel, one learned 3 x 3 expansion
+stage, and three depthwise 3 x 3 pyramid stages. It is an executable edge
+variant of the architecture, not yet the larger 16/24/40/64/96-channel research
+configuration in the table below.
 The current 5,000-image `LOCAL_FAST` smoke benchmark produces top-K detections
 at the conventional 0.25 threshold after the background-control ablation; the
 synthetic overfit test passes, but localization quality, confidence
@@ -85,12 +89,12 @@ serialization; inference warmups and repeated inference, plus save/load I/O,
 are reported separately. It reserves a unique checkpoint path per process and
 malformed or unknown benchmark options fail closed.
 
-Verification status for this checkpoint: the loader and benchmark hardening
-has passed static diff review, but a fresh C build is pending because the
-current Windows session has no native C compiler/CMake and WSL returns
-`E_ACCESSDENIED`. The last pushed commit remains the prior verified baseline;
-this pending diff must not be reported as pushed until the toolchain and Git
-index permissions are restored.
+Verification status for this checkpoint: fresh Release, Debug, and ASan builds
+pass CTest; 5,000-image Release LOCAL_FAST runs pass through the F32, INT8, and
+W4A8 profiles; GLOBAL_BP remains the reference run; and boundary smoke tests
+cover the minimum and odd/even image sizes. This specialization is still an
+uncommitted checkpoint until the final review completes and the measured diff
+is pushed.
 
 COCO is not part of the core API or the first timing contract. COCO 2017 becomes
 an optional 80-class scalability and accuracy test after the 5,000-image gate

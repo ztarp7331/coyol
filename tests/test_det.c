@@ -150,6 +150,80 @@ static void test_arena_and_conv(void) {
     assert(fabsf(grad_bias[0] - 1.0f) < 1e-6f);
 }
 
+static void test_stride2_padding_parity(void) {
+    const int dimensions[] = {1, 2, 3, 4, 31, 32, 33, 159, 160, 161};
+    const int channel_counts[] = {1, 4};
+    for (size_t dimension_index = 0U;
+         dimension_index < sizeof(dimensions) / sizeof(dimensions[0]); ++dimension_index) {
+        int height = dimensions[dimension_index];
+        int width = dimensions[(dimension_index * 3U + 2U) %
+                                (sizeof(dimensions) / sizeof(dimensions[0]))];
+        for (size_t channel_index = 0U;
+             channel_index < sizeof(channel_counts) / sizeof(channel_counts[0]); ++channel_index) {
+            int channels = channel_counts[channel_index];
+            int output_channels = 2;
+            int output_height = (height + 1) / 2;
+            int output_width = (width + 1) / 2;
+            size_t input_count = (size_t)channels * (size_t)height * (size_t)width;
+            size_t weight_count = (size_t)output_channels * (size_t)channels * 9U;
+            size_t output_count = (size_t)output_channels * (size_t)output_height *
+                                  (size_t)output_width;
+            float *input_data = (float *)malloc(input_count * sizeof(float));
+            float *weights = (float *)malloc(weight_count * sizeof(float));
+            float *output_data = (float *)malloc(output_count * sizeof(float));
+            float *reference = (float *)malloc(output_count * sizeof(float));
+            assert(input_data != NULL && weights != NULL && output_data != NULL &&
+                   reference != NULL);
+            for (size_t i = 0U; i < input_count; ++i) {
+                input_data[i] = (float)((int)(i % 17U) - 8) * 0.07f;
+            }
+            for (size_t i = 0U; i < weight_count; ++i) {
+                weights[i] = (float)((int)(i % 11U) - 5) * 0.03f;
+            }
+            const float bias[2] = {-0.13f, 0.21f};
+            det_tensor_f32 input = {input_data, channels, height, width};
+            det_tensor_f32 output = {output_data, output_channels, output_height, output_width};
+            assert(det_conv2d_f32(&input, weights, bias, output_channels, 3, 2, 1,
+                                  &output) == DET_OK);
+            for (int oc = 0; oc < output_channels; ++oc) {
+                for (int oy = 0; oy < output_height; ++oy) {
+                    for (int ox = 0; ox < output_width; ++ox) {
+                        float sum = bias[oc];
+                        for (int ic = 0; ic < channels; ++ic) {
+                            for (int ky = 0; ky < 3; ++ky) {
+                                int iy = oy * 2 + ky - 1;
+                                if (iy < 0 || iy >= height) continue;
+                                for (int kx = 0; kx < 3; ++kx) {
+                                    int ix = ox * 2 + kx - 1;
+                                    if (ix < 0 || ix >= width) continue;
+                                    size_t input_index = ((size_t)ic * (size_t)height +
+                                                          (size_t)iy) * (size_t)width +
+                                                         (size_t)ix;
+                                    size_t weight_index = (((size_t)oc * (size_t)channels +
+                                                            (size_t)ic) * 3U +
+                                                           (size_t)ky) * 3U + (size_t)kx;
+                                    sum += weights[weight_index] * input_data[input_index];
+                                }
+                            }
+                        }
+                        size_t output_index = ((size_t)oc * (size_t)output_height +
+                                               (size_t)oy) * (size_t)output_width +
+                                              (size_t)ox;
+                        reference[output_index] = sum;
+                    }
+                }
+            }
+            for (size_t i = 0U; i < output_count; ++i) {
+                assert(fabsf(output_data[i] - reference[i]) < 1.0e-6f);
+            }
+            free(reference);
+            free(output_data);
+            free(weights);
+            free(input_data);
+        }
+    }
+}
+
 static void test_math(void) {
     assert(fabsf(det_sigmoid(0.0f) - 0.5f) < 1e-6f);
     det_box a = {0, 0, 10, 10, 0};
@@ -334,6 +408,7 @@ static void test_train_predict_roundtrip(void) {
 
 int main(void) {
     test_arena_and_conv();
+    test_stride2_padding_parity();
     test_math();
     test_invalid_dataset_sample();
     test_train_predict_roundtrip();
