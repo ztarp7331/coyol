@@ -224,7 +224,13 @@ validation gate.
 On the same 160 x 160 Release benchmark, repeated quantized inference has
 measured about 0.8--1.9 ms across INT8 and W4A8 runs. The model file now carries the
 quantized buffers and scales, so a quantized load is self-contained; these are
-latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
+latency measurements only. The test suite now includes a deterministic two-box,
+two-class 64 x 64 streamed fixture: it requires two FP32 true positives with
+finite IoU/AP, then requires INT8 and W4A8 to retain every true positive and
+false negative, stay within a small false-positive/recall/precision allowance,
+and remain within the 2-point and 5-point mAP-loss limits respectively. This
+is a qualification smoke gate, not a COCO-scale accuracy claim; the broader
+multi-size, multi-class validation set remains outstanding.
 
 ### 2.2 Fast full-model learning
 

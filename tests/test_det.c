@@ -32,6 +32,11 @@ typedef struct {
 } repeat_sample_dataset;
 
 typedef struct {
+    det_sample sample;
+    int emitted;
+} multi_box_dataset;
+
+typedef struct {
     char magic[4];
     uint32_t version;
     uint32_t width;
@@ -261,6 +266,18 @@ static int next_repeat(void *user, det_sample *sample) {
 static void reset_repeat(void *user) {
     repeat_sample_dataset *dataset = (repeat_sample_dataset *)user;
     dataset->remaining = dataset->total;
+}
+
+static int next_multi_box(void *user, det_sample *sample) {
+    multi_box_dataset *dataset = (multi_box_dataset *)user;
+    if (dataset->emitted != 0) return 0;
+    *sample = dataset->sample;
+    dataset->emitted = 1;
+    return 1;
+}
+
+static void reset_multi_box(void *user) {
+    ((multi_box_dataset *)user)->emitted = 0;
 }
 
 static int next_io_error(void *user, det_sample *sample) {
@@ -815,6 +832,76 @@ static void test_odd_shape_neck_roundtrip(void) {
     (void)remove(local_after_path);
 }
 
+static void test_multi_box_quantization_gate(void) {
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model_spec spec = {64, 64, 1, 2, 32, 31};
+    float pixels[64 * 64] = {0.0f};
+    for (int y = 8; y < 24; ++y) {
+        for (int x = 8; x < 24; ++x) pixels[y * 64 + x] = 1.0f;
+    }
+    for (int y = 40; y < 56; ++y) {
+        for (int x = 40; x < 56; ++x) pixels[y * 64 + x] = 0.75f;
+    }
+    det_box boxes[2] = {{8.0f, 8.0f, 24.0f, 24.0f, 0},
+                        {40.0f, 40.0f, 56.0f, 56.0f, 1}};
+    multi_box_dataset storage = {{{pixels, 1, 64, 64}, boxes, 2}, 0};
+    det_dataset dataset = {&storage, next_multi_box, reset_multi_box, 1};
+    det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 80,
+                               0.02f, 0.8f, 0.1f, 1, 31, 1};
+    det_train_report train_report;
+    det_eval_report f32_report;
+    det_eval_report int8_report;
+    det_eval_report w4_report;
+    assert(det_context_create(2U << 20, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    assert(det_train(model, &dataset, &config, &train_report) == DET_OK);
+    assert(train_report.samples_seen == 80U && train_report.used_global_backward == 0);
+    assert(det_evaluate(model, &dataset, 0.1f, &f32_report) == DET_OK);
+    assert(f32_report.samples_seen == 1U && f32_report.ground_truths == 2U);
+    assert(f32_report.true_positives >= 2U);
+    assert(f32_report.ap50 >= 0.2f && f32_report.map50_95 >= 0.2f);
+
+    assert(det_model_set_precision(model, DET_PRECISION_INT8) == DET_OK);
+    assert(det_evaluate(model, &dataset, 0.1f, &int8_report) == DET_OK);
+    assert(int8_report.ground_truths == f32_report.ground_truths);
+    assert(int8_report.true_positives == f32_report.true_positives);
+    assert(int8_report.false_negatives == f32_report.false_negatives);
+    assert(int8_report.false_positives <= f32_report.false_positives + 2U);
+    assert(int8_report.recall + 0.01f >= f32_report.recall);
+    assert(int8_report.precision + 0.02f >= f32_report.precision);
+    assert(int8_report.ap50 + 0.02f >= f32_report.ap50);
+    assert(int8_report.map50_95 + 0.02f >= f32_report.map50_95);
+    assert(int8_report.mean_iou + 0.05f >= f32_report.mean_iou);
+
+    assert(det_model_set_precision(model, DET_PRECISION_W4A8) == DET_OK);
+    assert(det_evaluate(model, &dataset, 0.1f, &w4_report) == DET_OK);
+    assert(w4_report.ground_truths == f32_report.ground_truths);
+    assert(w4_report.true_positives == f32_report.true_positives);
+    assert(w4_report.false_negatives == f32_report.false_negatives);
+    assert(w4_report.false_positives <= f32_report.false_positives + 2U);
+    assert(w4_report.recall + 0.01f >= f32_report.recall);
+    assert(w4_report.precision + 0.02f >= f32_report.precision);
+    assert(w4_report.ap50 + 0.05f >= f32_report.ap50);
+    assert(w4_report.map50_95 + 0.05f >= f32_report.map50_95);
+    assert(w4_report.mean_iou + 0.10f >= f32_report.mean_iou);
+    det_model_destroy(model);
+
+    det_model *global_model = NULL;
+    det_train_config global_config = {DET_TRAIN_GLOBAL_BP, DET_PRECISION_F32, 2,
+                                      0.01f, 0.8f, 0.1f, 1, 31, 1};
+    det_train_report global_report;
+    det_eval_report global_eval;
+    assert(det_model_build(ctx, &spec, &global_model) == DET_OK);
+    assert(det_train(global_model, &dataset, &global_config, &global_report) == DET_OK);
+    assert(global_report.samples_seen == 2U && global_report.used_global_backward == 1);
+    assert(det_evaluate(global_model, &dataset, 0.1f, &global_eval) == DET_OK);
+    assert(global_eval.samples_seen == 1U && global_eval.ground_truths == 2U);
+    assert(isfinite(global_eval.mean_iou) && isfinite(global_eval.map50_95));
+    det_model_destroy(global_model);
+    det_context_destroy(ctx);
+}
+
 int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
@@ -823,6 +910,7 @@ int main(void) {
     test_invalid_dataset_sample();
     test_train_predict_roundtrip();
     test_odd_shape_neck_roundtrip();
+    test_multi_box_quantization_gate();
     puts("all det tests passed");
     return 0;
 }
