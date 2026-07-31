@@ -145,7 +145,9 @@ The shared detection tower produces, at every scale:
 
 There is no DFL. The deployed one-to-one output requires thresholding, box
 decoding, and fixed-size top-K selection but no NMS. A one-to-many head remains
-available during reference training and evaluation.
+planned as a training-only auxiliary head; the current compact implementation
+has one learned head per scale and therefore has not yet delivered dual
+assignment.
 
 These choices retain YOLO26's useful deployment ideas—DFL-free regression and
 dual-head NMS-free detection—without copying its complete architecture:
@@ -173,8 +175,10 @@ latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
 
 ### 2.2 Fast full-model learning
 
-`LOCAL_FAST` must update the convolutional backbone, neck, and head. It must not
-use a frozen or pretrained detector.
+`LOCAL_FAST` must update the convolutional backbone, neck, and head once the
+neck is present. It must not use a frozen or pretrained detector. The current
+compact graph has no learned neck yet, so its measured LOCAL_FAST path updates
+the backbone and heads only.
 
 The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
@@ -225,11 +229,13 @@ This framework treats the timing as a falsifiable experiment:
 
 ### 2.3 Reference learning
 
-`GLOBAL_BP` trains the identical graph with ordinary end-to-end backpropagation.
-It provides:
+`GLOBAL_BP` trains the identical current graph with ordinary end-to-end
+backpropagation. It provides the gradient and convergence reference needed
+before adding the planned neck and auxiliary assignment head:
 
 - gradient and convergence truth for `LOCAL_FAST`;
-- one-to-many plus one-to-one consistent assignment;
+- one-to-one assignment in the current head, with one-to-many plus one-to-one
+  consistent assignment reserved for the dual-head increment;
 - Progressive Loss moving from `(0.8, 0.2)` to `(0.1, 0.9)`;
 - tiny-object assignment protection;
 - BCE classification loss;
