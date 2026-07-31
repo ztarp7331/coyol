@@ -104,6 +104,9 @@ failure cannot be reported as a short successful epoch. The benchmark accepts
 streamed inside training, its companion is explicitly `train_plus_decode_ms`,
 not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
 implementation.
+The public `det_evaluate` path now performs greedy class-aware IoU@0.50 matching
+over any streamed dataset and reports precision, recall, mean IoU, and TP/FP/FN
+counts. It is an evaluation primitive, not yet a full ranked mAP implementation.
 The benchmark now stops both training timers immediately after checkpoint
 serialization; inference warmups and repeated inference, plus save/load I/O,
 are reported separately. It reserves a unique checkpoint path per process and

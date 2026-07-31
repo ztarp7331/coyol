@@ -234,6 +234,16 @@ static void test_manifest_adapter(void) {
     assert(dataset.next(dataset.user, &sample) == 0);
     assert(det_manifest_status(raw) == DET_OK);
     det_manifest_close(raw);
+    manifest = fopen(manifest_path, "wb");
+    assert(manifest != NULL);
+    assert(fputs("det_test_image.pgm 0,0,3,2,2\n", manifest) >= 0);
+    assert(fclose(manifest) == 0);
+    raw = NULL;
+    assert(det_manifest_open(manifest_path, 4, 4, 1, 4, &raw) == DET_OK);
+    assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
+    assert(dataset.next(dataset.user, &sample) < 0);
+    assert(det_manifest_status(raw) == DET_ERR_FORMAT);
+    det_manifest_close(raw);
     (void)remove(image_path);
     (void)remove(manifest_path);
 
@@ -253,7 +263,7 @@ static void test_manifest_adapter(void) {
     assert(det_manifest_open(bad_manifest_path, 2, 2, 1, 1, &raw) == DET_OK);
     assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
     assert(dataset.next(dataset.user, &sample) < 0);
-    assert(det_manifest_status(raw) == DET_ERR_IO);
+    assert(det_manifest_status(raw) == DET_ERR_FORMAT);
     det_manifest_close(raw);
     (void)remove(bad_image_path);
     (void)remove(bad_manifest_path);
@@ -460,6 +470,12 @@ static void test_train_predict_roundtrip(void) {
     config.reset_weights = 0;
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
     assert(report.used_global_backward == 1);
+    det_eval_report evaluation;
+    assert(det_evaluate(model, &dataset, 0.1f, &evaluation) == DET_OK);
+    assert(evaluation.samples_seen == 1U && evaluation.ground_truths == 1U);
+    assert(evaluation.predictions > 0U);
+    assert(isfinite(evaluation.precision) && isfinite(evaluation.recall) &&
+           isfinite(evaluation.mean_iou));
 
     const char *path = "det_test_model.cdet";
     assert(det_save(model, path) == DET_OK);

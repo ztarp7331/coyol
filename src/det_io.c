@@ -124,8 +124,14 @@ static int parse_box_token(const char *token, det_box *box) {
 }
 
 static int is_absolute_path(const char *path) {
-    return path != NULL && (path[0] == '/' || path[0] == '\\' ||
-                            (isalpha((unsigned char)path[0]) && path[1] == ':'));
+    if (path == NULL) return 0;
+#if defined(_WIN32)
+    return path[0] == '/' || path[0] == '\\' ||
+           (isalpha((unsigned char)path[0]) && path[1] == ':' &&
+            (path[2] == '/' || path[2] == '\\'));
+#else
+    return path[0] == '/';
+#endif
 }
 
 static int make_image_path(const det_manifest_dataset *dataset, const char *path,
@@ -149,17 +155,20 @@ static int ensure_raw_capacity(det_manifest_dataset *dataset, size_t bytes) {
     return 1;
 }
 
-static int decode_pnm(det_manifest_dataset *dataset, const char *path,
-                      int *source_width, int *source_height) {
+static det_status decode_pnm(det_manifest_dataset *dataset, const char *path,
+                             int *source_width, int *source_height) {
     FILE *file = NULL;
     char token[64];
     int source_channels;
     int ascii_samples;
     int width, height, max_value;
     size_t pixels, bytes;
-    if (dataset == NULL || path == NULL || source_width == NULL || source_height == NULL) return 0;
+    if (dataset == NULL || path == NULL || source_width == NULL || source_height == NULL) {
+        return DET_ERR_ARGUMENT;
+    }
     file = fopen(path, "rb");
-    if (file == NULL) return 0;
+    if (file == NULL) return DET_ERR_IO;
+    det_status failure = DET_ERR_FORMAT;
     if (!read_pnm_token(file, token, sizeof(token)) ||
         (strcmp(token, "P2") != 0 && strcmp(token, "P3") != 0 &&
          strcmp(token, "P5") != 0 && strcmp(token, "P6") != 0)) goto fail;
@@ -174,7 +183,10 @@ static int decode_pnm(det_manifest_dataset *dataset, const char *path,
     if (pixels > SIZE_MAX / (size_t)source_channels) goto fail;
     bytes = pixels * (size_t)source_channels;
     if (bytes > DET_MANIFEST_MAX_RAW_BYTES) goto fail;
-    if (!ensure_raw_capacity(dataset, bytes)) goto fail;
+    if (!ensure_raw_capacity(dataset, bytes)) {
+        failure = DET_ERR_MEMORY;
+        goto fail;
+    }
     if (ascii_samples) {
         for (size_t i = 0U; i < bytes; ++i) {
             int value;
@@ -183,13 +195,14 @@ static int decode_pnm(det_manifest_dataset *dataset, const char *path,
             dataset->raw[i] = (unsigned char)value;
         }
     } else if (fread(dataset->raw, 1U, bytes, file) != bytes) {
+        failure = DET_ERR_IO;
         goto fail;
     } else {
         for (size_t i = 0U; i < bytes; ++i) {
             if ((int)dataset->raw[i] > max_value) goto fail;
         }
     }
-    if (fclose(file) != 0) return 0;
+    if (fclose(file) != 0) return DET_ERR_IO;
     for (int y = 0; y < dataset->height; ++y) {
         size_t source_y = (size_t)y * (size_t)height / (size_t)dataset->height;
         for (int x = 0; x < dataset->width; ++x) {
@@ -215,10 +228,10 @@ static int decode_pnm(det_manifest_dataset *dataset, const char *path,
     }
     *source_width = width;
     *source_height = height;
-    return 1;
+    return DET_OK;
 fail:
     if (file != NULL) fclose(file);
-    return 0;
+    return failure;
 }
 
 static int parse_manifest_line(det_manifest_dataset *dataset, char *line,
@@ -267,9 +280,17 @@ static int manifest_next(void *user, det_sample *sample) {
         }
         int source_width = 0;
         int source_height = 0;
-        if (!decode_pnm(dataset, image_path, &source_width, &source_height)) {
-            dataset->status = DET_ERR_IO;
+        det_status decode_status = decode_pnm(dataset, image_path, &source_width, &source_height);
+        if (decode_status != DET_OK) {
+            dataset->status = decode_status;
             return -1;
+        }
+        for (int i = 0; i < parsed - 1; ++i) {
+            if (dataset->boxes[i].x2 > (float)source_width ||
+                dataset->boxes[i].y2 > (float)source_height) {
+                dataset->status = DET_ERR_FORMAT;
+                return -1;
+            }
         }
         float x_scale = (float)dataset->width / (float)source_width;
         float y_scale = (float)dataset->height / (float)source_height;

@@ -93,6 +93,18 @@ typedef struct {
 } det_train_report;
 
 typedef struct {
+    size_t samples_seen;
+    size_t ground_truths;
+    size_t predictions;
+    size_t true_positives;
+    size_t false_positives;
+    size_t false_negatives;
+    float precision;
+    float recall;
+    float mean_iou;
+} det_eval_report;
+
+typedef struct {
     det_box box;
     float score;
 } det_detection;
@@ -154,6 +166,9 @@ det_status det_model_reset(det_model *model, int seed);
 
 det_status det_train(det_model *model, const det_dataset *dataset,
                      const det_train_config *config, det_train_report *report);
+/* Greedy class-aware IoU@0.50 matching over a streamed validation dataset. */
+det_status det_evaluate(const det_model *model, const det_dataset *dataset,
+                        float score_threshold, det_eval_report *report);
 det_status det_predict(const det_model *model, const det_image *image,
                        float score_threshold, det_detection *detections,
                        int capacity, int *count);

@@ -1752,6 +1752,88 @@ det_status det_predict(const det_model *model, const det_image *image,
     return DET_OK;
 }
 
+det_status det_evaluate(const det_model *model, const det_dataset *dataset,
+                        float score_threshold, det_eval_report *report) {
+    if (model == NULL || dataset == NULL || report == NULL || dataset->next == NULL ||
+        !isfinite(score_threshold) || score_threshold < 0.0f || score_threshold > 1.0f) {
+        return DET_ERR_ARGUMENT;
+    }
+    if ((size_t)model->spec.max_detections > SIZE_MAX / sizeof(det_detection)) {
+        return DET_ERR_MEMORY;
+    }
+    det_detection *detections = (det_detection *)malloc(
+        (size_t)model->spec.max_detections * sizeof(*detections));
+    if (detections == NULL) return DET_ERR_MEMORY;
+    memset(report, 0, sizeof(*report));
+    if (dataset->reset != NULL) dataset->reset(dataset->user);
+    double iou_sum = 0.0;
+    det_status status = DET_OK;
+    for (;;) {
+        det_sample sample;
+        int next_status = dataset->next(dataset->user, &sample);
+        if (next_status < 0) {
+            status = DET_ERR_IO;
+            break;
+        }
+        if (next_status == 0) break;
+        if (!validate_sample(model, &sample)) {
+            status = DET_ERR_ARGUMENT;
+            break;
+        }
+        unsigned char *matched = (unsigned char *)calloc((size_t)sample.box_count, 1U);
+        if (sample.box_count > 0 && matched == NULL) {
+            status = DET_ERR_MEMORY;
+            break;
+        }
+        int detection_count = 0;
+        status = det_predict(model, &sample.image, score_threshold, detections,
+                             model->spec.max_detections, &detection_count);
+        if (status != DET_OK) {
+            free(matched);
+            break;
+        }
+        report->samples_seen += 1U;
+        report->ground_truths += (size_t)sample.box_count;
+        report->predictions += (size_t)detection_count;
+        size_t matched_count = 0U;
+        for (int d = 0; d < detection_count; ++d) {
+            int best_index = -1;
+            float best_iou = 0.0f;
+            for (int b = 0; b < sample.box_count; ++b) {
+                if (matched[b] != 0U || sample.boxes[b].class_id != detections[d].box.class_id) {
+                    continue;
+                }
+                float iou = det_iou(&detections[d].box, &sample.boxes[b]);
+                if (iou > best_iou) {
+                    best_iou = iou;
+                    best_index = b;
+                }
+            }
+            if (best_index >= 0 && best_iou >= 0.5f) {
+                matched[best_index] = 1U;
+                ++matched_count;
+                ++report->true_positives;
+                iou_sum += (double)best_iou;
+            } else {
+                ++report->false_positives;
+            }
+        }
+        report->false_negatives += (size_t)sample.box_count - matched_count;
+        free(matched);
+    }
+    free(detections);
+    if (status != DET_OK) return status;
+    if (report->samples_seen == 0U) return DET_ERR_ARGUMENT;
+    size_t predicted_positive = report->true_positives + report->false_positives;
+    report->precision = predicted_positive > 0U ?
+        (float)report->true_positives / (float)predicted_positive : 0.0f;
+    report->recall = report->ground_truths > 0U ?
+        (float)report->true_positives / (float)report->ground_truths : 0.0f;
+    report->mean_iou = report->true_positives > 0U ?
+        (float)(iou_sum / (double)report->true_positives) : 0.0f;
+    return DET_OK;
+}
+
 typedef struct {
     char magic[4];
     uint32_t version;
