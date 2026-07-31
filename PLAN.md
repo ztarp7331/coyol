@@ -78,6 +78,12 @@ INT8, and 0.906--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples p
 sixteenth image and does not change inference. The occasional W4A8 overrun
 shows why the one-second result is still a stretch target, not a qualified
 guarantee.
+The first top-down-neck build with its local update measured 1.147 s F32,
+1.201 s INT8, and 1.132 s W4A8 for 5,000 synthetic 160 x 160 images on the
+development CPU; the same compact graph at 33 x 33 measured 101--111 ms.
+These are timing checkpoints, not accuracy claims. The 160 x 160 local path is
+currently above the one-second stretch gate, so the neck must be optimized or
+the gate must be qualified on a documented lower-resolution edge profile.
 
 Two training times must be published:
 
@@ -209,9 +215,12 @@ latency measurements only and the INT8/W4A8 accuracy gates are not yet claimed.
 
 `LOCAL_FAST` must update the convolutional backbone, neck, and both assignment
 heads once the neck is present. It must not use a frozen or pretrained detector.
-The current compact graph has no learned neck yet; its measured LOCAL_FAST path
-updates the backbone, the deployed one-to-one heads, and the periodic
-training-only one-to-many bank.
+The compact graph now has three learned 1 x 1 lateral projections and a
+top-down P5-to-P3 nearest-neighbor fusion path. `GLOBAL_BP` propagates through
+the fusion and updates the lateral weights; `LOCAL_FAST` applies the same
+deterministic sparse local rule to the three lateral stages. This is
+intentionally smaller than the research table's 48-channel PAN target and does
+not yet claim the bottom-up pass.
 
 The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
@@ -385,7 +394,7 @@ Use per-output-channel symmetric weight scales, per-tensor activation scales,
 INT32 accumulation, and integer multiplier-plus-shift requantization. Precision
 profiles are compiled separately rather than switched at runtime.
 
-The current version-6 `CDET` model contains graph metadata, tensor shapes,
+The current version-7 `CDET` model contains graph metadata, tensor shapes,
 FP32 optimizer state, quantized buffers/scales, and a CRC32 over the payload.
 It contains both the deployed one-to-one and training-only one-to-many head
 banks and does not serialize pointers. On load, FP32 weights are authoritative and

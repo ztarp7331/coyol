@@ -654,6 +654,60 @@ static void test_train_predict_roundtrip(void) {
     det_context_destroy(ctx);
 }
 
+static void test_odd_shape_neck_roundtrip(void) {
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model *loaded = NULL;
+    det_model_spec spec = {33, 31, 1, 1, 8, 3};
+    float pixels[33 * 31] = {0.0f};
+    det_image image = {pixels, 1, 31, 33};
+    det_detection before[8];
+    det_detection trained[8];
+    det_detection after[8];
+    int before_count = 0;
+    int trained_count = 0;
+    int after_count = 0;
+    const char *before_path = "det_test_odd_neck_before.cdet";
+    const char *path = "det_test_odd_neck.cdet";
+    assert(det_context_create(1U << 20, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    assert(det_model_reset(model, 11) == DET_OK);
+    assert(det_predict(model, &image, 0.1f, before, 8, &before_count) == DET_OK);
+    assert(det_save(model, before_path) == DET_OK);
+    det_box box = {4.0f, 4.0f, 12.0f, 12.0f, 0};
+    one_sample_dataset storage = {{{pixels, 1, 31, 33}, &box, 1}, 0};
+    det_dataset dataset = {&storage, next_one, reset_one, 1};
+    det_train_config config = {DET_TRAIN_GLOBAL_BP, DET_PRECISION_F32, 1, 0.01f,
+                               0.8f, 0.1f, 0, 11, 1};
+    det_train_report report;
+    assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    assert(report.used_global_backward == 1);
+    assert(det_predict(model, &image, 0.1f, trained, 8, &trained_count) == DET_OK);
+    assert(det_save(model, path) == DET_OK);
+    assert(!files_equal(before_path, path));
+    assert(det_load(ctx, path, &loaded) == DET_OK);
+    assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
+    assert(after_count == trained_count);
+    for (int i = 0; i < trained_count; ++i) {
+        assert(fabsf(trained[i].score - after[i].score) < 1e-6f);
+        assert(fabsf(trained[i].box.x1 - after[i].box.x1) < 1e-6f);
+        assert(fabsf(trained[i].box.y1 - after[i].box.y1) < 1e-6f);
+        assert(fabsf(trained[i].box.x2 - after[i].box.x2) < 1e-6f);
+        assert(fabsf(trained[i].box.y2 - after[i].box.y2) < 1e-6f);
+    }
+    assert(det_model_set_precision(loaded, DET_PRECISION_INT8) == DET_OK);
+    assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
+    for (int i = 0; i < after_count; ++i) assert(isfinite(after[i].score));
+    assert(det_model_set_precision(loaded, DET_PRECISION_W4A8) == DET_OK);
+    assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
+    for (int i = 0; i < after_count; ++i) assert(isfinite(after[i].score));
+    det_model_destroy(loaded);
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+    (void)remove(before_path);
+    (void)remove(path);
+}
+
 int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
@@ -661,6 +715,7 @@ int main(void) {
     test_manifest_adapter();
     test_invalid_dataset_sample();
     test_train_predict_roundtrip();
+    test_odd_shape_neck_roundtrip();
     puts("all det tests passed");
     return 0;
 }
