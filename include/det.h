@@ -102,6 +102,7 @@ typedef struct {
     float precision;
     float recall;
     float mean_iou;
+    float ap50;
 } det_eval_report;
 
 typedef struct {

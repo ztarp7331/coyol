@@ -1695,6 +1695,157 @@ static void sort_detections_descending(det_detection *detections, int count) {
     }
 }
 
+typedef struct {
+    det_detection detection;
+    size_t sample_index;
+} det_eval_prediction;
+
+typedef struct {
+    det_box box;
+    size_t sample_index;
+} det_eval_ground_truth;
+
+static int append_eval_prediction(det_eval_prediction **items, size_t *count,
+                                  size_t *capacity, const det_eval_prediction *item) {
+    if (*count == *capacity) {
+        size_t next = *capacity == 0U ? 64U : *capacity * 2U;
+        if (next < *capacity || next > SIZE_MAX / sizeof(**items)) return 0;
+        det_eval_prediction *grown = (det_eval_prediction *)realloc(
+            *items, next * sizeof(**items));
+        if (grown == NULL) return 0;
+        *items = grown;
+        *capacity = next;
+    }
+    (*items)[(*count)++] = *item;
+    return 1;
+}
+
+static int append_eval_ground_truth(det_eval_ground_truth **items, size_t *count,
+                                    size_t *capacity, const det_eval_ground_truth *item) {
+    if (*count == *capacity) {
+        size_t next = *capacity == 0U ? 64U : *capacity * 2U;
+        if (next < *capacity || next > SIZE_MAX / sizeof(**items)) return 0;
+        det_eval_ground_truth *grown = (det_eval_ground_truth *)realloc(
+            *items, next * sizeof(**items));
+        if (grown == NULL) return 0;
+        *items = grown;
+        *capacity = next;
+    }
+    (*items)[(*count)++] = *item;
+    return 1;
+}
+
+static int compare_eval_predictions(const void *left, const void *right) {
+    const det_eval_prediction *a = (const det_eval_prediction *)left;
+    const det_eval_prediction *b = (const det_eval_prediction *)right;
+    if (a->detection.score < b->detection.score) return 1;
+    if (a->detection.score > b->detection.score) return -1;
+    if (a->sample_index < b->sample_index) return -1;
+    if (a->sample_index > b->sample_index) return 1;
+    return 0;
+}
+
+static det_status evaluate_ap50(const det_model *model, const det_dataset *dataset,
+                                float *out_ap50) {
+    if (out_ap50 == NULL) return DET_ERR_ARGUMENT;
+    *out_ap50 = 0.0f;
+    if (dataset->reset == NULL) return DET_OK;
+    det_eval_prediction *predictions = NULL;
+    det_eval_ground_truth *ground_truths = NULL;
+    size_t prediction_count = 0U, prediction_capacity = 0U;
+    size_t ground_truth_count = 0U, ground_truth_capacity = 0U;
+    det_detection *detections = (det_detection *)malloc(
+        (size_t)model->spec.max_detections * sizeof(*detections));
+    if (detections == NULL) return DET_ERR_MEMORY;
+    det_status status = DET_OK;
+    dataset->reset(dataset->user);
+    size_t sample_index = 0U;
+    for (;;) {
+        det_sample sample;
+        int next_status = dataset->next(dataset->user, &sample);
+        if (next_status < 0) {
+            status = DET_ERR_IO;
+            break;
+        }
+        if (next_status == 0) break;
+        if (!validate_sample(model, &sample)) {
+            status = DET_ERR_ARGUMENT;
+            break;
+        }
+        for (int b = 0; b < sample.box_count; ++b) {
+            det_eval_ground_truth item = {sample.boxes[b], sample_index};
+            if (!append_eval_ground_truth(&ground_truths, &ground_truth_count,
+                                          &ground_truth_capacity, &item)) {
+                status = DET_ERR_MEMORY;
+                break;
+            }
+        }
+        if (status != DET_OK) break;
+        int detection_count = 0;
+        status = det_predict(model, &sample.image, 0.0f, detections,
+                             model->spec.max_detections, &detection_count);
+        if (status != DET_OK) break;
+        for (int d = 0; d < detection_count; ++d) {
+            det_eval_prediction item = {detections[d], sample_index};
+            if (!append_eval_prediction(&predictions, &prediction_count,
+                                        &prediction_capacity, &item)) {
+                status = DET_ERR_MEMORY;
+                break;
+            }
+        }
+        if (status != DET_OK) break;
+        ++sample_index;
+    }
+    free(detections);
+    if (status != DET_OK) {
+        free(predictions);
+        free(ground_truths);
+        return status;
+    }
+    if (prediction_count > 1U) {
+        qsort(predictions, prediction_count, sizeof(*predictions), compare_eval_predictions);
+    }
+    unsigned char *matched = (unsigned char *)calloc(ground_truth_count, 1U);
+    if (ground_truth_count > 0U && matched == NULL) {
+        free(predictions);
+        free(ground_truths);
+        return DET_ERR_MEMORY;
+    }
+    size_t true_positives = 0U;
+    double ap = 0.0;
+    double previous_recall = 0.0;
+    for (size_t i = 0U; i < prediction_count; ++i) {
+        size_t best_index = SIZE_MAX;
+        float best_iou = 0.0f;
+        for (size_t g = 0U; g < ground_truth_count; ++g) {
+            if (matched[g] != 0U ||
+                ground_truths[g].sample_index != predictions[i].sample_index ||
+                ground_truths[g].box.class_id != predictions[i].detection.box.class_id) {
+                continue;
+            }
+            float iou = det_iou(&predictions[i].detection.box, &ground_truths[g].box);
+            if (iou > best_iou) {
+                best_iou = iou;
+                best_index = g;
+            }
+        }
+        if (best_index != SIZE_MAX && best_iou >= 0.5f) {
+            matched[best_index] = 1U;
+            ++true_positives;
+            double recall = ground_truth_count > 0U ?
+                (double)true_positives / (double)ground_truth_count : 0.0;
+            double precision = (double)true_positives / (double)(i + 1U);
+            ap += precision * (recall - previous_recall);
+            previous_recall = recall;
+        }
+    }
+    *out_ap50 = ground_truth_count > 0U ? (float)ap : 0.0f;
+    free(matched);
+    free(predictions);
+    free(ground_truths);
+    return DET_OK;
+}
+
 det_status det_predict(const det_model *model, const det_image *image,
                        float score_threshold, det_detection *detections,
                        int capacity, int *count) {
@@ -1768,6 +1919,8 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
     if (dataset->reset != NULL) dataset->reset(dataset->user);
     double iou_sum = 0.0;
     det_status status = DET_OK;
+    unsigned char *matched = NULL;
+    size_t matched_capacity = 0U;
     for (;;) {
         det_sample sample;
         int next_status = dataset->next(dataset->user, &sample);
@@ -1780,16 +1933,21 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
             status = DET_ERR_ARGUMENT;
             break;
         }
-        unsigned char *matched = (unsigned char *)calloc((size_t)sample.box_count, 1U);
-        if (sample.box_count > 0 && matched == NULL) {
-            status = DET_ERR_MEMORY;
-            break;
+        if ((size_t)sample.box_count > matched_capacity) {
+            unsigned char *grown = (unsigned char *)realloc(
+                matched, (size_t)sample.box_count);
+            if (grown == NULL) {
+                status = DET_ERR_MEMORY;
+                break;
+            }
+            matched = grown;
+            matched_capacity = (size_t)sample.box_count;
         }
+        if (sample.box_count > 0) memset(matched, 0, (size_t)sample.box_count);
         int detection_count = 0;
         status = det_predict(model, &sample.image, score_threshold, detections,
                              model->spec.max_detections, &detection_count);
         if (status != DET_OK) {
-            free(matched);
             break;
         }
         report->samples_seen += 1U;
@@ -1819,8 +1977,8 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
             }
         }
         report->false_negatives += (size_t)sample.box_count - matched_count;
-        free(matched);
     }
+    free(matched);
     free(detections);
     if (status != DET_OK) return status;
     if (report->samples_seen == 0U) return DET_ERR_ARGUMENT;
@@ -1831,7 +1989,7 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
         (float)report->true_positives / (float)report->ground_truths : 0.0f;
     report->mean_iou = report->true_positives > 0U ?
         (float)(iou_sum / (double)report->true_positives) : 0.0f;
-    return DET_OK;
+    return evaluate_ap50(model, dataset, &report->ap50);
 }
 
 typedef struct {

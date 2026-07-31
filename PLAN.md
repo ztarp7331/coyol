@@ -105,8 +105,9 @@ streamed inside training, its companion is explicitly `train_plus_decode_ms`,
 not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
 implementation.
 The public `det_evaluate` path now performs greedy class-aware IoU@0.50 matching
-over any streamed dataset and reports precision, recall, mean IoU, and TP/FP/FN
-counts. It is an evaluation primitive, not yet a full ranked mAP implementation.
+over any streamed dataset and reports precision, recall, mean IoU, TP/FP/FN
+counts, and ranked AP50 when the stream can be reset. It remains a single-IoU
+evaluation primitive; full multi-IoU mAP and per-class buckets are still open.
 The benchmark now stops both training timers immediately after checkpoint
 serialization; inference warmups and repeated inference, plus save/load I/O,
 are reported separately. It reserves a unique checkpoint path per process and

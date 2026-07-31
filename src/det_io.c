@@ -346,7 +346,11 @@ det_status det_manifest_open(const char *manifest_path, int width, int height,
         return DET_ERR_IO;
     }
     const char *last_slash = strrchr(manifest_path, '/');
+#if defined(_WIN32)
     const char *last_backslash = strrchr(manifest_path, '\\');
+#else
+    const char *last_backslash = NULL;
+#endif
     const char *separator = last_slash == NULL ? last_backslash :
                             (last_backslash == NULL ? last_slash :
                              (last_slash > last_backslash ? last_slash : last_backslash));
