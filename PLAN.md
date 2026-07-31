@@ -93,8 +93,8 @@ Verification status for this checkpoint: fresh Release, Debug, and ASan builds
 pass CTest; 5,000-image Release LOCAL_FAST runs pass through the F32, INT8, and
 W4A8 profiles; GLOBAL_BP remains the reference run; and boundary smoke tests
 cover the minimum and odd/even image sizes. This specialization is still an
-uncommitted checkpoint until the final review completes and the measured diff
-is pushed.
+verified and pushed in commit `e47afc1`; the official raw/full-architecture
+training gate remains open.
 
 COCO is not part of the core API or the first timing contract. COCO 2017 becomes
 an optional 80-class scalability and accuracy test after the 5,000-image gate
