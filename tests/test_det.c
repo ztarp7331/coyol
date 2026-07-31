@@ -26,6 +26,12 @@ typedef struct {
 } one_sample_dataset;
 
 typedef struct {
+    det_sample sample;
+    size_t remaining;
+    size_t total;
+} repeat_sample_dataset;
+
+typedef struct {
     char magic[4];
     uint32_t version;
     uint32_t width;
@@ -186,6 +192,19 @@ static size_t test_head_bytes(int classes) {
            outputs * sizeof(float);
 }
 
+static size_t test_bottomup_weight_offset(int channels, int classes) {
+    size_t offset = sizeof(test_file_header);
+    int input_channels = channels;
+    for (int stage = 0; stage < 5; ++stage) {
+        int output_channels = stage == 0 ? 1 : 4;
+        offset += test_stage_bytes(input_channels, output_channels, stage > 1);
+        input_channels = output_channels;
+    }
+    offset += 6U * test_head_bytes(classes);
+    offset += 3U * test_stage_bytes_kernel(4, 4, 0, 1);
+    return offset + 10U * sizeof(int);
+}
+
 static int mutate_auxiliary_weight(const char *path, int width, int height,
                                    int channels, int classes) {
     size_t offset = sizeof(test_file_header);
@@ -229,6 +248,19 @@ static int next_one(void *user, det_sample *sample) {
 
 static void reset_one(void *user) {
     ((one_sample_dataset *)user)->emitted = 0;
+}
+
+static int next_repeat(void *user, det_sample *sample) {
+    repeat_sample_dataset *dataset = (repeat_sample_dataset *)user;
+    if (dataset->remaining == 0U) return 0;
+    *sample = dataset->sample;
+    --dataset->remaining;
+    return 1;
+}
+
+static void reset_repeat(void *user) {
+    repeat_sample_dataset *dataset = (repeat_sample_dataset *)user;
+    dataset->remaining = dataset->total;
 }
 
 static int next_io_error(void *user, det_sample *sample) {
@@ -738,16 +770,7 @@ static void test_odd_shape_neck_roundtrip(void) {
     assert(det_predict(model, &image, 0.1f, trained, 8, &trained_count) == DET_OK);
     assert(det_save(model, path) == DET_OK);
     assert(!files_equal(before_path, path));
-    size_t bottomup_offset = sizeof(test_file_header);
-    int input_channels = 1;
-    for (int stage = 0; stage < 5; ++stage) {
-        int output_channels = stage == 0 ? 1 : 4;
-        bottomup_offset += test_stage_bytes(input_channels, output_channels, stage > 1);
-        input_channels = output_channels;
-    }
-    bottomup_offset += 6U * test_head_bytes(1);
-    bottomup_offset += 3U * test_stage_bytes_kernel(4, 4, 0, 1);
-    bottomup_offset += 10U * sizeof(int);
+    size_t bottomup_offset = test_bottomup_weight_offset(1, 1);
     assert(file_regions_differ(before_path, path, bottomup_offset,
                                4U * 9U * sizeof(float)));
     assert(det_load(ctx, path, &loaded) == DET_OK);
@@ -767,10 +790,29 @@ static void test_odd_shape_neck_roundtrip(void) {
     assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
     for (int i = 0; i < after_count; ++i) assert(isfinite(after[i].score));
     det_model_destroy(loaded);
+
+    det_model *local_model = NULL;
+    const char *local_before_path = "det_test_odd_local_before.cdet";
+    const char *local_after_path = "det_test_odd_local_after.cdet";
+    assert(det_model_build(ctx, &spec, &local_model) == DET_OK);
+    assert(det_model_reset(local_model, 23) == DET_OK);
+    assert(det_save(local_model, local_before_path) == DET_OK);
+    repeat_sample_dataset local_storage = {storage.sample, 600U, 600U};
+    det_dataset local_dataset = {&local_storage, next_repeat, reset_repeat, 600U};
+    det_train_config local_config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 2,
+                                     0.01f, 0.8f, 0.1f, 0, 23, 1};
+    assert(det_train(local_model, &local_dataset, &local_config, &report) == DET_OK);
+    assert(det_save(local_model, local_after_path) == DET_OK);
+    assert(file_regions_differ(local_before_path, local_after_path,
+                               test_bottomup_weight_offset(1, 1) - 10U * sizeof(int),
+                               test_stage_bytes_kernel(4, 4, 1, 3)));
+    det_model_destroy(local_model);
     det_model_destroy(model);
     det_context_destroy(ctx);
     (void)remove(before_path);
     (void)remove(path);
+    (void)remove(local_before_path);
+    (void)remove(local_after_path);
 }
 
 int main(void) {

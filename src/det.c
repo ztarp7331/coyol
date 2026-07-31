@@ -1758,6 +1758,16 @@ static void local_update_neck(det_model *model, const det_sample *sample, int sc
                             sample_index, lr, momentum, updates);
 }
 
+static void local_update_bottomup(det_model *model, const det_sample *sample, int scale,
+                                  size_t sample_index, float lr, float momentum,
+                                  size_t *updates) {
+    if (sample_index < 1024U || (sample_index & 15U) != 0U) return;
+    const float *input_data = scale == 0 ? model->neck_topdown[0] :
+                              model->neck_fused[scale];
+    local_update_stage_data(&model->bottomup[scale], input_data, sample, scale + 3,
+                            sample_index, lr * 0.01f, momentum, updates);
+}
+
 static int validate_sample(const det_model *model, const det_sample *sample) {
     if (model == NULL || sample == NULL || sample->image.data == NULL ||
         sample->image.channels != model->spec.channels ||
@@ -1989,6 +1999,7 @@ static float train_auxiliary_head_bank(det_model *model, const det_sample *sampl
 
 static float train_sample(det_model *model, const det_sample *sample,
                            const det_train_config *config, size_t sample_index,
+                           size_t global_sample_index,
                            size_t *updates) {
     backbone_forward(model, &sample->image);
     float loss = 0.0f;
@@ -2044,6 +2055,10 @@ static float train_sample(det_model *model, const det_sample *sample,
             local_update_neck(model, sample, i, sample_index, config->learning_rate,
                               config->momentum, updates);
         }
+        for (int i = 0; i < DET_BOTTOMUP_STAGES; ++i) {
+            local_update_bottomup(model, sample, i, global_sample_index, config->learning_rate,
+                                  config->momentum, updates);
+        }
     }
     return terms > 0U ? loss / (float)terms : 0.0f;
 }
@@ -2080,7 +2095,8 @@ det_status det_train(det_model *model, const det_dataset *dataset,
             if (next_status < 0) return DET_ERR_IO;
             if (next_status == 0) break;
             if (!validate_sample(model, &sample)) return DET_ERR_ARGUMENT;
-            loss_sum += train_sample(model, &sample, config, seen, &updates);
+            loss_sum += train_sample(model, &sample, config, seen,
+                                     report->samples_seen, &updates);
             ++seen;
             ++report->samples_seen;
         }

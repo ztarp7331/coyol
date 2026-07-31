@@ -78,21 +78,27 @@ INT8, and 0.906--1.083 s W4A8 synthetic end-to-end. The auxiliary bank samples p
 sixteenth image and does not change inference. The occasional W4A8 overrun
 shows why the one-second result is still a stretch target, not a qualified
 guarantee.
-The top-down plus bottom-up build with the one-box local-update fast path
-measured 0.974 s F32, 0.997 s INT8, and 1.045 s W4A8 for 5,000 synthetic
-160 x 160 images on a pinned development CPU; repeated runs remain host-load
-sensitive. The same compact graph at 33 x 33 remains about 100--118 ms.
-These are timing checkpoints, not accuracy claims. The 160 x 160 local path
-currently meets the one-second stretch gate for F32/INT8 on the pinned host;
-W4A8 remains just above it and needs a separate packed-weight optimization.
+The top-down plus bottom-up build with the one-box local-update fast path and
+damped bottom-up ablation measured 0.802 s F32, 0.780 s INT8, and 0.862 s W4A8
+for 5,000 synthetic 160 x 160 images on a pinned development CPU; repeated
+runs remain host-load sensitive. The same compact graph at 33 x 33 remains
+about 100--118 ms.
+These are timing checkpoints, not accuracy claims. All three 160 x 160 local
+variants were under one second in this pinned run; repeated runs remain
+host-load sensitive, so this is a qualification checkpoint rather than a
+hardware-independent guarantee. W4A8 still needs an accuracy gate before it is
+treated as a deployable packed format.
 The fast path preserves the original row-major target/update order for the
 common one-box stream and retains the original multi-box fallback. The C
 convolution API now has dedicated 1-channel stride-2 and 1 x 1 kernels; generic
 shape behavior remains covered by the parity tests.
 The bottom-up extension is now wired as two depthwise 3 x 3 stride-2 stages;
 its zero initialization preserves the validated local path while `GLOBAL_BP`
-can learn the new fusion weights. LOCAL_FAST bottom-up learning is an explicit
-next ablation because the naive local target destabilized the compact detector.
+can learn the new fusion weights. LOCAL_FAST now qualifies a damped bottom-up
+ablation after a cumulative 1,024-sample warm-up across the streamed training
+run, updating it every sixteenth sample; this avoids destabilizing the early
+compact detector while still exercising the full architecture on the
+5,000-image profile.
 
 Two training times must be published:
 
@@ -228,9 +234,8 @@ The compact graph now has three learned 1 x 1 lateral projections, a top-down
 P5-to-P3 nearest-neighbor fusion path, and two depthwise bottom-up stages
 (P3-to-P4 and P4-to-P5). `GLOBAL_BP` propagates through both directions and
 updates all neck stages; `LOCAL_FAST` applies the deterministic sparse local
-rule to the three lateral stages while bottom-up local learning remains an
-ablation. This is intentionally smaller than the research table's 48-channel
-PAN target.
+rule to the three lateral stages and the damped warm-start bottom-up ablation.
+This is intentionally smaller than the research table's 48-channel PAN target.
 
 The current implementation's local stage update is explicitly a surrogate
 local-learning rule: each stage receives a deterministic sparse local box
