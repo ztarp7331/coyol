@@ -91,6 +91,17 @@ Both target one second. Separating them is diagnostic, not an exclusion:
 `train_e2e_ms` will be the complete user-visible result once raw input exists,
 while `train_core_ms` identifies whether the bottleneck is learning or input
 I/O. Until then, `synthetic_e2e_ms` is explicitly not a raw-input claim.
+The raw boundary now has a small dependency-free adapter: `det_manifest_open`
+streams P2/P3/P5/P6 PNM files from a manifest, performs nearest-neighbor resize,
+converts 1/3-channel input to the model layout, and scales box coordinates. The
+manifest format is one image path followed by optional whitespace-separated
+`x1,y1,x2,y2,class` records; relative image paths resolve beside the manifest.
+`det_train` propagates a negative dataset callback as `DET_ERR_IO`, so a decode
+failure cannot be reported as a short successful epoch. The benchmark accepts
+`--manifest` and labels the full timer `train_e2e_ms`; because decoding is
+streamed inside training, its companion is explicitly `train_plus_decode_ms`,
+not `train_core_ms`. It remains a raw-adapter baseline, not a JPEG/COCO
+implementation.
 The benchmark now stops both training timers immediately after checkpoint
 serialization; inference warmups and repeated inference, plus save/load I/O,
 are reported separately. It reserves a unique checkpoint path per process and
@@ -102,6 +113,11 @@ GLOBAL_BP remains the reference run; and boundary smoke tests cover minimum and
 odd/even image sizes. This specialization is verified and pushed in the current
 dual-assignment checkpoint; the official raw/full-architecture training gate
 remains open.
+
+The first raw-manifest smoke on a 33 x 33 P2 image completed successfully in
+23.305--47.100 ms end-to-end across repeated runs (including decode, resize,
+training, and checkpoint I/O); this is an adapter correctness measurement, not
+a 5,000-image performance claim.
 
 COCO is not part of the core API or the first timing contract. COCO 2017 becomes
 an optional 80-class scalability and accuracy test after the 5,000-image gate

@@ -196,6 +196,82 @@ static void reset_one(void *user) {
     ((one_sample_dataset *)user)->emitted = 0;
 }
 
+static int next_io_error(void *user, det_sample *sample) {
+    (void)user;
+    (void)sample;
+    return -1;
+}
+
+static void test_manifest_adapter(void) {
+    const char *image_path = "det_test_image.pgm";
+    const char *manifest_path = "det_test_manifest.txt";
+    const unsigned char pixels[] = {0U, 64U, 128U, 255U};
+    FILE *image = fopen(image_path, "wb");
+    assert(image != NULL);
+    assert(fputs("P5\n2 2\n255\n", image) >= 0);
+    assert(fwrite(pixels, 1U, sizeof(pixels), image) == sizeof(pixels));
+    assert(fclose(image) == 0);
+    FILE *manifest = fopen(manifest_path, "wb");
+    assert(manifest != NULL);
+    assert(fputs("det_test_image.pgm 0,0,2,2,2\n", manifest) >= 0);
+    assert(fclose(manifest) == 0);
+
+    det_manifest_dataset *raw = NULL;
+    assert(det_manifest_open(manifest_path, 4, 4, 1, 4, &raw) == DET_OK);
+    det_dataset dataset;
+    assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
+    assert(dataset.sample_count == 1U);
+    det_sample sample;
+    assert(dataset.next(dataset.user, &sample) == 1);
+    assert(sample.image.width == 4 && sample.image.height == 4 && sample.image.channels == 1);
+    assert(fabsf(sample.image.data[0] - 0.0f) < 1e-6f);
+    assert(fabsf(sample.image.data[2] - 64.0f / 255.0f) < 1e-6f);
+    assert(fabsf(sample.image.data[2 * 4 + 2] - 255.0f / 255.0f) < 1e-6f);
+    assert(sample.box_count == 1);
+    assert(fabsf(sample.boxes[0].x2 - 4.0f) < 1e-6f);
+    assert(fabsf(sample.boxes[0].y2 - 4.0f) < 1e-6f);
+    assert(sample.boxes[0].class_id == 2);
+    assert(dataset.next(dataset.user, &sample) == 0);
+    assert(det_manifest_status(raw) == DET_OK);
+    det_manifest_close(raw);
+    (void)remove(image_path);
+    (void)remove(manifest_path);
+
+    const char *bad_image_path = "det_test_bad_image.pgm";
+    const char *bad_manifest_path = "det_test_bad_manifest.txt";
+    const unsigned char bad_pixels[] = {0U, 2U, 0U, 1U};
+    image = fopen(bad_image_path, "wb");
+    assert(image != NULL);
+    assert(fputs("P5\n2 2\n1\n", image) >= 0);
+    assert(fwrite(bad_pixels, 1U, sizeof(bad_pixels), image) == sizeof(bad_pixels));
+    assert(fclose(image) == 0);
+    manifest = fopen(bad_manifest_path, "wb");
+    assert(manifest != NULL);
+    assert(fputs("det_test_bad_image.pgm\n", manifest) >= 0);
+    assert(fclose(manifest) == 0);
+    raw = NULL;
+    assert(det_manifest_open(bad_manifest_path, 2, 2, 1, 1, &raw) == DET_OK);
+    assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
+    assert(dataset.next(dataset.user, &sample) < 0);
+    assert(det_manifest_status(raw) == DET_ERR_IO);
+    det_manifest_close(raw);
+    (void)remove(bad_image_path);
+    (void)remove(bad_manifest_path);
+
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model_spec spec = {8, 8, 1, 1, 4, 3};
+    assert(det_context_create(1U << 16, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    det_dataset failing = {NULL, next_io_error, NULL, 1U};
+    det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1, 0.01f,
+                               0.8f, 0.1f, 1, 3, 1};
+    det_train_report report;
+    assert(det_train(model, &failing, &config, &report) == DET_ERR_IO);
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+}
+
 static void test_invalid_dataset_sample(void) {
     det_context *ctx = NULL;
     det_model *model = NULL;
@@ -547,6 +623,7 @@ int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
     test_math();
+    test_manifest_adapter();
     test_invalid_dataset_sample();
     test_train_predict_roundtrip();
     puts("all det tests passed");

@@ -1649,8 +1649,10 @@ det_status det_train(det_model *model, const det_dataset *dataset,
         if (dataset->reset != NULL) dataset->reset(dataset->user);
         det_sample sample;
         size_t seen = 0U;
-        while ((config->max_samples <= 0 || seen < (size_t)config->max_samples) &&
-               dataset->next(dataset->user, &sample) > 0) {
+        while (config->max_samples <= 0 || seen < (size_t)config->max_samples) {
+            int next_status = dataset->next(dataset->user, &sample);
+            if (next_status < 0) return DET_ERR_IO;
+            if (next_status == 0) break;
             if (!validate_sample(model, &sample)) return DET_ERR_ARGUMENT;
             loss_sum += train_sample(model, &sample, config, seen, &updates);
             ++seen;

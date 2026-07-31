@@ -7,7 +7,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(DET_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
-add_library(det STATIC src/det.c)
+add_library(det STATIC src/det.c src/det_io.c)
 target_include_directories(det PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)
   target_compile_options(det PRIVATE /W4)

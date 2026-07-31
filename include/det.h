@@ -119,6 +119,7 @@ typedef struct {
 
 typedef struct det_context det_context;
 typedef struct det_model det_model;
+typedef struct det_manifest_dataset det_manifest_dataset;
 
 det_status det_context_create(size_t arena_bytes, det_context **out);
 void det_context_destroy(det_context *ctx);
@@ -159,6 +160,19 @@ det_status det_predict(const det_model *model, const det_image *image,
 
 det_status det_save(const det_model *model, const char *path);
 det_status det_load(det_context *ctx, const char *path, det_model **out);
+
+/* Dataset-neutral raw-file adapter. Manifest lines are:
+   image_path [x1,y1,x2,y2,class ...]
+   Paths cannot contain whitespace; relative paths resolve beside the manifest.
+   P2/P3/P5/P6 PNM images are decoded, resized to the requested shape, and exposed as
+   a normal det_dataset callback stream. */
+det_status det_manifest_open(const char *manifest_path, int width, int height,
+                             int channels, int max_boxes,
+                             det_manifest_dataset **out);
+det_status det_manifest_dataset_view(det_manifest_dataset *dataset,
+                                     det_dataset *out);
+det_status det_manifest_status(const det_manifest_dataset *dataset);
+void det_manifest_close(det_manifest_dataset *dataset);
 
 float det_sigmoid(float x);
 float det_iou(const det_box *a, const det_box *b);

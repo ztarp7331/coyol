@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
     int width = 160;
     int height = 160;
     int global = 0;
+    const char *manifest_path = NULL;
     det_precision precision = DET_PRECISION_F32;
     float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
@@ -164,6 +165,13 @@ int main(int argc, char **argv) {
                 return EXIT_FAILURE;
             }
         }
+        else if (strcmp(argv[i], "--manifest") == 0) {
+            if (i + 1 >= argc || argv[++i][0] == '\0') {
+                fprintf(stderr, "manifest must be a non-empty path\n");
+                return EXIT_FAILURE;
+            }
+            manifest_path = argv[i];
+        }
         else if (strcmp(argv[i], "--global") == 0) global = 1;
         else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
@@ -185,16 +193,32 @@ int main(int argc, char **argv) {
         det_context_destroy(ctx);
         return EXIT_FAILURE;
     }
-    float *pixels = (float *)calloc((size_t)width * (size_t)height, sizeof(float));
-    if (pixels == NULL) {
-        fprintf(stderr, "pixel allocation failed\n");
-        det_model_destroy(model);
-        det_context_destroy(ctx);
-        return EXIT_FAILURE;
+    float *pixels = NULL;
+    bench_dataset storage = {0};
+    det_manifest_dataset *manifest_dataset = NULL;
+    det_dataset dataset;
+    if (manifest_path != NULL) {
+        status = det_manifest_open(manifest_path, width, height, 1, 100, &manifest_dataset);
+        if (status == DET_OK) status = det_manifest_dataset_view(manifest_dataset, &dataset);
+        if (status != DET_OK || dataset.sample_count == 0U) {
+            fprintf(stderr, "manifest setup failed: %d\n", status);
+            det_manifest_close(manifest_dataset);
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
+    } else {
+        pixels = (float *)calloc((size_t)width * (size_t)height, sizeof(float));
+        if (pixels == NULL) {
+            fprintf(stderr, "pixel allocation failed\n");
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
+        storage = (bench_dataset){pixels, width, height, 1, (size_t)sample_count, 0U,
+                                  {0, 0, 0, 0, 0}};
+        dataset = (det_dataset){&storage, next_sample, reset_dataset, (size_t)sample_count};
     }
-    bench_dataset storage = {pixels, width, height, 1, (size_t)sample_count, 0U,
-                             {0, 0, 0, 0, 0}};
-    det_dataset dataset = {&storage, next_sample, reset_dataset, (size_t)sample_count};
     det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
                                DET_PRECISION_F32, 1, 0.01f, 0.8f, 0.1f,
                                sample_count, 1, 1};
@@ -204,6 +228,7 @@ int main(int argc, char **argv) {
     if (status != DET_OK) {
         fprintf(stderr, "training failed: %d\n", status);
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(model);
         det_context_destroy(ctx);
         return EXIT_FAILURE;
@@ -212,6 +237,7 @@ int main(int argc, char **argv) {
     if (status != DET_OK) {
         fprintf(stderr, "precision setup failed: %d\n", status);
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(model);
         det_context_destroy(ctx);
         return EXIT_FAILURE;
@@ -220,6 +246,7 @@ int main(int argc, char **argv) {
     if (!reserve_model_path(model_path, sizeof(model_path))) {
         fprintf(stderr, "could not reserve a unique benchmark model path\n");
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(model);
         det_context_destroy(ctx);
         return EXIT_FAILURE;
@@ -236,15 +263,17 @@ int main(int argc, char **argv) {
     if (status != DET_OK) {
         fprintf(stderr, "model I/O failed: %d\n", status);
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(model);
         det_context_destroy(ctx);
         return EXIT_FAILURE;
     }
-    storage.index = 0;
     det_sample inference_sample;
-    if (!next_sample(&storage, &inference_sample)) {
+    if (dataset.reset != NULL) dataset.reset(dataset.user);
+    if (dataset.next(dataset.user, &inference_sample) <= 0) {
         fprintf(stderr, "failed to prepare inference sample\n");
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(loaded);
         det_model_destroy(model);
         det_context_destroy(ctx);
@@ -266,6 +295,7 @@ int main(int argc, char **argv) {
     if (status != DET_OK) {
         fprintf(stderr, "inference failed: %d\n", status);
         free(pixels);
+        det_manifest_close(manifest_dataset);
         det_model_destroy(loaded);
         det_model_destroy(model);
         det_context_destroy(ctx);
@@ -274,16 +304,19 @@ int main(int argc, char **argv) {
     det_model_destroy(loaded);
     const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" : "F32");
-    printf("samples=%d input=%dx%d mode=%s precision=%s threshold=%.3f train_core_ms=%.3f synthetic_e2e_ms=%.3f "
+    printf("samples=%zu input=%dx%d source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           sample_count, width, height, global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name,
-           threshold,
-           train_core_ms, synthetic_e2e_ms, infer_ms, io_ms,
+           report.samples_seen, width, height, manifest_path == NULL ? "synthetic" : "manifest",
+           global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name, threshold,
+           manifest_path == NULL ? "train_core_ms" : "train_plus_decode_ms",
+           train_core_ms, manifest_path == NULL ? "synthetic_e2e_ms" : "train_e2e_ms",
+           synthetic_e2e_ms, infer_ms, io_ms,
            report.updates, report.mean_loss,
-           train_core_ms > 0.0 ? (double)sample_count * 1000.0 / train_core_ms : 0.0,
+           train_core_ms > 0.0 ? (double)report.samples_seen * 1000.0 / train_core_ms : 0.0,
            detection_count);
     free(pixels);
+    det_manifest_close(manifest_dataset);
     det_model_destroy(model);
     det_context_destroy(ctx);
     return EXIT_SUCCESS;
