@@ -12,6 +12,7 @@ typedef struct {
     double train_ms;
     double calibration_ms;
     double eval_ms;
+    double eval_per_image_ms;
     float mean_loss;
     float mean_iou;
     float class_accuracy;
@@ -131,6 +132,8 @@ static int run_mode(kshira_bit_mode bits, mode_result *result) {
         }
     }
     result->eval_ms = now_ms() - start;
+    result->eval_per_image_ms = result->eval_ms /
+        (double)(EVAL_SAMPLES_PER_DOMAIN * KSHIRA_DOMAIN_COUNT);
     result->bits = bits;
     result->mean_loss = processed == 0U ? 0.0f : loss_sum / (float)processed;
     result->mean_iou = kshira_proxy_mean_iou(&metrics);
@@ -150,17 +153,21 @@ int main(void) {
             return EXIT_FAILURE;
         }
         printf("rad_bits=%s domain_samples=5000 domains=%d train_ms=%.3f calibration_ms=%.3f "
-               "eval_ms=%.3f "
+               "eval_ms=%.3f eval_per_image_ms=%.3f train_gate=%s "
                "mean_loss=%.6f proxy_iou=%.6f proxy_class=%.6f "
                "detections=%zu max_score=%.6f "
                "arena_high_water=%zu arena_cap=%u image_workspace_bytes=%zu\n",
                mode_name(results[i].bits), KSHIRA_DOMAIN_COUNT, results[i].train_ms,
-               results[i].calibration_ms, results[i].eval_ms, results[i].mean_loss,
+               results[i].calibration_ms, results[i].eval_ms, results[i].eval_per_image_ms,
+               results[i].train_ms < 1000.0 ? "PASS" : "OPEN", results[i].mean_loss,
                results[i].mean_iou,
                results[i].class_accuracy, results[i].detections, results[i].max_score,
                results[i].arena_high_water,
                256U * 1024U, (size_t)160 * (size_t)160 * sizeof(float));
     }
+    printf("edge_train_gate int8=%s int4=%s\n",
+           results[1].train_ms < 1000.0 ? "PASS" : "OPEN",
+           results[2].train_ms < 1000.0 ? "PASS" : "OPEN");
     if (results[0].mean_loss > 0.0f) {
         printf("quant_recovery int8_loss_ratio=%.6f int4_loss_ratio=%.6f "
                "int8_iou_ratio=%.6f int4_iou_ratio=%.6f\n",
