@@ -93,7 +93,9 @@ contract is:
   synthetic recovery gates; they are not COCO accuracy, FPGA timing, or 1 W
   measurements. The harness now emits per-mode `train_gate` status,
   aggregate INT8/INT4 `edge_train_gate`, and per-image evaluation latency so
-  host jitter cannot be mistaken for a completed timing gate.
+  host jitter cannot be mistaken for a completed timing gate. Non-noise domain
+  backgrounds use an exact zero-fill fast path; the measured network-bound
+  INT8 gate remains host-variable and is still open.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

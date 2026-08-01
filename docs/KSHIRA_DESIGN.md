@@ -53,6 +53,9 @@ changing the baseline's accuracy and timing claims.
   sub-second quantized edge timing gate; kernel/layout work remains.
 - `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
   `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
+- The balanced domain generator uses an exact zero-fill fast path for its
+  non-noise backgrounds; this does not change the samples or close the
+  network-bound INT8 timing gate.
 
 All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

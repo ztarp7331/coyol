@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 static uint32_t next_u32(uint32_t *state) {
     *state = *state * 1664525U + 1013904223U;
@@ -132,14 +133,18 @@ kshira_status kshira_domain_next(kshira_domain_stream *stream, float *image,
     target->x2 = target->x1 + (float)box_width;
     target->y2 = target->y1 + (float)box_height;
     target->class_id = domain % stream->spec.classes;
+    if (domain != 9) {
+        memset(image, 0, image_elements * sizeof(*image));
+    }
     for (int channel = 0; channel < stream->spec.channels; ++channel) {
-        for (int y = 0; y < stream->spec.height; ++y) {
-            for (int x = 0; x < stream->spec.width; ++x) {
-                size_t index = ((size_t)channel * (size_t)stream->spec.height + (size_t)y) *
-                               (size_t)stream->spec.width + (size_t)x;
-                image[index] = domain == 9 ?
-                    (float)(pixel_hash(stream->spec.seed ^ (uint32_t)sample,
-                                       x, y, channel) % 25U) / 1000.0f : 0.0f;
+        if (domain == 9) {
+            for (int y = 0; y < stream->spec.height; ++y) {
+                for (int x = 0; x < stream->spec.width; ++x) {
+                    size_t index = ((size_t)channel * (size_t)stream->spec.height +
+                                    (size_t)y) * (size_t)stream->spec.width + (size_t)x;
+                    image[index] = (float)(pixel_hash(stream->spec.seed ^ (uint32_t)sample,
+                                                       x, y, channel) % 25U) / 1000.0f;
+                }
             }
         }
         for (int y = (int)target->y1; y < (int)target->y2; ++y) {
