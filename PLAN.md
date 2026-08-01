@@ -106,7 +106,7 @@ contract is:
 - M13 adds an inference-only pooled P3/P4/P5 view over the RAD fused map. P4
   and P5 are generated cell-by-cell from the stride-4 map and merged into the
   existing bounded top-K output without new arena buffers. Release held-out
-  evaluation is now about 0.89--0.97 s aggregate (8.9--9.7 ms per image), with
+  evaluation is now about 0.89--1.05 s aggregate (8.9--10.5 ms per image), with
   the same 260,025-byte high-water. The training step still supervises only
   P3, so this is an architectural/inference checkpoint, not a qualified
   multi-scale accuracy result.

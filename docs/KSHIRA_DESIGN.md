@@ -50,7 +50,7 @@ changing the baseline's accuracy and timing claims.
   pooling the existing stride-4 fused map one cell at a time, then merged with
   P3 through the bounded top-K path without allocating additional feature maps.
   This keeps the 256 KiB high-water unchanged and raises recent held-out
-  evaluation to about 0.89--0.97 s aggregate (8.9--9.7 ms per image). The
+  evaluation to about 0.89--1.05 s aggregate (8.9--10.5 ms per image). The
   current training step still supervises only the P3 head, so P4/P5 outputs are
   experimental and are not a qualified multi-scale accuracy result.
 - Reusing the per-step input and stem-tile scales removes duplicate full-image
