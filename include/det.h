@@ -24,13 +24,20 @@ typedef enum {
 typedef enum {
     DET_PRECISION_F32 = 0,
     DET_PRECISION_INT8 = 1,
-    DET_PRECISION_W4A8 = 2
+    DET_PRECISION_W4A8 = 2,
+    DET_PRECISION_INT4 = 3
 } det_precision;
 
 typedef enum {
     DET_TRAIN_LOCAL_FAST = 0,
-    DET_TRAIN_GLOBAL_BP = 1
+    DET_TRAIN_GLOBAL_BP = 1,
+    DET_TRAIN_ODT = 2
 } det_train_mode;
+
+typedef enum {
+    DET_ARCH_CDET = 0,
+    DET_ARCH_KSHIRA = 1
+} det_architecture;
 
 typedef struct {
     float x1;
@@ -70,6 +77,8 @@ typedef struct {
     int num_classes;
     int max_detections;
     int seed;
+    det_architecture architecture;
+    int feature_channels; /* KSHIRA: 0 selects the measured 8-channel profile. */
 } det_model_spec;
 
 typedef struct {
@@ -169,6 +178,7 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
                            det_model **out);
 det_status det_model_set_precision(det_model *model, det_precision precision);
 det_precision det_model_precision(const det_model *model);
+det_architecture det_model_architecture(const det_model *model);
 void det_model_destroy(det_model *model);
 det_status det_model_reset(det_model *model, int seed);
 

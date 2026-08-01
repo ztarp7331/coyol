@@ -1,9 +1,11 @@
 # KSHIRA implementation contract
 
-KSHIRA (Kernel-Sparse Hierarchical Inference & Runtime Adaptation) is the
-research branch for the C detector. It combines the measured multi-scale
-detector baseline with a lower-memory RAD/SMRE branch rather than silently
-changing the baseline's accuracy and timing claims.
+KSHIRA (Kernel-Sparse Hierarchical Inference & Runtime Adaptation) is an
+architecture profile in the C detector family. Its RAD/SMRE implementation
+remains split into focused internal modules, but callers select it through the
+same `det_model` lifecycle and dataset contract as the compatibility graph.
+Measurements remain profile-specific so integration does not blur accuracy or
+timing claims.
 
 ## Contracts already implemented
 
@@ -176,3 +178,12 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   0.427/0.497 on the synthetic held-out stream. These are scale-aware proxy
   diagnostics, not COCO accuracy; raw-input training, FPGA lowering, and
   measured hardware energy remain open.
+- M17 adds `DET_ARCH_KSHIRA` to the main `det_model_spec`. Each selected model
+  owns an independent bounded KSHIRA arena, so original and peer models can
+  coexist under one context. The public `det_train` path now sequences F32 PRE,
+  INT8 TRAIN, and INT4 multi-scale ODT, while `det_predict` and `det_evaluate`
+  dispatch through the same model handle. The shared raw-manifest adapter can
+  therefore feed either architecture without a KSHIRA-specific dataset API.
+  The current integration explicitly rejects CDET W4A8 on KSHIRA, standalone
+  GLOBAL_BP semantics, zero-box negative training, and KSHIRA serialization
+  until those contracts are implemented rather than silently approximated.

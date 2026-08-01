@@ -5,5 +5,6 @@
 #include "det_model.inc"
 #include "det_forward.inc"
 #include "det_train.inc"
+#include "det_kshira.inc"
 #include "det_eval.inc"
 #include "det_serialize.inc"

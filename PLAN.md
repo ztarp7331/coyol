@@ -36,9 +36,11 @@ The primary reference workload is dataset-neutral:
 
 ### KSHIRA integration direction
 
-The KSHIRA design is the research branch extending the validated detector, not
-an unmeasured replacement of its compatibility baseline. The integration
-contract is:
+KSHIRA is an architecture profile inside the detector family, not a second
+user-facing framework. The validated CDET graph remains the compatibility
+profile while KSHIRA operators stay in focused source modules behind the same
+`det_model`, `det_dataset`, `det_train`, and `det_predict` lifecycle. The
+integration contract is:
 
 - `src/det_*.inc` contains the existing detector in ordered core, quantization,
   model, forward, training, evaluation, and serialization units; `src/det.c`
@@ -150,6 +152,15 @@ contract is:
   loss; a current Release run measured INT8 P4/P5 IoU 0.451/0.562 and INT4
   0.427/0.497 on the synthetic held-out stream. These are scale-aware proxy
   diagnostics, not COCO accuracy, and the combined timing gate remains open.
+- M17 begins the public-runtime unification. `det_model_spec.architecture`
+  selects `DET_ARCH_CDET` or `DET_ARCH_KSHIRA`; the KSHIRA profile owns a
+  per-model bounded arena and is driven through the normal detector build,
+  reset, train, precision, prediction, evaluation, and dataset contracts.
+  F32 local training, INT8 full-encoder training, and INT4 multi-scale ODT now
+  share that API, and multiple KSHIRA models can coexist under one context
+  without aliasing state. KSHIRA model serialization is still explicitly
+  unsupported, zero-box negative learning and its GLOBAL_BP reference remain
+  open, and CDET W4A8 is kept distinct from KSHIRA W4A4/INT4 semantics.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

@@ -1,5 +1,6 @@
 /* Core public tensors, arena, convolution, and scalar math operators. */
 #include "det.h"
+#include "kshira/session.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -13,7 +14,6 @@
 #endif
 
 struct det_context {
-    uint8_t *arena_memory;
     size_t arena_bytes;
 };
 
@@ -62,6 +62,10 @@ typedef struct {
 struct det_model {
     det_context *ctx;
     det_model_spec spec;
+    det_architecture architecture;
+    uint8_t *kshira_memory;
+    size_t kshira_memory_bytes;
+    kshira_session kshira;
     det_stage stages[DET_GRAPH_STAGES];
     det_stage neck[DET_NECK_STAGES];
     det_stage bottomup[DET_BOTTOMUP_STAGES];
@@ -75,6 +79,19 @@ struct det_model {
 };
 
 static const int k_strides[DET_MAX_SCALES] = {8, 16, 32};
+
+static det_status det_kshira_build(det_model *model);
+static void det_kshira_release(det_model *model);
+static det_status det_kshira_reset(det_model *model, int seed);
+static det_status det_kshira_set_precision(det_model *model,
+                                            det_precision precision);
+static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
+                                    const det_train_config *config,
+                                    det_train_report *report);
+static det_status det_kshira_predict(det_model *model, const det_image *image,
+                                      float score_threshold,
+                                      det_detection *detections, int capacity,
+                                      int *count);
 
 static double now_ms(void) {
 #if defined(_WIN32)
@@ -125,11 +142,6 @@ det_status det_context_create(size_t arena_bytes, det_context **out) {
     if (out == NULL || arena_bytes == 0U) return DET_ERR_ARGUMENT;
     det_context *ctx = (det_context *)calloc(1U, sizeof(*ctx));
     if (ctx == NULL) return DET_ERR_MEMORY;
-    ctx->arena_memory = (uint8_t *)malloc(arena_bytes);
-    if (ctx->arena_memory == NULL) {
-        free(ctx);
-        return DET_ERR_MEMORY;
-    }
     ctx->arena_bytes = arena_bytes;
     *out = ctx;
     return DET_OK;
@@ -137,7 +149,6 @@ det_status det_context_create(size_t arena_bytes, det_context **out) {
 
 void det_context_destroy(det_context *ctx) {
     if (ctx == NULL) return;
-    free(ctx->arena_memory);
     free(ctx);
 }
 
@@ -487,4 +498,3 @@ int8_t det_requantize_i32(int64_t accumulator, int32_t multiplier, int shift,
     return (int8_t)rounded;
 #endif
 }
-

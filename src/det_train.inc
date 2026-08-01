@@ -440,11 +440,19 @@ det_status det_train(det_model *model, const det_dataset *dataset,
         dataset->next == NULL || config->epochs <= 0 || config->learning_rate <= 0.0f ||
         config->momentum < 0.0f || config->momentum >= 1.0f ||
         config->reset_weights < 0 || config->reset_weights > 1 ||
-        (config->mode != DET_TRAIN_LOCAL_FAST && config->mode != DET_TRAIN_GLOBAL_BP) ||
+        (config->mode != DET_TRAIN_LOCAL_FAST && config->mode != DET_TRAIN_GLOBAL_BP &&
+         config->mode != DET_TRAIN_ODT) ||
         (config->precision != DET_PRECISION_F32 && config->precision != DET_PRECISION_INT8 &&
-         config->precision != DET_PRECISION_W4A8) || !isfinite(config->learning_rate) ||
-        !isfinite(config->momentum) || !isfinite(config->score_threshold)) {
+         config->precision != DET_PRECISION_W4A8 &&
+         config->precision != DET_PRECISION_INT4) || !isfinite(config->learning_rate) ||
+         !isfinite(config->momentum) || !isfinite(config->score_threshold)) {
         return DET_ERR_ARGUMENT;
+    }
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        return det_kshira_train(model, dataset, config, report);
+    }
+    if (config->mode == DET_TRAIN_ODT || config->precision == DET_PRECISION_INT4) {
+        return DET_ERR_UNSUPPORTED;
     }
     if (config->precision != DET_PRECISION_F32) {
         return DET_ERR_UNSUPPORTED;
@@ -507,4 +515,3 @@ static void sort_detections_descending(det_detection *detections, int count) {
         detections[j] = value;
     }
 }
-

@@ -272,6 +272,10 @@ det_status det_predict(const det_model *model, const det_image *image,
     size_t image_elements = 0U;
     if (!checked_size3(image->channels, image->height, image->width, &image_elements) ||
         !finite_values(image->data, image_elements)) return DET_ERR_ARGUMENT;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        return det_kshira_predict((det_model *)model, image, score_threshold,
+                                  detections, capacity, count);
+    }
     *count = 0;
     backbone_forward((det_model *)model, image);
     float output[4 + DET_MAX_CLASSES];
@@ -454,4 +458,3 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
     free(ranges);
     return status;
 }
-

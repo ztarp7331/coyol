@@ -108,6 +108,7 @@ static int expected_payload_size(const det_file_header *header, size_t *out) {
 
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
+    if (model->architecture == DET_ARCH_KSHIRA) return DET_ERR_UNSUPPORTED;
     if (!valid_precision(model->precision)) return DET_ERR_FORMAT;
     for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
         const det_stage *stage = &model->stages[s];
@@ -339,7 +340,8 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         return DET_ERR_FORMAT;
     }
     det_model_spec spec = {(int)header.width, (int)header.height, (int)header.channels,
-                           (int)header.classes, (int)header.max_detections, 1};
+                           (int)header.classes, (int)header.max_detections, 1,
+                           DET_ARCH_CDET, 0};
     det_model *model = NULL;
     det_status status = det_model_build(ctx, &spec, &model);
     if (status != DET_OK) {

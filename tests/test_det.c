@@ -978,6 +978,64 @@ static void test_streamed_size_class_stress(void) {
     det_context_destroy(ctx);
 }
 
+static void test_integrated_kshira_architecture(void) {
+    det_context *ctx = NULL;
+    det_model *model = NULL;
+    det_model *peer = NULL;
+    det_model_spec spec = {32, 32, 1, 2, 8, 17, DET_ARCH_KSHIRA, 4};
+    float pixels[32 * 32] = {0.0f};
+    det_box boxes[2] = {{4.0f, 4.0f, 8.0f, 8.0f, 0},
+                        {12.0f, 12.0f, 24.0f, 24.0f, 1}};
+    one_sample_dataset storage = {{{pixels, 1, 32, 32}, boxes, 2}, 0};
+    det_dataset dataset = {&storage, next_one, reset_one, 1U};
+    det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1,
+                               1.0e-4f, 0.0f, 0.1f, 1, 17, 1};
+    det_train_report report;
+    det_detection detections[8];
+    int count = 0;
+    for (int y = 4; y < 24; ++y) {
+        for (int x = 4; x < 24; ++x) pixels[y * 32 + x] = 0.5f;
+    }
+    assert(det_context_create(64U << 10, &ctx) == DET_OK);
+    assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    assert(det_model_build(ctx, &spec, &peer) == DET_OK);
+    assert(det_model_architecture(model) == DET_ARCH_KSHIRA);
+    assert(det_model_precision(model) == DET_PRECISION_F32);
+    assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    assert(report.samples_seen == 1U && report.updates == 2U &&
+           !report.used_global_backward && isfinite(report.mean_loss));
+    assert(det_predict(model, &storage.sample.image, 0.0f, detections, 8,
+                       &count) == DET_OK);
+    assert(count >= 0 && count <= 8);
+    assert(det_model_set_precision(model, DET_PRECISION_W4A8) ==
+           DET_ERR_UNSUPPORTED);
+    config = (det_train_config){DET_TRAIN_LOCAL_FAST, DET_PRECISION_INT8, 1,
+                                1.0e-4f, 0.0f, 0.1f, 1, 17, 0};
+    assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    assert(report.samples_seen == 1U && report.updates == 2U &&
+           det_model_precision(model) == DET_PRECISION_INT8);
+    config = (det_train_config){DET_TRAIN_ODT, DET_PRECISION_INT4, 1,
+                                1.0e-4f, 0.0f, 0.1f, 1, 17, 0};
+    assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    assert(report.samples_seen == 1U && report.updates == 2U &&
+           det_model_precision(model) == DET_PRECISION_INT4);
+    assert(det_predict(model, &storage.sample.image, 0.0f, detections, 8,
+                       &count) == DET_OK);
+    assert(count >= 0 && count <= 8);
+    assert(det_save(model, "det_kshira_unsupported.bin") == DET_ERR_UNSUPPORTED);
+    assert(det_model_reset(model, 23) == DET_OK);
+    storage.sample.box_count = 0;
+    config = (det_train_config){DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1,
+                                1.0e-4f, 0.0f, 0.1f, 1, 23, 0};
+    assert(det_train(model, &dataset, &config, &report) == DET_ERR_UNSUPPORTED);
+    storage.sample.box_count = 2;
+    assert(det_predict(peer, &storage.sample.image, 0.0f, detections, 8,
+                       &count) == DET_OK);
+    det_model_destroy(peer);
+    det_model_destroy(model);
+    det_context_destroy(ctx);
+}
+
 int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
@@ -988,6 +1046,7 @@ int main(void) {
     test_odd_shape_neck_roundtrip();
     test_multi_box_quantization_gate();
     test_streamed_size_class_stress();
+    test_integrated_kshira_architecture();
     puts("all det tests passed");
     return 0;
 }

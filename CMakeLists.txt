@@ -30,6 +30,7 @@ endif()
 
 add_library(det STATIC src/det.c src/det_io.c)
 target_include_directories(det PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(det PUBLIC kshira)
 if(MSVC)
   target_compile_options(det PRIVATE /W4)
 else()

@@ -200,13 +200,28 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
     if (ctx == NULL || spec == NULL || out == NULL || spec->width <= 0 ||
         spec->height <= 0 || spec->width > 4096 || spec->height > 4096 ||
         spec->channels <= 0 || spec->channels > 4 || spec->num_classes <= 0 ||
-        spec->num_classes > DET_MAX_CLASSES || spec->max_detections <= 0) {
+        spec->num_classes > DET_MAX_CLASSES || spec->max_detections <= 0 ||
+        (spec->architecture != DET_ARCH_CDET &&
+         spec->architecture != DET_ARCH_KSHIRA) || spec->feature_channels < 0 ||
+        spec->feature_channels > 32 ||
+        (spec->architecture == DET_ARCH_CDET && spec->feature_channels != 0)) {
         return DET_ERR_ARGUMENT;
     }
+    *out = NULL;
     det_model *model = (det_model *)calloc(1U, sizeof(*model));
     if (model == NULL) return DET_ERR_MEMORY;
     model->ctx = ctx;
     model->spec = *spec;
+    model->architecture = spec->architecture;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        det_status status = det_kshira_build(model);
+        if (status != DET_OK) {
+            free(model);
+            return status;
+        }
+        *out = model;
+        return DET_OK;
+    }
     int stage_height = spec->height;
     int stage_width = spec->width;
     for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
@@ -276,7 +291,11 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
 }
 
 det_status det_model_set_precision(det_model *model, det_precision precision) {
-    if (model == NULL || !valid_precision(precision)) return DET_ERR_ARGUMENT;
+    if (model == NULL) return DET_ERR_ARGUMENT;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        return det_kshira_set_precision(model, precision);
+    }
+    if (!valid_precision(precision)) return DET_ERR_ARGUMENT;
     if (precision != DET_PRECISION_F32) {
         for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
             const det_stage *stage = &model->stages[i];
@@ -428,8 +447,17 @@ det_precision det_model_precision(const det_model *model) {
     return model == NULL ? DET_PRECISION_F32 : model->precision;
 }
 
+det_architecture det_model_architecture(const det_model *model) {
+    return model == NULL ? DET_ARCH_CDET : model->architecture;
+}
+
 void det_model_destroy(det_model *model) {
     if (model == NULL) return;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        det_kshira_release(model);
+        free(model);
+        return;
+    }
     for (int i = 0; i < DET_GRAPH_STAGES; ++i) free_stage(&model->stages[i]);
     for (int i = 0; i < DET_NECK_STAGES; ++i) {
         free_stage(&model->neck[i]);
@@ -445,6 +473,9 @@ void det_model_destroy(det_model *model) {
 
 det_status det_model_reset(det_model *model, int seed) {
     if (model == NULL) return DET_ERR_ARGUMENT;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        return det_kshira_reset(model, seed);
+    }
     model->precision = DET_PRECISION_F32;
     uint32_t state = (uint32_t)(seed == 0 ? 1 : seed);
     for (int s = 0; s < DET_MAX_SCALES; ++s) {
@@ -528,4 +559,3 @@ det_status det_model_reset(det_model *model, int seed) {
     model->train_updates = 0U;
     return det_model_set_precision(model, DET_PRECISION_F32);
 }
-
