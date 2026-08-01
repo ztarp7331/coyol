@@ -29,7 +29,8 @@ changing the baseline's accuracy and timing claims.
   tile needed by the largest dilation. On the development WSL host, the
   160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
   latest three WSL runs with all encoder channels enabled and 258,365 bytes
-  high-water inside a 256 KiB arena; host load and ASAN affect timing.
+  high-water before the arena-backed delta scratch; host load and ASAN affect
+  timing.
   The image buffer is caller-owned outside that arena (102,400 bytes for this
   harness), and the timer is a host diagnostic rather than an energy meter.
 - `kshira_rad_calibrate` runs a full-map representative pass after quantized
@@ -55,9 +56,12 @@ changing the baseline's accuracy and timing claims.
   evaluation is about 0.76--0.86 s aggregate (7.6--8.6 ms per image).
   Instrumented ASAN timing is diagnostic and remains above the strict gate;
   the Release result is host-specific evidence, not a board or FPGA claim.
-- The delta cache is currently a fixed maximum 12.8 KiB stack scratch object.
-  This is safe for the current host harness, but an arena-backed scratch
-  allocation is required before claiming a small bare-metal stack profile.
+- M12 moves the encoder delta cache into the caller-owned arena and sizes it
+  from the configured feature/input channels. The 160 x 160 / 8-feature
+  benchmark now reports 260,025 bytes high-water inside the 256 KiB arena,
+  including this scratch, with no per-step stack allocation. This removes the
+  fixed stack burden but leaves only about 2.1 KiB of headroom for this profile;
+  larger feature maps must be admitted by the sparse/arena planner before use.
 - `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
   `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
 - The balanced domain generator uses an exact zero-fill fast path for its
@@ -69,8 +73,9 @@ The `kshira_tests` executable covers alignment, overflow/failure paths, pack /
 unpack round trips, QAS identities, sparse masks, and phase compatibility.
 
 The RAD M3--M4 branch is also present behind `kshira_rad.h`: its 160 x 160
-8-feature configuration uses 258,100 bytes high-water inside a 256 KiB arena
-and emits at most 16 top-K candidates without NMS. M5 now dispatches real
+8-feature configuration uses 260,025 bytes high-water inside a 256 KiB arena
+including the reusable training-delta scratch and emits at most 16 top-K
+candidates without NMS. M5 now dispatches real
 integer MACs for FP32/INT8/INT4 modes and applies QAS to a sparse head update;
 the Release harness measured approximately 1.35 ms F32, 9.52 ms INT8, and
 9.10 ms INT4 per image on the pinned development CPU. These measurements do
@@ -111,5 +116,7 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   updates, and INT4/INT8 proxy recovery (landed on the synthetic gate).
 - M11: transactional full-encoder delta cache and a strict Release INT8/INT4
   sub-second training gate (landed on the synthetic 5,000-sample harness).
-- M12+: arena-backed delta scratch, multi-scale RAD feature integration, and
-  end-to-end dataset-scale qualification.
+- M12: arena-backed, spec-sized delta scratch (landed); multi-scale RAD
+  feature integration and end-to-end dataset-scale qualification remain open.
+- M13+: multi-scale RAD feature integration, FPGA lowering, and measured
+  hardware energy qualification.

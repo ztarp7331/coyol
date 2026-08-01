@@ -13,12 +13,12 @@ enum { RAD_BRANCHES = 3, RAD_KERNEL = 3, RAD_STRIDE = 4, RAD_MAX_CLASSES = 80 };
 static const float RAD_QAS_GRADIENT_LIMIT = 1.0f;
 
 typedef struct {
-    float project_weights[32 * 32];
-    float project_bias[32];
-    float branch_weights[RAD_BRANCHES][32 * 9];
-    float branch_bias[RAD_BRANCHES][32];
-    float stem_weights[32 * 4 * 9];
-    float stem_bias[32];
+    float *project_weights;
+    float *project_bias;
+    float *branch_weights[RAD_BRANCHES];
+    float *branch_bias[RAD_BRANCHES];
+    float *stem_weights;
+    float *stem_bias;
 } rad_encoder_delta_buffer;
 
 struct kshira_rad_model {
@@ -41,6 +41,7 @@ struct kshira_rad_model {
     float *stem;
     float *branches[RAD_BRANCHES];
     float *fused;
+    rad_encoder_delta_buffer *encoder_deltas;
     float calibration_input_scale;
     float calibration_stem_scale;
     float calibration_branch_scale[RAD_BRANCHES];
@@ -77,6 +78,32 @@ static size_t rad_index(int channels, int height, int width, int c, int y, int x
 static float *alloc_floats(kshira_arena *arena, size_t count) {
     if (count == 0U || count > SIZE_MAX / sizeof(float)) return NULL;
     return (float *)kshira_arena_alloc(arena, count * sizeof(float), _Alignof(float));
+}
+
+static rad_encoder_delta_buffer *alloc_encoder_deltas(kshira_arena *arena,
+                                                       const kshira_rad_spec *spec) {
+    rad_encoder_delta_buffer *buffer;
+    if (arena == NULL || spec == NULL) return NULL;
+    buffer = (rad_encoder_delta_buffer *)kshira_arena_alloc(
+        arena, sizeof(*buffer), _Alignof(rad_encoder_delta_buffer));
+    if (buffer == NULL) return NULL;
+    buffer->project_weights = alloc_floats(
+        arena, (size_t)spec->feature_channels * (size_t)spec->feature_channels);
+    buffer->project_bias = alloc_floats(arena, (size_t)spec->feature_channels);
+    buffer->stem_weights = alloc_floats(
+        arena, (size_t)spec->feature_channels * (size_t)spec->channels * 9U);
+    buffer->stem_bias = alloc_floats(arena, (size_t)spec->feature_channels);
+    if (buffer->project_weights == NULL || buffer->project_bias == NULL ||
+        buffer->stem_weights == NULL || buffer->stem_bias == NULL) return NULL;
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        buffer->branch_weights[branch] = alloc_floats(
+            arena, (size_t)spec->feature_channels * 9U);
+        buffer->branch_bias[branch] = alloc_floats(
+            arena, (size_t)spec->feature_channels);
+        if (buffer->branch_weights[branch] == NULL ||
+            buffer->branch_bias[branch] == NULL) return NULL;
+    }
+    return buffer;
 }
 
 static float sigmoid(float value) {
@@ -1074,6 +1101,16 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
         if (model->branches[branch] == NULL) return KSHIRA_ERR_MEMORY;
         model->activation_bytes += map_elements * sizeof(float);
     }
+    model->encoder_deltas = alloc_encoder_deltas(arena, spec);
+    if (model->encoder_deltas == NULL) return KSHIRA_ERR_MEMORY;
+    model->activation_bytes +=
+        (sizeof(*model->encoder_deltas) +
+         ((size_t)spec->feature_channels * (size_t)spec->feature_channels +
+          (size_t)spec->feature_channels +
+          (size_t)RAD_BRANCHES * (size_t)spec->feature_channels * 9U +
+          (size_t)RAD_BRANCHES * (size_t)spec->feature_channels +
+          (size_t)spec->feature_channels * (size_t)spec->channels * 9U +
+          (size_t)spec->feature_channels) * sizeof(float));
     if (kshira_rad_reset(model, spec->seed) != KSHIRA_OK) return KSHIRA_ERR_ARGUMENT;
     *out = model;
     return KSHIRA_OK;
@@ -1269,7 +1306,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
     size_t image_count;
     float weight_scale;
     float feature_scale;
-    rad_encoder_delta_buffer encoder_deltas = {0};
+    rad_encoder_delta_buffer *encoder_deltas;
     float loss_sum = 0.0f;
     if (model == NULL || image == NULL || image->data == NULL || target == NULL ||
         config == NULL || loss == NULL ||
@@ -1287,6 +1324,8 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         return KSHIRA_ERR_ARGUMENT;
     }
     c = model->spec.feature_channels;
+    encoder_deltas = model->encoder_deltas;
+    if (encoder_deltas == NULL) return KSHIRA_ERR_MEMORY;
     if (config->channel_mask != NULL && config->channel_mask->channel_count != (size_t)c) {
         return KSHIRA_ERR_ARGUMENT;
     }
@@ -1403,10 +1442,10 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         if (config->update_mode == KSHIRA_UPDATE_FULL) {
             if (rad_update_encoder(model, image, target_x, target_y, fused_gradient,
                                    config->channel_mask, config->learning_rate,
-                                   &encoder_deltas, 0) != KSHIRA_OK ||
+                                   encoder_deltas, 0) != KSHIRA_OK ||
                 rad_update_encoder(model, image, target_x, target_y, fused_gradient,
                                    config->channel_mask, config->learning_rate,
-                                   &encoder_deltas, 1) != KSHIRA_OK) {
+                                   encoder_deltas, 1) != KSHIRA_OK) {
                 return KSHIRA_ERR_RANGE;
             }
         }

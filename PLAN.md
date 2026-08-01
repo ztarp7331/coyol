@@ -98,9 +98,11 @@ contract is:
   The harness emits per-mode `train_gate`, aggregate `edge_train_gate`, and
   per-image evaluation latency so host jitter cannot be mistaken for a
   universal guarantee. Non-noise domain backgrounds use an exact zero-fill
-  fast path. The current delta cache is a fixed maximum 12.8 KiB stack scratch
-  object; arena-backed scratch is required for a small bare-metal stack
-  profile.
+  fast path. M12 moves the delta cache into the caller-owned arena and sizes it
+  from the configured feature/input channels. The current 160 x 160 / 8-feature
+  profile uses 260,025 bytes high-water inside the 256 KiB arena, including this
+  scratch, with no per-step stack allocation. Larger feature maps must still be
+  admitted by the sparse/arena planner before use.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
