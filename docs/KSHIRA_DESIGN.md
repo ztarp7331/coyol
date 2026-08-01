@@ -19,6 +19,10 @@ changing the baseline's accuracy and timing claims.
 - `kshira_session`: caller-owned composition of the arena, RAD model, phase
   driver, and channel mask; the session test runs FP32 PRE, INT8 TRAIN, and
   INT4 ODT without reallocating.
+- `kshira_rad_build` now treats model construction as a transaction: direct
+  callers get the original arena offset/high-water and a null model on any
+  allocation or initialization failure, matching the session rollback
+  contract.
 - Full-update training now uses a straight-through single-target gradient path
   through projection, depthwise dilated branches, and the stem. Encoder updates
   honor the sparse channel mask and validate aggregate finite deltas before
@@ -127,5 +131,6 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   feature integration and end-to-end dataset-scale qualification remain open.
 - M13: inference-only pooled P3/P4/P5 candidate integration (landed); scale-
   aware assignment and head training remain open.
-- M14+: scale-aware training, FPGA lowering, and measured hardware energy
-  qualification.
+- M14: direct RAD arena transaction/rollback hardening (landed); scale-aware
+  training with separately qualified head/encoder gradients remains open.
+- M15+: FPGA lowering and measured hardware energy qualification.

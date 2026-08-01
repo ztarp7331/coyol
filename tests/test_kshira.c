@@ -289,6 +289,21 @@ static void test_rad_top_k(void) {
         assert(kshira_arena_init(&bad_arena, bad_memory, sizeof(bad_memory)) == KSHIRA_OK);
         assert(kshira_rad_build(&bad_arena, &bad_spec, &bad_model) == KSHIRA_ERR_ARGUMENT);
     }
+    {
+        unsigned char tiny_memory[4096];
+        kshira_arena tiny_arena;
+        kshira_rad_model *tiny_model = NULL;
+        kshira_rad_spec tiny_spec = {32, 32, 1, 3, 4, 3, 23};
+        size_t start_used;
+        size_t start_high_water;
+        assert(kshira_arena_init(&tiny_arena, tiny_memory, sizeof(tiny_memory)) == KSHIRA_OK);
+        assert(kshira_arena_alloc(&tiny_arena, 16U, 8U) != NULL);
+        start_used = kshira_arena_used(&tiny_arena);
+        start_high_water = kshira_arena_high_water(&tiny_arena);
+        assert(kshira_rad_build(&tiny_arena, &tiny_spec, &tiny_model) == KSHIRA_ERR_MEMORY);
+        assert(tiny_model == NULL && kshira_arena_used(&tiny_arena) == start_used &&
+               kshira_arena_high_water(&tiny_arena) == start_high_water);
+    }
 }
 
 static void test_session_contract(void) {

@@ -110,6 +110,9 @@ contract is:
   the same 260,025-byte high-water. The training step still supervises only
   P3, so this is an architectural/inference checkpoint, not a qualified
   multi-scale accuracy result.
+- RAD construction now rolls back direct caller arenas on partial allocation
+  or initialization failure; a focused test preserves a nonzero pre-existing
+  arena offset and high-water.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

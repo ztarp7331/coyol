@@ -1079,10 +1079,18 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
     kshira_rad_model *model;
     size_t map_elements;
     size_t count;
+    size_t start_offset;
+    size_t start_high_water;
+    kshira_status status;
     if (arena == NULL || out == NULL || !valid_spec(spec)) return KSHIRA_ERR_ARGUMENT;
     *out = NULL;
+    start_offset = arena->offset;
+    start_high_water = arena->high_water;
     model = (kshira_rad_model *)kshira_arena_alloc(arena, sizeof(*model), _Alignof(kshira_rad_model));
-    if (model == NULL) return KSHIRA_ERR_MEMORY;
+    if (model == NULL) {
+        status = KSHIRA_ERR_MEMORY;
+        goto fail;
+    }
     model->spec = *spec;
     model->arena = arena;
     model->bits = KSHIRA_BITS_FLOAT;
@@ -1092,17 +1100,24 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                        (spec->width % RAD_STRIDE != 0 ? 1 : 0);
     model->outputs = 5 + spec->classes;
     if (!checked_elements(spec->feature_channels, model->map_height, model->map_width,
-                          &map_elements)) return KSHIRA_ERR_RANGE;
+                          &map_elements)) {
+        status = KSHIRA_ERR_RANGE;
+        goto fail;
+    }
     count = (size_t)spec->feature_channels * (size_t)spec->channels * 9U;
     model->stem_weights = alloc_floats(arena, count);
     model->stem_bias = alloc_floats(arena, (size_t)spec->feature_channels);
-    if (model->stem_weights == NULL || model->stem_bias == NULL) return KSHIRA_ERR_MEMORY;
+    if (model->stem_weights == NULL || model->stem_bias == NULL) {
+        status = KSHIRA_ERR_MEMORY;
+        goto fail;
+    }
     model->parameter_bytes = count * sizeof(float) + (size_t)spec->feature_channels * sizeof(float);
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
         model->branch_weights[branch] = alloc_floats(arena, (size_t)spec->feature_channels * 9U);
         model->branch_bias[branch] = alloc_floats(arena, (size_t)spec->feature_channels);
         if (model->branch_weights[branch] == NULL || model->branch_bias[branch] == NULL) {
-            return KSHIRA_ERR_MEMORY;
+            status = KSHIRA_ERR_MEMORY;
+            goto fail;
         }
         model->parameter_bytes += ((size_t)spec->feature_channels * 9U +
                                    (size_t)spec->feature_channels) * sizeof(float);
@@ -1114,22 +1129,34 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                                        (size_t)spec->feature_channels);
     model->head_bias = alloc_floats(arena, (size_t)model->outputs);
     if (model->project_weights == NULL || model->project_bias == NULL ||
-        model->head_weights == NULL || model->head_bias == NULL) return KSHIRA_ERR_MEMORY;
+        model->head_weights == NULL || model->head_bias == NULL) {
+        status = KSHIRA_ERR_MEMORY;
+        goto fail;
+    }
     model->parameter_bytes += ((size_t)spec->feature_channels * (size_t)spec->feature_channels +
                                (size_t)spec->feature_channels +
                                (size_t)model->outputs * (size_t)spec->feature_channels +
                                (size_t)model->outputs) * sizeof(float);
     model->stem = alloc_floats(arena, map_elements);
     model->fused = alloc_floats(arena, map_elements);
-    if (model->stem == NULL || model->fused == NULL) return KSHIRA_ERR_MEMORY;
+    if (model->stem == NULL || model->fused == NULL) {
+        status = KSHIRA_ERR_MEMORY;
+        goto fail;
+    }
     model->activation_bytes = 2U * map_elements * sizeof(float);
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
         model->branches[branch] = alloc_floats(arena, map_elements);
-        if (model->branches[branch] == NULL) return KSHIRA_ERR_MEMORY;
+        if (model->branches[branch] == NULL) {
+            status = KSHIRA_ERR_MEMORY;
+            goto fail;
+        }
         model->activation_bytes += map_elements * sizeof(float);
     }
     model->encoder_deltas = alloc_encoder_deltas(arena, spec);
-    if (model->encoder_deltas == NULL) return KSHIRA_ERR_MEMORY;
+    if (model->encoder_deltas == NULL) {
+        status = KSHIRA_ERR_MEMORY;
+        goto fail;
+    }
     model->activation_bytes +=
         (sizeof(*model->encoder_deltas) +
          ((size_t)spec->feature_channels * (size_t)spec->feature_channels +
@@ -1138,9 +1165,18 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
           (size_t)RAD_BRANCHES * (size_t)spec->feature_channels +
           (size_t)spec->feature_channels * (size_t)spec->channels * 9U +
           (size_t)spec->feature_channels) * sizeof(float));
-    if (kshira_rad_reset(model, spec->seed) != KSHIRA_OK) return KSHIRA_ERR_ARGUMENT;
+    if (kshira_rad_reset(model, spec->seed) != KSHIRA_OK) {
+        status = KSHIRA_ERR_ARGUMENT;
+        goto fail;
+    }
     *out = model;
     return KSHIRA_OK;
+
+fail:
+    arena->offset = start_offset;
+    arena->high_water = start_high_water;
+    *out = NULL;
+    return status;
 }
 
 kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
