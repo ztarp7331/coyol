@@ -26,7 +26,7 @@ changing the baseline's accuracy and timing claims.
 - `kshira_domain` provides ten deterministic, balanced curriculum domains
   (textures, edges, rings, gradients, sparse points, and noise) with one target
   box per sample. The local training path computes only the nine-by-nine map
-  tile needed by the largest dilation. On the pinned development CPU, the
+  tile needed by the largest dilation. On the development WSL host, the
   160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
   latest three WSL runs with all encoder channels enabled and 258,317 bytes
   high-water inside a 256 KiB arena; host load and ASAN affect timing.
@@ -37,6 +37,12 @@ changing the baseline's accuracy and timing claims.
   full-map calibration. This is an explicit local-fast approximation; M8 must
   add calibrated persistent scales and a quantized proxy-recovery gate before
   claiming deployment-equivalent accuracy.
+- `kshira_eval` supplies allocation-free IoU/class-hit metrics. The M8 harness
+  runs FP32, INT8, and INT4 over the same 5,000-sample curriculum and a held-out
+  calibration stream, using the highest-score detection at a 0.25 threshold.
+  The current quantized profile uses sparse channel updates plus a bounded QAS
+  gradient; it completes, but its latest top-1 proxy result is FP32 IoU about
+  0.31 versus 0 for INT8/INT4, leaving recovery unqualified.
 
 All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /
@@ -79,5 +85,6 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
 - M6: PRE/TRAIN/ODT driver with checkpoint contracts and hard arena failure.
 - M7: ten-domain generators, local receptive-field training, and the 5,000-image
   edge harness (landed; accuracy and energy gates remain open).
-- M8+: quantized multi-domain recovery, proxy detection qualification, and
-  hardware-specific energy data.
+- M8: quantized multi-domain recovery and proxy detection qualification
+  (harness landed; recovery gate open).
+- M9+: hardware-specific energy data and deployment-equivalent quantized scales.

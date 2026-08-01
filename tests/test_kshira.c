@@ -1,5 +1,6 @@
 #include "kshira/core.h"
 #include "kshira/domain.h"
+#include "kshira/eval.h"
 #include "kshira/phase.h"
 #include "kshira/quant.h"
 #include "kshira/rad.h"
@@ -335,6 +336,29 @@ static void test_domain_curriculum(void) {
     for (int i = 0; i < KSHIRA_DOMAIN_COUNT; ++i) assert(counts[i] == SAMPLES);
 }
 
+static void test_proxy_metrics(void) {
+    kshira_proxy_metrics metrics;
+    kshira_rad_box target = {0.0f, 0.0f, 10.0f, 10.0f, 2};
+    kshira_rad_detection detections[2] = {
+        {{2.0f, 2.0f, 8.0f, 8.0f, 2}, 0.9f, 0.8f},
+        {{20.0f, 20.0f, 24.0f, 24.0f, 1}, 0.8f, 0.7f}
+    };
+    kshira_proxy_metrics_init(&metrics);
+    assert(fabsf(kshira_box_iou(&target, &detections[0].box) - 0.36f) < 1.0e-6f);
+    assert(kshira_proxy_metrics_add(&metrics, &target, detections, 2) == KSHIRA_OK);
+    assert(kshira_proxy_metrics_add(&metrics, &target, NULL, 0) == KSHIRA_OK);
+    assert(fabsf(kshira_proxy_mean_iou(&metrics) - 0.18f) < 1.0e-6f);
+    assert(fabsf(kshira_proxy_class_accuracy(&metrics) - 0.5f) < 1.0e-6f);
+    {
+        kshira_rad_box invalid = {1.0f, 1.0f, 1.0f, 2.0f, 2};
+        assert(kshira_proxy_metrics_add(&metrics, &invalid, detections, 1) ==
+               KSHIRA_ERR_ARGUMENT);
+        detections[1].box.x2 = detections[1].box.x1;
+        assert(kshira_proxy_metrics_add(&metrics, &target, detections, 2) ==
+               KSHIRA_ERR_ARGUMENT);
+    }
+}
+
 int main(void) {
     test_arena();
     test_quant();
@@ -343,6 +367,7 @@ int main(void) {
     test_rad_top_k();
     test_session_contract();
     test_domain_curriculum();
+    test_proxy_metrics();
     puts("all kshira tests passed");
     return 0;
 }

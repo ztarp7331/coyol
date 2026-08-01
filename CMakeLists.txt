@@ -15,6 +15,7 @@ add_library(kshira STATIC
   src/kshira_rad.c
   src/kshira_session.c
   src/kshira_domain.c
+  src/kshira_eval.c
 )
 target_include_directories(kshira PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)

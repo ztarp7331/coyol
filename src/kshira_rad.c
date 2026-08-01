@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 enum { RAD_BRANCHES = 3, RAD_KERNEL = 3, RAD_STRIDE = 4, RAD_MAX_CLASSES = 80 };
+static const float RAD_QAS_GRADIENT_LIMIT = 1.0f;
 
 struct kshira_rad_model {
     kshira_rad_spec spec;
@@ -76,6 +77,19 @@ static float sigmoid(float value) {
 static float relu(float value) {
     if (!isfinite(value) || value <= 0.0f) return 0.0f;
     return value > 1000000.0f ? 1000000.0f : value;
+}
+
+static int clamp_qas_gradient(float *gradient) {
+    if (gradient == NULL || !isfinite(*gradient)) return 0;
+    if (*gradient > RAD_QAS_GRADIENT_LIMIT) *gradient = RAD_QAS_GRADIENT_LIMIT;
+    if (*gradient < -RAD_QAS_GRADIENT_LIMIT) *gradient = -RAD_QAS_GRADIENT_LIMIT;
+    return 1;
+}
+
+static int normalize_qas_gradient(float *gradient, int quantized) {
+    if (gradient == NULL || !isfinite(*gradient)) return 0;
+    if (quantized) return clamp_qas_gradient(gradient);
+    return 1;
 }
 
 static float quant_scale_values(const float *values, size_t count, kshira_bit_mode bits) {
@@ -590,7 +604,7 @@ static void head_forward_quant(const kshira_rad_model *model, const float *featu
 
 static kshira_status encoder_delta(float current, float gradient, float learning_rate,
                                    float weight_scale, float input_scale, int bias,
-                                   float *delta) {
+                                   int quantized, float *delta) {
     kshira_status status;
     float updated;
     if (delta == NULL || !isfinite(current) || !isfinite(gradient) ||
@@ -600,7 +614,10 @@ static kshira_status encoder_delta(float current, float gradient, float learning
     } else {
         status = kshira_apply_qas(&gradient, 1U, NULL, 0U, weight_scale, input_scale);
     }
-    if (status != KSHIRA_OK || !isfinite(gradient)) return KSHIRA_ERR_RANGE;
+    if (status != KSHIRA_OK ||
+        !normalize_qas_gradient(&gradient, quantized)) {
+        return KSHIRA_ERR_RANGE;
+    }
     *delta = learning_rate * gradient;
     updated = current - *delta;
     return isfinite(*delta) && isfinite(updated) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
@@ -688,6 +705,7 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
             float bias_delta;
             if (encoder_delta(model->project_bias[oc], fused_grad, learning_rate,
                               project_weight_scale, branch_input_scale, 1,
+                              model->bits != KSHIRA_BITS_FLOAT,
                               &bias_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
             if (commit) model->project_bias[oc] -= bias_delta;
         }
@@ -704,6 +722,7 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                                                                   (size_t)ic],
                                          weight_gradient, learning_rate,
                                          project_weight_scale, branch_input_scale, 0,
+                                         model->bits != KSHIRA_BITS_FLOAT,
                                          &weight_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
             if (commit && enabled) {
                 model->project_weights[(size_t)oc * (size_t)c + (size_t)ic] -= weight_delta;
@@ -725,7 +744,8 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                 float bias_delta;
                 if (encoder_delta(model->branch_bias[branch][channel], branch_grad,
                                   learning_rate, branch_weight_scale[branch],
-                                  stem_input_scale, 1, &bias_delta) != KSHIRA_OK) {
+                                  stem_input_scale, 1, model->bits != KSHIRA_BITS_FLOAT,
+                                  &bias_delta) != KSHIRA_OK) {
                     return KSHIRA_ERR_RANGE;
                 }
             }
@@ -746,7 +766,8 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                                                             (size_t)ky) * RAD_KERNEL +
                                                            (size_t)kx],
                             weight_gradient, learning_rate, branch_weight_scale[branch],
-                            stem_input_scale, 0, &weight_delta) != KSHIRA_OK) {
+                            stem_input_scale, 0, model->bits != KSHIRA_BITS_FLOAT,
+                            &weight_delta) != KSHIRA_OK) {
                         return KSHIRA_ERR_RANGE;
                     }
                 }
@@ -783,7 +804,8 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
         if (enabled) {
             float bias_delta;
             if (encoder_delta(model->stem_bias[channel], bias_gradient, learning_rate,
-                              stem_weight_scale, image_scale, 1, &bias_delta) != KSHIRA_OK) {
+                              stem_weight_scale, image_scale, 1,
+                              model->bits != KSHIRA_BITS_FLOAT, &bias_delta) != KSHIRA_OK) {
                 return KSHIRA_ERR_RANGE;
             }
             if (commit) model->stem_bias[channel] -= bias_delta;
@@ -828,6 +850,7 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                                                (size_t)stem_ky * RAD_KERNEL +
                                                (size_t)stem_kx],
                             weight_gradient, learning_rate, stem_weight_scale, image_scale, 0,
+                            model->bits != KSHIRA_BITS_FLOAT,
                             &weight_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
                     if (commit && enabled) {
                         model->stem_weights[((size_t)channel * (size_t)image->channels +
@@ -856,7 +879,8 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                     float bias_delta;
                     if (encoder_delta(model->branch_bias[branch][channel], branch_grad,
                                       learning_rate, branch_weight_scale[branch],
-                                      stem_input_scale, 1, &bias_delta) != KSHIRA_OK) {
+                                      stem_input_scale, 1,
+                                      model->bits != KSHIRA_BITS_FLOAT, &bias_delta) != KSHIRA_OK) {
                         return KSHIRA_ERR_RANGE;
                     }
                     model->branch_bias[branch][channel] -= bias_delta;
@@ -878,7 +902,8 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                                                                 (size_t)ky) * RAD_KERNEL +
                                                                (size_t)kx],
                                 weight_gradient, learning_rate, branch_weight_scale[branch],
-                                stem_input_scale, 0, &weight_delta) != KSHIRA_OK) {
+                                stem_input_scale, 0, model->bits != KSHIRA_BITS_FLOAT,
+                                &weight_delta) != KSHIRA_OK) {
                             return KSHIRA_ERR_RANGE;
                         }
                         model->branch_weights[branch][((size_t)channel * RAD_KERNEL +
@@ -1192,7 +1217,9 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
             float updated;
             if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
                                  weight_scale, feature_scale) != KSHIRA_OK ||
-                !isfinite(gradient_bias)) return KSHIRA_ERR_RANGE;
+                !normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
+                return KSHIRA_ERR_RANGE;
+            }
             delta = config->learning_rate * gradient_bias;
             updated = model->head_bias[o] - delta;
             if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1207,7 +1234,10 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                     if (!isfinite(gradient_weight) ||
                         kshira_apply_qas(&gradient_weight, 1U, NULL, 0U,
                                          weight_scale, feature_scale) != KSHIRA_OK ||
-                        !isfinite(gradient_weight)) return KSHIRA_ERR_RANGE;
+                        !normalize_qas_gradient(&gradient_weight,
+                                                model->bits != KSHIRA_BITS_FLOAT)) {
+                        return KSHIRA_ERR_RANGE;
+                    }
                     delta = config->learning_rate * gradient_weight;
                     updated = model->head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
                     if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1228,6 +1258,9 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                  weight_scale, feature_scale) != KSHIRA_OK) {
                 return KSHIRA_ERR_RANGE;
             }
+            if (!normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
+                return KSHIRA_ERR_RANGE;
+            }
             model->head_bias[o] -= config->learning_rate * gradient_bias;
             if (config->update_mode == KSHIRA_UPDATE_CHANNELS ||
                 config->update_mode == KSHIRA_UPDATE_FULL) {
@@ -1239,6 +1272,10 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                     gradient_weight = gradients[o] * features[ic];
                     if (kshira_apply_qas(&gradient_weight, 1U, NULL, 0U,
                                          weight_scale, feature_scale) != KSHIRA_OK) {
+                        return KSHIRA_ERR_RANGE;
+                    }
+                    if (!normalize_qas_gradient(&gradient_weight,
+                                                model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
                     model->head_weights[(size_t)o * (size_t)c + (size_t)ic] -=

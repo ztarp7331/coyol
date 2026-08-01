@@ -80,6 +80,12 @@ contract is:
   enabled, and 258,317-byte high-water under the 256 KiB arena. Host load affects
   the timing; this is a synthetic throughput gate, not an accuracy, board-power,
   or real-dataset claim.
+- `kshira_eval` adds allocation-free IoU and class-hit accumulation for
+  calibration sets. The M8 harness runs the same 5,000-sample stream in FP32,
+  INT8, and INT4, then evaluates held-out samples and emits loss/proxy ratios.
+  A bounded QAS-gradient safeguard is required for the current real quantized
+  path; the latest run measured FP32 top-1 proxy IoU about 0.31 while INT8/INT4
+  proxy IoU was 0, so quantized recovery is not qualified.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
