@@ -1704,7 +1704,7 @@ kshira_status kshira_rad_train_multiscale_step(
     float stem_input_scale = 0.0f;
     /* Fixed-size quantized caches avoid requantizing the same weights for each
      * pooled cell; their bounds follow valid_spec's feature-channel ceiling. */
-    int8_t branch_quantized[RAD_BRANCHES * 32 * 9] = {0};
+    int8_t branch_quantized[32 * 9] = {0};
     int8_t project_quantized[32 * 32] = {0};
     float loss_sum = 0.0f;
     float *head_weights;
@@ -1746,11 +1746,6 @@ kshira_status kshira_rad_train_multiscale_step(
         for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
             branch_weight_scales[branch] = quant_scale_values(
                 model->branch_weights[branch], (size_t)c * 9U, model->bits);
-            for (int i = 0; i < c * 9; ++i) {
-                branch_quantized[branch * 32 * 9 + i] = (int8_t)kshira_quantize_symmetric(
-                    model->branch_weights[branch][i], branch_weight_scales[branch],
-                    model->bits);
-            }
         }
         project_weight_scale = quant_scale_values(
             model->project_weights, (size_t)c * (size_t)c, model->bits);
@@ -1789,18 +1784,33 @@ kshira_status kshira_rad_train_multiscale_step(
     } else {
         conv_stem_region(model, image, region_y0, region_y1, region_x0, region_x1);
     }
-    for (int y = source_y; y < source_y1; ++y) {
-        for (int x = source_x; x < source_x1; ++x) {
-            for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-                if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+    if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            for (int i = 0; i < c * 9; ++i) {
+                branch_quantized[i] = (int8_t)kshira_quantize_symmetric(
+                    model->branch_weights[branch][i], branch_weight_scales[branch],
+                    model->bits);
+            }
+            for (int y = source_y; y < source_y1; ++y) {
+                for (int x = source_x; x < source_x1; ++x) {
                     depthwise_branch_target_quant_scaled(model, branch, y, x,
                                                          branch_weight_scales[branch],
                                                          stem_input_scale,
-                                                         &branch_quantized[branch * 32 * 9]);
-                } else {
+                                                         branch_quantized);
+                }
+            }
+        }
+    } else {
+        for (int y = source_y; y < source_y1; ++y) {
+            for (int x = source_x; x < source_x1; ++x) {
+                for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
                     depthwise_branch_target(model, branch, y, x);
                 }
             }
+        }
+    }
+    for (int y = source_y; y < source_y1; ++y) {
+        for (int x = source_x; x < source_x1; ++x) {
             if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
                 project_fused_target_quant_scaled(model, y, x, project_weight_scale,
                                                   project_quantized);

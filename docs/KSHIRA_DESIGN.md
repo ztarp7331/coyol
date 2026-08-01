@@ -160,6 +160,11 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   sample, reusing their scales across all pooled cells. This reduces inner-loop
   requantization without changing arena layout or the validated P3/encoder
   path. Repeated Release runs put INT8 ODT near 0.94--0.98 s and INT4 near
-  1.01--1.04 s; INT4 and the combined 10,000-step gate remain open. M16b will
-  reclaim arena headroom and qualify real multi-scale accuracy and raw-input
-  training before FPGA lowering and measured hardware energy.
+  1.01--1.04 s; INT4 and the combined 10,000-step gate remain open.
+- M16b1 reuses one 32-channel branch quantization cache while materializing all
+  pooled branch outputs before projection. This removes 576 bytes from the
+  multiscale step's automatic cache footprint without changing arena usage or
+  quantized results. Latest repeated Release runs put INT8 ODT near 0.94--0.96
+  s and INT4 near 0.90--0.94 s; both per-phase gates passed in those runs.
+  M16b2 will reclaim arena headroom and qualify real multi-scale accuracy and
+  raw-input training before FPGA lowering and measured hardware energy.

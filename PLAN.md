@@ -135,6 +135,12 @@ contract is:
   261,729-byte optional-head high-water; repeated host runs put INT8 ODT near
   0.94--0.98 s and INT4 near 1.01--1.04 s. INT4 remains just outside the
   per-phase stretch gate and the combined 10,000-step gate remains open.
+- M16b1 reuses one 32-channel branch quantization cache while materializing all
+  pooled branch outputs before projection. This removes 576 bytes from the
+  multiscale step's automatic cache footprint without changing arena usage or
+  quantized results. Latest repeated Release runs put INT8 ODT near
+  0.94--0.96 s and INT4 near 0.90--0.94 s; both per-phase gates passed in those
+  runs. Arena headroom and the combined gate remain open for M16b2.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
