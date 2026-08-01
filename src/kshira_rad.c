@@ -584,11 +584,42 @@ static void depthwise_branch_target(const kshira_rad_model *model, int branch,
     }
 }
 
+static void depthwise_branch_target_quant_scaled(const kshira_rad_model *model, int branch,
+                                                 int target_y, int target_x,
+                                                 float weight_scale, float input_scale,
+                                                 const int8_t *quantized_weights) {
+    int c = model->spec.feature_channels;
+    int dilation = 1 << branch;
+    for (int channel = 0; channel < c; ++channel) {
+        int64_t accumulator = 0;
+        for (int ky = 0; ky < RAD_KERNEL; ++ky) {
+            int iy = target_y + (ky - 1) * dilation;
+            if (iy < 0 || iy >= model->map_height) continue;
+            for (int kx = 0; kx < RAD_KERNEL; ++kx) {
+                int ix = target_x + (kx - 1) * dilation;
+                size_t wi;
+                if (ix < 0 || ix >= model->map_width) continue;
+                wi = ((size_t)channel * RAD_KERNEL + (size_t)ky) * RAD_KERNEL +
+                     (size_t)kx;
+                accumulator += (int64_t)(quantized_weights != NULL ?
+                    quantized_weights[wi] : kshira_quantize_symmetric(
+                        model->branch_weights[branch][wi], weight_scale, model->bits)) *
+                    (int64_t)quantized_value(model->stem[rad_index(
+                        c, model->map_height, model->map_width, channel, iy, ix)],
+                        input_scale, model->bits);
+            }
+        }
+        model->branches[branch][rad_index(c, model->map_height, model->map_width,
+                                          channel, target_y, target_x)] =
+            relu((float)accumulator * weight_scale * input_scale +
+                 model->branch_bias[branch][channel]);
+    }
+}
+
 static void depthwise_branch_target_quant(const kshira_rad_model *model, int branch,
                                           int target_y, int target_x) {
     int c = model->spec.feature_channels;
     int y0, y1, x0, x1;
-    int dilation = 1 << branch;
     float weight_scale = quant_scale_values(model->branch_weights[branch],
                                             (size_t)c * 9U, model->bits);
     float input_scale;
@@ -601,29 +632,8 @@ static void depthwise_branch_target_quant(const kshira_rad_model *model, int bra
         input_scale = quant_scale_region(model->stem, c, model->map_height,
                                          model->map_width, y0, y1, x0, x1, model->bits);
     }
-    for (int channel = 0; channel < c; ++channel) {
-        int64_t accumulator = 0;
-        for (int ky = 0; ky < RAD_KERNEL; ++ky) {
-            int iy = target_y + (ky - 1) * dilation;
-            if (iy < 0 || iy >= model->map_height) continue;
-            for (int kx = 0; kx < RAD_KERNEL; ++kx) {
-                int ix = target_x + (kx - 1) * dilation;
-                size_t wi;
-                if (ix < 0 || ix >= model->map_width) continue;
-                wi = ((size_t)channel * RAD_KERNEL + (size_t)ky) * RAD_KERNEL +
-                     (size_t)kx;
-                accumulator += (int64_t)kshira_quantize_symmetric(
-                    model->branch_weights[branch][wi], weight_scale, model->bits) *
-                    (int64_t)quantized_value(model->stem[rad_index(
-                        c, model->map_height, model->map_width, channel, iy, ix)],
-                        input_scale, model->bits);
-            }
-        }
-        model->branches[branch][rad_index(c, model->map_height, model->map_width,
-                                          channel, target_y, target_x)] =
-            relu((float)accumulator * weight_scale * input_scale +
-                 model->branch_bias[branch][channel]);
-    }
+    depthwise_branch_target_quant_scaled(model, branch, target_y, target_x,
+                                         weight_scale, input_scale, NULL);
 }
 
 static void project_fused_target(const kshira_rad_model *model, int target_y, int target_x) {
@@ -644,11 +654,11 @@ static void project_fused_target(const kshira_rad_model *model, int target_y, in
     }
 }
 
-static void project_fused_target_quant(const kshira_rad_model *model,
-                                       int target_y, int target_x) {
+static void project_fused_target_quant_scaled(const kshira_rad_model *model,
+                                              int target_y, int target_x,
+                                              float weight_scale,
+                                              const int8_t *quantized_weights) {
     int c = model->spec.feature_channels;
-    float weight_scale = quant_scale_values(model->project_weights,
-                                            (size_t)c * (size_t)c, model->bits);
     float input_scale = 0.0f;
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
         float scale;
@@ -675,14 +685,25 @@ static void project_fused_target_quant(const kshira_rad_model *model,
                     c, model->map_height, model->map_width, ic, target_y, target_x)],
                     input_scale, model->bits);
             }
-            accumulator += (int64_t)kshira_quantize_symmetric(
-                model->project_weights[(size_t)oc * (size_t)c + (size_t)ic],
-                weight_scale, model->bits) * branch_sum;
+            {
+                size_t wi = (size_t)oc * (size_t)c + (size_t)ic;
+                accumulator += (int64_t)(quantized_weights != NULL ?
+                    quantized_weights[wi] : kshira_quantize_symmetric(
+                        model->project_weights[wi], weight_scale, model->bits)) * branch_sum;
+            }
         }
         model->fused[rad_index(c, model->map_height, model->map_width, oc, target_y, target_x)] =
             relu((float)accumulator * weight_scale * input_scale /
                  (float)RAD_BRANCHES + model->project_bias[oc]);
     }
+}
+
+static void project_fused_target_quant(const kshira_rad_model *model,
+                                       int target_y, int target_x) {
+    int c = model->spec.feature_channels;
+    float weight_scale = quant_scale_values(model->project_weights,
+                                            (size_t)c * (size_t)c, model->bits);
+    project_fused_target_quant_scaled(model, target_y, target_x, weight_scale, NULL);
 }
 
 static void rad_forward_target(kshira_rad_model *model, const kshira_image_f32 *image,
@@ -1678,6 +1699,13 @@ kshira_status kshira_rad_train_multiscale_step(
     size_t image_count;
     float weight_scale;
     float feature_scale;
+    float branch_weight_scales[RAD_BRANCHES] = {0.0f};
+    float project_weight_scale = 0.0f;
+    float stem_input_scale = 0.0f;
+    /* Fixed-size quantized caches avoid requantizing the same weights for each
+     * pooled cell; their bounds follow valid_spec's feature-channel ceiling. */
+    int8_t branch_quantized[RAD_BRANCHES * 32 * 9] = {0};
+    int8_t project_quantized[32 * 32] = {0};
     float loss_sum = 0.0f;
     float *head_weights;
     float *head_bias;
@@ -1714,6 +1742,23 @@ kshira_status kshira_rad_train_multiscale_step(
     if (model->bits != config->bits) clear_calibration(model);
     model->bits = config->bits;
     c = model->spec.feature_channels;
+    if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            branch_weight_scales[branch] = quant_scale_values(
+                model->branch_weights[branch], (size_t)c * 9U, model->bits);
+            for (int i = 0; i < c * 9; ++i) {
+                branch_quantized[branch * 32 * 9 + i] = (int8_t)kshira_quantize_symmetric(
+                    model->branch_weights[branch][i], branch_weight_scales[branch],
+                    model->bits);
+            }
+        }
+        project_weight_scale = quant_scale_values(
+            model->project_weights, (size_t)c * (size_t)c, model->bits);
+        for (int i = 0; i < c * c; ++i) {
+            project_quantized[i] = (int8_t)kshira_quantize_symmetric(
+                model->project_weights[i], project_weight_scale, model->bits);
+        }
+    }
     target_x = (int)(((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE);
     target_y = (int)(((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE);
     if (target_x < 0) target_x = 0;
@@ -1739,6 +1784,8 @@ kshira_status kshira_rad_train_multiscale_step(
     if (region_y1 > model->map_height) region_y1 = model->map_height;
     if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
         conv_stem_region_quant(model, image, region_y0, region_y1, region_x0, region_x1);
+        stem_input_scale = model->calibration_samples > 0U ?
+                           model->calibration_stem_scale : model->transient_stem_scale;
     } else {
         conv_stem_region(model, image, region_y0, region_y1, region_x0, region_x1);
     }
@@ -1746,13 +1793,17 @@ kshira_status kshira_rad_train_multiscale_step(
         for (int x = source_x; x < source_x1; ++x) {
             for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
                 if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
-                    depthwise_branch_target_quant(model, branch, y, x);
+                    depthwise_branch_target_quant_scaled(model, branch, y, x,
+                                                         branch_weight_scales[branch],
+                                                         stem_input_scale,
+                                                         &branch_quantized[branch * 32 * 9]);
                 } else {
                     depthwise_branch_target(model, branch, y, x);
                 }
             }
             if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
-                project_fused_target_quant(model, y, x);
+                project_fused_target_quant_scaled(model, y, x, project_weight_scale,
+                                                  project_quantized);
             } else {
                 project_fused_target(model, y, x);
             }

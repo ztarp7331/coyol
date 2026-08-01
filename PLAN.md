@@ -128,6 +128,13 @@ contract is:
   and host jitter remain observable. The measurements are synthetic host
   diagnostics rather than COCO, FPGA, or 1 W qualification. The default
   `multiscale_heads=0` path remains unchanged.
+- M16a reduces quantized ODT inner-loop work by packing the fixed branch and
+  projection weights once per sample and reusing their scales across all pooled
+  cells. It does not change the arena layout or the validated P3/encoder path.
+  Latest Release runs keep the 260,089-byte baseline high-water and
+  261,729-byte optional-head high-water; repeated host runs put INT8 ODT near
+  0.94--0.98 s and INT4 near 1.01--1.04 s. INT4 remains just outside the
+  per-phase stretch gate and the combined 10,000-step gate remains open.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

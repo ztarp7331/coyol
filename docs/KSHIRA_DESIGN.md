@@ -156,7 +156,10 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   261,729/262,144 bytes high-water (415 bytes free). The combined 10,000-step
   training gate remains open; these are synthetic host measurements, not COCO,
   FPGA, or 1 W qualification. ASAN timing is diagnostic only.
-- M16: reduce bounded multi-scale update cost and reclaim arena headroom while
-  preserving the P3/encoder recovery gate; then qualify real multi-scale
-  accuracy and raw-input training before FPGA lowering and measured hardware
-  energy.
+- M16a precomputes packed branch and projection weights for each quantized ODT
+  sample, reusing their scales across all pooled cells. This reduces inner-loop
+  requantization without changing arena layout or the validated P3/encoder
+  path. Repeated Release runs put INT8 ODT near 0.94--0.98 s and INT4 near
+  1.01--1.04 s; INT4 and the combined 10,000-step gate remain open. M16b will
+  reclaim arena headroom and qualify real multi-scale accuracy and raw-input
+  training before FPGA lowering and measured hardware energy.
