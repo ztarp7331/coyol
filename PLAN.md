@@ -113,6 +113,21 @@ contract is:
 - RAD construction now rolls back direct caller arenas on partial allocation
   or initialization failure; a focused test preserves a nonzero pre-existing
   arena offset and high-water.
+- M15 adds an opt-in `multiscale_heads=1` profile. Its P4/P5 heads are trained
+  only during ODT through `kshira_rad_train_multiscale_step` or the session
+  wrapper; the RAD API supports FREEZE, BIAS, and channel-sparse updates, while
+  the session contract selects channel-sparse ODT. FULL remains reserved for
+  the validated encoder/P3 path. The bounded ODT forward
+  computes every pooled source cell from one caller-owned region, and inference
+  falls back to the base head until each scale has been updated. The Release
+  harness processes 5,000 base and 5,000 ODT samples and reports separate base,
+  ODT, combined, and inference gates. Recent host runs are about 0.78--1.03 s
+  base, 0.97--1.21 s ODT, and 9.8--11.9 ms per eval image; high-water is
+  261,729/262,144 bytes. The combined 10,000-step gate is still open, and the
+  timing statuses are diagnostics rather than process-failure criteria so ASAN
+  and host jitter remain observable. The measurements are synthetic host
+  diagnostics rather than COCO, FPGA, or 1 W qualification. The default
+  `multiscale_heads=0` path remains unchanged.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
@@ -234,10 +249,10 @@ The first raw-manifest smoke on a 33 x 33 P2 image completed successfully in
 training, and checkpoint I/O); this is an adapter correctness measurement, not
 a 5,000-image performance claim.
 
-COCO is not part of the core API or the first timing contract. COCO 2017 becomes
-an optional 80-class scalability and accuracy test after the 5,000-image gate
-works. Dataset adapters must never leak COCO-specific assumptions into the
-model, loss, graph, or public API.
+COCO is not a separate product: it is an optional 80-class scalability and
+accuracy qualification for the same dataset-neutral replacement framework after
+the 5,000-image gate works. Dataset adapters must never leak COCO-specific
+assumptions into the model, loss, graph, or public API.
 
 ## 2. Research-driven detector
 

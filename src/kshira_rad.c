@@ -9,7 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { RAD_BRANCHES = 3, RAD_KERNEL = 3, RAD_STRIDE = 4, RAD_MAX_CLASSES = 80 };
+enum { RAD_BRANCHES = 3, RAD_SCALES = 3, RAD_KERNEL = 3, RAD_STRIDE = 4,
+       RAD_MAX_CLASSES = 80 };
 static const float RAD_QAS_GRADIENT_LIMIT = 1.0f;
 
 typedef struct {
@@ -20,6 +21,11 @@ typedef struct {
     float *stem_weights;
     float *stem_bias;
 } rad_encoder_delta_buffer;
+
+typedef struct {
+    float *weights;
+    float *bias;
+} rad_head_delta_buffer;
 
 struct kshira_rad_model {
     kshira_rad_spec spec;
@@ -38,6 +44,11 @@ struct kshira_rad_model {
     float *project_bias;
     float *head_weights;
     float *head_bias;
+    float *scale_head_weights[RAD_SCALES];
+    float *scale_head_bias[RAD_SCALES];
+    rad_head_delta_buffer *scale_head_deltas;
+    int scale_heads_ready;
+    int scale_head_trained_mask;
     float *stem;
     float *branches[RAD_BRANCHES];
     float *fused;
@@ -57,7 +68,8 @@ static int valid_spec(const kshira_rad_spec *spec) {
            spec->height <= INT_MAX - (RAD_STRIDE - 1) &&
            spec->channels >= 1 && spec->channels <= 4 && spec->classes >= 1 &&
            spec->classes <= RAD_MAX_CLASSES && spec->feature_channels >= 1 &&
-           spec->feature_channels <= 32 && spec->top_k >= 1 && spec->top_k <= 64;
+           spec->feature_channels <= 32 && spec->top_k >= 1 && spec->top_k <= 64 &&
+           (spec->multiscale_heads == 0 || spec->multiscale_heads == 1);
 }
 
 static int checked_elements(int a, int b, int c, size_t *out) {
@@ -103,6 +115,19 @@ static rad_encoder_delta_buffer *alloc_encoder_deltas(kshira_arena *arena,
         if (buffer->branch_weights[branch] == NULL ||
             buffer->branch_bias[branch] == NULL) return NULL;
     }
+    return buffer;
+}
+
+static rad_head_delta_buffer *alloc_scale_head_deltas(kshira_arena *arena,
+                                                       int outputs, int channels) {
+    rad_head_delta_buffer *buffer;
+    if (arena == NULL || outputs <= 0 || channels <= 0) return NULL;
+    buffer = (rad_head_delta_buffer *)kshira_arena_alloc(
+        arena, sizeof(*buffer), _Alignof(rad_head_delta_buffer));
+    if (buffer == NULL) return NULL;
+    buffer->weights = alloc_floats(arena, (size_t)outputs * (size_t)channels);
+    buffer->bias = alloc_floats(arena, (size_t)outputs);
+    if (buffer->weights == NULL || buffer->bias == NULL) return NULL;
     return buffer;
 }
 
@@ -438,12 +463,10 @@ static float quant_scale_region(const float *values, int channels, int height, i
     return kshira_symmetric_scale(maximum, bits);
 }
 
-static void conv_stem_target(kshira_rad_model *model, const kshira_image_f32 *image,
-                             int target_y, int target_x) {
+static void conv_stem_region(kshira_rad_model *model, const kshira_image_f32 *image,
+                             int y0, int y1, int x0, int x1) {
     int c = model->spec.feature_channels;
-    int y0, y1, x0, x1;
     model->transient_scales_valid = 0;
-    target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = y0; y < y1; ++y) {
             for (int x = x0; x < x1; ++x) {
@@ -472,11 +495,17 @@ static void conv_stem_target(kshira_rad_model *model, const kshira_image_f32 *im
     }
 }
 
-static void conv_stem_target_quant(kshira_rad_model *model,
-                                   const kshira_image_f32 *image,
-                                   int target_y, int target_x) {
-    int c = model->spec.feature_channels;
+static void conv_stem_target(kshira_rad_model *model, const kshira_image_f32 *image,
+                             int target_y, int target_x) {
     int y0, y1, x0, x1;
+    target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
+    conv_stem_region(model, image, y0, y1, x0, x1);
+}
+
+static void conv_stem_region_quant(kshira_rad_model *model,
+                                   const kshira_image_f32 *image,
+                                   int y0, int y1, int x0, int x1) {
+    int c = model->spec.feature_channels;
     size_t weight_count = (size_t)c * (size_t)image->channels * 9U;
     size_t image_count = (size_t)image->channels * (size_t)image->height *
                          (size_t)image->width;
@@ -486,7 +515,6 @@ static void conv_stem_target_quant(kshira_rad_model *model,
                                               model->calibration_samples);
     model->transient_image_scale = input_scale;
     model->transient_scales_valid = 1;
-    target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = y0; y < y1; ++y) {
             for (int x = x0; x < x1; ++x) {
@@ -522,6 +550,14 @@ static void conv_stem_target_quant(kshira_rad_model *model,
             model->stem, c, model->map_height, model->map_width, y0, y1, x0, x1,
             model->bits);
     }
+}
+
+static void conv_stem_target_quant(kshira_rad_model *model,
+                                   const kshira_image_f32 *image,
+                                   int target_y, int target_x) {
+    int y0, y1, x0, x1;
+    target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
+    conv_stem_region_quant(model, image, y0, y1, x0, x1);
 }
 
 static void depthwise_branch_target(const kshira_rad_model *model, int branch,
@@ -680,28 +716,28 @@ static void rad_forward(kshira_rad_model *model, const kshira_image_f32 *image) 
     }
 }
 
-static void head_forward_f32(const kshira_rad_model *model, const float *features,
-                             float *output) {
+static void head_forward_f32(const kshira_rad_model *model, const float *head_weights,
+                             const float *head_bias, const float *features, float *output) {
     int c = model->spec.feature_channels;
     for (int o = 0; o < model->outputs; ++o) {
-        float sum = model->head_bias[o];
+        float sum = head_bias[o];
         for (int ic = 0; ic < c; ++ic) {
-            sum += model->head_weights[(size_t)o * (size_t)c + (size_t)ic] * features[ic];
+            sum += head_weights[(size_t)o * (size_t)c + (size_t)ic] * features[ic];
         }
         output[o] = isfinite(sum) ? sum : (sum > 0.0f ? 1000000.0f : -1000000.0f);
     }
 }
 
-static void head_forward_quant(const kshira_rad_model *model, const float *features,
-                               float *output) {
+static void head_forward_quant(const kshira_rad_model *model, const float *head_weights,
+                               const float *head_bias, const float *features, float *output) {
     int c = model->spec.feature_channels;
-    float weight_scale = quant_scale_values(model->head_weights,
+    float weight_scale = quant_scale_values(head_weights,
                                             (size_t)model->outputs * (size_t)c, model->bits);
     float feature_scale = quant_scale_values(features, (size_t)c, model->bits);
     for (int o = 0; o < model->outputs; ++o) {
-        float value = quantized_dot(&model->head_weights[(size_t)o * (size_t)c], features,
+        float value = quantized_dot(&head_weights[(size_t)o * (size_t)c], features,
                                     (size_t)c, weight_scale, feature_scale, model->bits) +
-                      model->head_bias[o];
+                      head_bias[o];
         output[o] = isfinite(value) ? value : (value > 0.0f ? 1000000.0f : -1000000.0f);
     }
 }
@@ -1137,6 +1173,34 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                                (size_t)spec->feature_channels +
                                (size_t)model->outputs * (size_t)spec->feature_channels +
                                (size_t)model->outputs) * sizeof(float);
+    model->scale_heads_ready = 0;
+    model->scale_head_trained_mask = 0;
+    model->scale_head_deltas = NULL;
+    for (int level = 0; level < RAD_SCALES; ++level) {
+        model->scale_head_weights[level] = NULL;
+        model->scale_head_bias[level] = NULL;
+    }
+    if (spec->multiscale_heads) {
+        size_t head_count = (size_t)model->outputs * (size_t)spec->feature_channels;
+        for (int level = 1; level < RAD_SCALES; ++level) {
+            model->scale_head_weights[level] = alloc_floats(arena, head_count);
+            model->scale_head_bias[level] = alloc_floats(arena, (size_t)model->outputs);
+            if (model->scale_head_weights[level] == NULL ||
+                model->scale_head_bias[level] == NULL) {
+                status = KSHIRA_ERR_MEMORY;
+                goto fail;
+            }
+        }
+        model->scale_head_deltas = alloc_scale_head_deltas(
+            arena, model->outputs, spec->feature_channels);
+        if (model->scale_head_deltas == NULL) {
+            status = KSHIRA_ERR_MEMORY;
+            goto fail;
+        }
+        model->scale_heads_ready = 1;
+        model->parameter_bytes += (size_t)(RAD_SCALES - 1) *
+                                  (head_count + (size_t)model->outputs) * sizeof(float);
+    }
     model->stem = alloc_floats(arena, map_elements);
     model->fused = alloc_floats(arena, map_elements);
     if (model->stem == NULL || model->fused == NULL) {
@@ -1165,6 +1229,12 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
           (size_t)RAD_BRANCHES * (size_t)spec->feature_channels +
           (size_t)spec->feature_channels * (size_t)spec->channels * 9U +
           (size_t)spec->feature_channels) * sizeof(float));
+    if (model->scale_head_deltas != NULL) {
+        model->activation_bytes += sizeof(*model->scale_head_deltas) +
+                                   ((size_t)model->outputs *
+                                    (size_t)spec->feature_channels +
+                                    (size_t)model->outputs) * sizeof(float);
+    }
     if (kshira_rad_reset(model, spec->seed) != KSHIRA_OK) {
         status = KSHIRA_ERR_ARGUMENT;
         goto fail;
@@ -1197,6 +1267,19 @@ kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
     fill_random(model->head_weights, (size_t)model->outputs *
                 (size_t)model->spec.feature_channels, &state, 0.05f);
     fill_zero(model->head_bias, (size_t)model->outputs);
+    if (model->scale_heads_ready) {
+        size_t head_count = (size_t)model->outputs *
+                            (size_t)model->spec.feature_channels;
+        for (int level = 1; level < RAD_SCALES; ++level) {
+            for (size_t i = 0U; i < head_count; ++i) {
+                model->scale_head_weights[level][i] = model->head_weights[i];
+            }
+            for (int o = 0; o < model->outputs; ++o) {
+                model->scale_head_bias[level][o] = model->head_bias[o];
+            }
+        }
+        model->scale_head_trained_mask = 0;
+    }
     clear_calibration(model);
     clear_transient_scales(model);
     return KSHIRA_OK;
@@ -1278,6 +1361,10 @@ int kshira_rad_calibration_ready(const kshira_rad_model *model) {
     return model != NULL && model->calibration_samples > 0U;
 }
 
+int kshira_rad_multiscale_ready(const kshira_rad_model *model) {
+    return model != NULL && model->scale_heads_ready;
+}
+
 kshira_status kshira_rad_predict(kshira_rad_model *model,
                                  const kshira_image_f32 *image, float threshold,
                                  kshira_rad_detection *detections, int capacity, int *count) {
@@ -1316,11 +1403,18 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
                 float best_class;
                 float quality;
                 float features[32];
+                const int use_scale_head = level > 0 && model->scale_heads_ready &&
+                                           (model->scale_head_trained_mask & (1 << level));
+                const float *head_weights = use_scale_head ?
+                                             model->scale_head_weights[level] :
+                                             model->head_weights;
+                const float *head_bias = use_scale_head ?
+                                         model->scale_head_bias[level] : model->head_bias;
                 pooled_features(model, level, y, x, features);
                 if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
-                    head_forward_quant(model, features, output);
+                    head_forward_quant(model, head_weights, head_bias, features, output);
                 } else {
-                    head_forward_f32(model, features, output);
+                    head_forward_f32(model, head_weights, head_bias, features, output);
                 }
                 quality = sigmoid(output[4]);
                 best_class = output[5];
@@ -1428,12 +1522,12 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                               ic, target_y, target_x)];
     }
     if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
-        head_forward_quant(model, features, output);
+        head_forward_quant(model, model->head_weights, model->head_bias, features, output);
         weight_scale = quant_scale_values(model->head_weights,
                                           (size_t)model->outputs * (size_t)c, model->bits);
         feature_scale = quant_scale_values(features, (size_t)c, model->bits);
     } else {
-        head_forward_f32(model, features, output);
+        head_forward_f32(model, model->head_weights, model->head_bias, features, output);
         weight_scale = 1.0f;
         feature_scale = 1.0f;
     }
@@ -1556,6 +1650,231 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         }
     }
     if (config->update_mode != KSHIRA_UPDATE_FREEZE) clear_calibration(model);
+    *loss = loss_sum / (float)model->outputs;
+    return isfinite(*loss) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
+}
+
+kshira_status kshira_rad_train_multiscale_step(
+    kshira_rad_model *model, const kshira_image_f32 *image,
+    const kshira_rad_box *target, int level,
+    const kshira_rad_train_config *config, float *loss) {
+    float features[32];
+    float output[5 + RAD_MAX_CLASSES] = {0.0f};
+    float gradients[5 + RAD_MAX_CLASSES];
+    int target_x;
+    int target_y;
+    int span;
+    int cell_x;
+    int cell_y;
+    int source_x;
+    int source_y;
+    int source_x1;
+    int source_y1;
+    int region_x0;
+    int region_y0;
+    int region_x1;
+    int region_y1;
+    int c;
+    size_t image_count;
+    float weight_scale;
+    float feature_scale;
+    float loss_sum = 0.0f;
+    float *head_weights;
+    float *head_bias;
+    int seed_scale_head;
+    if (model == NULL || image == NULL || image->data == NULL || target == NULL ||
+        config == NULL || loss == NULL || !model->scale_heads_ready ||
+        level < 1 || level >= RAD_SCALES ||
+        (config->bits != KSHIRA_BITS_FLOAT && !kshira_bit_mode_valid(config->bits)) ||
+        config->update_mode < KSHIRA_UPDATE_FREEZE ||
+        config->update_mode > KSHIRA_UPDATE_CHANNELS ||
+        !isfinite(config->learning_rate) || config->learning_rate <= 0.0f ||
+        image->channels != model->spec.channels || image->height != model->spec.height ||
+        image->width != model->spec.width || target->class_id < 0 ||
+        target->class_id >= model->spec.classes || !isfinite(target->x1) ||
+        !isfinite(target->y1) || !isfinite(target->x2) || !isfinite(target->y2) ||
+        target->x1 < 0.0f || target->y1 < 0.0f || target->x2 > (float)image->width ||
+        target->y2 > (float)image->height || target->x2 <= target->x1 ||
+        target->y2 <= target->y1) {
+        return KSHIRA_ERR_ARGUMENT;
+    }
+    if (config->channel_mask != NULL &&
+        config->channel_mask->channel_count != (size_t)model->spec.feature_channels) {
+        return KSHIRA_ERR_ARGUMENT;
+    }
+    if ((size_t)image->channels > SIZE_MAX / (size_t)image->height ||
+        (size_t)image->channels * (size_t)image->height > SIZE_MAX / (size_t)image->width) {
+        return KSHIRA_ERR_RANGE;
+    }
+    image_count = (size_t)image->channels * (size_t)image->height *
+                  (size_t)image->width;
+    for (size_t i = 0U; i < image_count; ++i) {
+        if (!isfinite(image->data[i])) return KSHIRA_ERR_ARGUMENT;
+    }
+    if (model->bits != config->bits) clear_calibration(model);
+    model->bits = config->bits;
+    c = model->spec.feature_channels;
+    target_x = (int)(((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE);
+    target_y = (int)(((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE);
+    if (target_x < 0) target_x = 0;
+    if (target_y < 0) target_y = 0;
+    if (target_x >= model->map_width) target_x = model->map_width - 1;
+    if (target_y >= model->map_height) target_y = model->map_height - 1;
+    span = 1 << level;
+    cell_x = target_x / span;
+    cell_y = target_y / span;
+    source_x = cell_x * span;
+    source_y = cell_y * span;
+    source_x1 = source_x + span;
+    source_y1 = source_y + span;
+    if (source_x1 > model->map_width) source_x1 = model->map_width;
+    if (source_y1 > model->map_height) source_y1 = model->map_height;
+    region_x0 = source_x - 4;
+    region_y0 = source_y - 4;
+    region_x1 = source_x1 + 4;
+    region_y1 = source_y1 + 4;
+    if (region_x0 < 0) region_x0 = 0;
+    if (region_y0 < 0) region_y0 = 0;
+    if (region_x1 > model->map_width) region_x1 = model->map_width;
+    if (region_y1 > model->map_height) region_y1 = model->map_height;
+    if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+        conv_stem_region_quant(model, image, region_y0, region_y1, region_x0, region_x1);
+    } else {
+        conv_stem_region(model, image, region_y0, region_y1, region_x0, region_x1);
+    }
+    for (int y = source_y; y < source_y1; ++y) {
+        for (int x = source_x; x < source_x1; ++x) {
+            for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+                if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+                    depthwise_branch_target_quant(model, branch, y, x);
+                } else {
+                    depthwise_branch_target(model, branch, y, x);
+                }
+            }
+            if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+                project_fused_target_quant(model, y, x);
+            } else {
+                project_fused_target(model, y, x);
+            }
+        }
+    }
+    for (int ic = 0; ic < c; ++ic) {
+        float sum = 0.0f;
+        int samples = 0;
+        for (int y = source_y; y < source_y1; ++y) {
+            for (int x = source_x; x < source_x1; ++x) {
+                sum += model->fused[rad_index(c, model->map_height, model->map_width,
+                                              ic, y, x)];
+                ++samples;
+            }
+        }
+        features[ic] = samples > 0 ? sum / (float)samples : 0.0f;
+    }
+    seed_scale_head = (model->scale_head_trained_mask & (1 << level)) == 0;
+    head_weights = seed_scale_head ? model->head_weights : model->scale_head_weights[level];
+    head_bias = seed_scale_head ? model->head_bias : model->scale_head_bias[level];
+    if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+        head_forward_quant(model, head_weights, head_bias, features, output);
+        weight_scale = quant_scale_values(head_weights,
+                                          (size_t)model->outputs * (size_t)c, model->bits);
+        feature_scale = quant_scale_values(features, (size_t)c, model->bits);
+    } else {
+        head_forward_f32(model, head_weights, head_bias, features, output);
+        weight_scale = 1.0f;
+        feature_scale = 1.0f;
+    }
+    for (int o = 0; o < model->outputs; ++o) {
+        float center_x = ((float)source_x + (float)source_x1) *
+                         0.5f * (float)RAD_STRIDE;
+        float center_y = ((float)source_y + (float)source_y1) *
+                         0.5f * (float)RAD_STRIDE;
+        float stride = (float)(RAD_STRIDE * span);
+        float target_value;
+        float probability;
+        if (o < 4) {
+            float values[4] = {
+                fmaxf(0.0f, (center_x - target->x1) / stride),
+                fmaxf(0.0f, (center_y - target->y1) / stride),
+                fmaxf(0.0f, (target->x2 - center_x) / stride),
+                fmaxf(0.0f, (target->y2 - center_y) / stride)
+            };
+            target_value = values[o];
+            gradients[o] = output[o] - target_value;
+            if (!isfinite(gradients[o])) return KSHIRA_ERR_RANGE;
+            loss_sum += 0.5f * gradients[o] * gradients[o];
+        } else {
+            probability = sigmoid(output[o]);
+            target_value = o == 4 ? 1.0f :
+                           (o - 5 == target->class_id ? 1.0f : 0.0f);
+            gradients[o] = probability - target_value;
+            if (!isfinite(gradients[o])) return KSHIRA_ERR_RANGE;
+            loss_sum += 0.5f * (probability - target_value) *
+                        (probability - target_value);
+        }
+    }
+    if (!isfinite(loss_sum)) return KSHIRA_ERR_RANGE;
+    if (config->update_mode != KSHIRA_UPDATE_FREEZE) {
+        rad_head_delta_buffer *deltas = model->scale_head_deltas;
+        if (deltas == NULL) return KSHIRA_ERR_MEMORY;
+        for (int o = 0; o < model->outputs; ++o) {
+            float gradient_bias = gradients[o];
+            float delta;
+            float updated;
+            if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
+                                 weight_scale, feature_scale) != KSHIRA_OK ||
+                !normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
+                return KSHIRA_ERR_RANGE;
+            }
+            gradient_bias *= class_gradient_scale(model, o, target->class_id);
+            delta = config->learning_rate * gradient_bias;
+            updated = head_bias[o] - delta;
+            if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
+            deltas->bias[o] = delta;
+            if (config->update_mode == KSHIRA_UPDATE_CHANNELS) {
+                for (int ic = 0; ic < c; ++ic) {
+                    float gradient_weight;
+                    if (config->channel_mask != NULL && !kshira_sparse_mask_get(
+                            config->channel_mask, (size_t)ic)) continue;
+                    gradient_weight = gradients[o] * features[ic];
+                    if (!isfinite(gradient_weight) ||
+                        kshira_apply_qas(&gradient_weight, 1U, NULL, 0U,
+                                         weight_scale, feature_scale) != KSHIRA_OK ||
+                        !normalize_qas_gradient(&gradient_weight,
+                                                model->bits != KSHIRA_BITS_FLOAT)) {
+                        return KSHIRA_ERR_RANGE;
+                    }
+                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
+                    delta = config->learning_rate * gradient_weight;
+                    updated = head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
+                    if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
+                    deltas->weights[(size_t)o * (size_t)c + (size_t)ic] = delta;
+                }
+            }
+        }
+        if (seed_scale_head) {
+            size_t head_count = (size_t)model->outputs * (size_t)c;
+            for (size_t i = 0U; i < head_count; ++i) {
+                model->scale_head_weights[level][i] = model->head_weights[i];
+            }
+            for (int o = 0; o < model->outputs; ++o) {
+                model->scale_head_bias[level][o] = model->head_bias[o];
+            }
+            head_weights = model->scale_head_weights[level];
+            head_bias = model->scale_head_bias[level];
+        }
+        for (int o = 0; o < model->outputs; ++o) {
+            head_bias[o] -= deltas->bias[o];
+            if (config->update_mode == KSHIRA_UPDATE_CHANNELS) {
+                for (int ic = 0; ic < c; ++ic) {
+                    if (config->channel_mask != NULL && !kshira_sparse_mask_get(
+                            config->channel_mask, (size_t)ic)) continue;
+                    head_weights[(size_t)o * (size_t)c + (size_t)ic] -=
+                        deltas->weights[(size_t)o * (size_t)c + (size_t)ic];
+                }
+            }
+        }
+        model->scale_head_trained_mask |= 1 << level;
+    }
     *loss = loss_sum / (float)model->outputs;
     return isfinite(*loss) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
 }

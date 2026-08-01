@@ -26,6 +26,7 @@ typedef struct {
     int feature_channels;
     int top_k;
     int seed;
+    int multiscale_heads; /* 0: pooled inference shares P3 head; 1: allocate P4/P5 ODT heads */
 } kshira_rad_spec;
 
 typedef struct {
@@ -61,12 +62,18 @@ kshira_bit_mode kshira_rad_bits(const kshira_rad_model *model);
 kshira_status kshira_rad_calibrate(kshira_rad_model *model,
                                     const kshira_image_f32 *image);
 int kshira_rad_calibration_ready(const kshira_rad_model *model);
+int kshira_rad_multiscale_ready(const kshira_rad_model *model);
 kshira_status kshira_rad_predict(kshira_rad_model *model,
                                  const kshira_image_f32 *image, float threshold,
                                  kshira_rad_detection *detections, int capacity, int *count);
 kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_f32 *image,
                                      const kshira_rad_box *target,
                                      const kshira_rad_train_config *config, float *loss);
+kshira_status kshira_rad_train_multiscale_step(kshira_rad_model *model,
+                                                const kshira_image_f32 *image,
+                                                const kshira_rad_box *target, int level,
+                                                const kshira_rad_train_config *config,
+                                                float *loss);
 int kshira_rad_map_height(const kshira_rad_model *model);
 int kshira_rad_map_width(const kshira_rad_model *model);
 size_t kshira_rad_parameter_bytes(const kshira_rad_model *model);

@@ -73,6 +73,14 @@ changing the baseline's accuracy and timing claims.
   including this scratch, with no per-step stack allocation. This removes the
   fixed stack burden but leaves only about 2.1 KiB of headroom for this profile;
   larger feature maps must be admitted by the sparse/arena planner before use.
+- M15 adds optional scale-head banks through `multiscale_heads=1`. P4/P5 ODT
+  updates use the pooled source region rather than stale cells, keep separate
+  trained-level readiness, and preflight all enabled bias/weight deltas before
+  committing them. `UPDATE_BIAS` leaves scale-head weights unchanged, while
+  `UPDATE_FULL` is rejected for this head-only phase. The optional banks and
+  their scratch raise the measured 160 x 160 profile to 261,729 bytes, leaving
+  415 bytes in the 256 KiB arena; the default `multiscale_heads=0` profile is
+  unchanged.
 - `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
   `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
 - The balanced domain generator uses an exact zero-fill fast path for its
@@ -90,8 +98,9 @@ candidates without NMS. M5 now dispatches real
 integer MACs for FP32/INT8/INT4 modes and applies QAS to a sparse head update;
 the Release harness measured approximately 1.35 ms F32, 9.52 ms INT8, and
 9.10 ms INT4 per image on the pinned development CPU. These measurements do
-not imply board power or detector accuracy yet, and the full multi-scale
-detector still needs its own quantized update integration.
+not imply board power or detector accuracy yet. Qualified scale-aware accuracy
+and combined training timing remain open; optional quantized P4/P5 head updates
+are now available in M15.
 
 ## Architecture combination
 
@@ -133,4 +142,21 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   aware assignment and head training remain open.
 - M14: direct RAD arena transaction/rollback hardening (landed); scale-aware
   training with separately qualified head/encoder gradients remains open.
-- M15+: FPGA lowering and measured hardware energy qualification.
+- M15: optional `multiscale_heads=1` allocation and ODT-only P4/P5 head
+  training (landed). `kshira_rad_train_multiscale_step` and the session wrapper
+  train level 1/2 heads in caller-owned transactional scratch. The RAD API
+  supports FREEZE, BIAS, or channel-sparse updates; the session contract
+  selects channel-sparse ODT, and FULL is intentionally rejected because the
+  validated encoder/P3 path remains the separate reference. Pooled ODT forward
+  now computes the complete bounded source region, and inference falls back to
+  the base head for any scale that has not completed an update. The Release
+  multiscale harness processes 5,000 base plus 5,000 ODT samples and reports
+  separate base, ODT, combined, and inference gates. Recent runs are roughly
+  0.78--1.03 s base, 0.97--1.21 s ODT, and 9.8--11.9 ms per eval image, with
+  261,729/262,144 bytes high-water (415 bytes free). The combined 10,000-step
+  training gate remains open; these are synthetic host measurements, not COCO,
+  FPGA, or 1 W qualification. ASAN timing is diagnostic only.
+- M16: reduce bounded multi-scale update cost and reclaim arena headroom while
+  preserving the P3/encoder recovery gate; then qualify real multi-scale
+  accuracy and raw-input training before FPGA lowering and measured hardware
+  energy.

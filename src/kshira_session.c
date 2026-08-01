@@ -111,6 +111,30 @@ kshira_status kshira_session_step(kshira_session *session, const kshira_image_f3
     return kshira_phase_driver_step(&session->phase);
 }
 
+kshira_status kshira_session_multiscale_step(kshira_session *session,
+                                               const kshira_image_f32 *image,
+                                               const kshira_rad_box *target, int level,
+                                               float learning_rate, float *loss) {
+    kshira_rad_train_config config;
+    kshira_phase_contract contract;
+    if (session == NULL || loss == NULL) return KSHIRA_ERR_ARGUMENT;
+    contract = session->phase.contract;
+    if (contract.phase != KSHIRA_PHASE_ODT ||
+        contract.update_mode != KSHIRA_UPDATE_CHANNELS ||
+        kshira_phase_validate(&contract) != KSHIRA_OK) return KSHIRA_ERR_ARGUMENT;
+    if (session->phase.steps == SIZE_MAX) return KSHIRA_ERR_RANGE;
+    config.bits = contract.bits;
+    config.update_mode = contract.update_mode;
+    config.channel_mask = &session->channel_mask;
+    config.learning_rate = learning_rate;
+    {
+        kshira_status status = kshira_rad_train_multiscale_step(
+            session->rad, image, target, level, &config, loss);
+        if (status != KSHIRA_OK) return status;
+    }
+    return kshira_phase_driver_step(&session->phase);
+}
+
 kshira_status kshira_session_predict(kshira_session *session, const kshira_image_f32 *image,
                                       float threshold, kshira_rad_detection *detections,
                                       int capacity, int *count) {
