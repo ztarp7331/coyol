@@ -270,6 +270,16 @@ static void test_rad_top_k(void) {
             assert(odd_detections[i].box.x2 > odd_detections[i].box.x1);
             assert(odd_detections[i].box.y2 > odd_detections[i].box.y1);
         }
+        assert(kshira_rad_set_bits(odd_model, KSHIRA_BITS_INT8) == KSHIRA_OK);
+        assert(kshira_rad_predict(odd_model, &odd_image, 0.0f, odd_detections, 8,
+                                  &odd_count) == KSHIRA_OK);
+        assert(odd_count >= 0 && odd_count <= 8);
+        for (int i = 0; i < odd_count; ++i) {
+            assert(odd_detections[i].box.x1 >= 0.0f && odd_detections[i].box.y1 >= 0.0f);
+            assert(odd_detections[i].box.x2 <= 9.0f && odd_detections[i].box.y2 <= 10.0f);
+            assert(odd_detections[i].box.x2 > odd_detections[i].box.x1);
+            assert(odd_detections[i].box.y2 > odd_detections[i].box.y1);
+        }
     }
     {
         unsigned char bad_memory[4096];

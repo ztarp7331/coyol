@@ -103,6 +103,13 @@ contract is:
   profile uses 260,025 bytes high-water inside the 256 KiB arena, including this
   scratch, with no per-step stack allocation. Larger feature maps must still be
   admitted by the sparse/arena planner before use.
+- M13 adds an inference-only pooled P3/P4/P5 view over the RAD fused map. P4
+  and P5 are generated cell-by-cell from the stride-4 map and merged into the
+  existing bounded top-K output without new arena buffers. Release held-out
+  evaluation is now about 0.89--0.97 s aggregate (8.9--9.7 ms per image), with
+  the same 260,025-byte high-water. The training step still supervises only
+  P3, so this is an architectural/inference checkpoint, not a qualified
+  multi-scale accuracy result.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

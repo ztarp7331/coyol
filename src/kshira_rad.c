@@ -706,6 +706,33 @@ static void head_forward_quant(const kshira_rad_model *model, const float *featu
     }
 }
 
+/* Build a pooled P4/P5 feature vector directly from the stride-4 map. No
+ * additional feature-map storage is needed; the bounded head consumes one
+ * cell at a time. */
+static void pooled_features(const kshira_rad_model *model, int level, int y, int x,
+                            float *features) {
+    int span = 1 << level;
+    int y0 = y * span;
+    int x0 = x * span;
+    int y1 = y0 + span;
+    int x1 = x0 + span;
+    int c = model->spec.feature_channels;
+    if (y1 > model->map_height) y1 = model->map_height;
+    if (x1 > model->map_width) x1 = model->map_width;
+    for (int ic = 0; ic < c; ++ic) {
+        float sum = 0.0f;
+        int samples = 0;
+        for (int iy = y0; iy < y1; ++iy) {
+            for (int ix = x0; ix < x1; ++ix) {
+                sum += model->fused[rad_index(c, model->map_height, model->map_width,
+                                              ic, iy, ix)];
+                ++samples;
+            }
+        }
+        features[ic] = samples > 0 ? sum / (float)samples : 0.0f;
+    }
+}
+
 static kshira_status encoder_delta(float current, float gradient, float learning_rate,
                                    float weight_scale, float input_scale, int bias,
                                    int quantized, float *delta) {
@@ -1218,7 +1245,6 @@ int kshira_rad_calibration_ready(const kshira_rad_model *model) {
 kshira_status kshira_rad_predict(kshira_rad_model *model,
                                  const kshira_image_f32 *image, float threshold,
                                  kshira_rad_detection *detections, int capacity, int *count) {
-    int c;
     if (model == NULL || image == NULL || image->data == NULL || detections == NULL ||
         count == NULL || capacity < 0 || !isfinite(threshold) || threshold < 0.0f ||
         threshold > 1.0f || image->channels != model->spec.channels ||
@@ -1238,55 +1264,65 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
     }
     *count = 0;
     rad_forward(model, image);
-    c = model->spec.feature_channels;
-    for (int y = 0; y < model->map_height; ++y) {
-        for (int x = 0; x < model->map_width; ++x) {
-            float output[5 + RAD_MAX_CLASSES] = {0.0f};
-            int class_id = 0;
-            float best_class;
-            float quality;
-            float features[32];
-            for (int ic = 0; ic < c; ++ic) {
-                features[ic] = model->fused[rad_index(c, model->map_height,
-                                                       model->map_width, ic, y, x)];
-            }
-            if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
-                head_forward_quant(model, features, output);
-            } else {
-                head_forward_f32(model, features, output);
-            }
-            quality = sigmoid(output[4]);
-            best_class = output[5];
-            for (int cls = 1; cls < model->spec.classes; ++cls) {
-                if (output[5 + cls] > best_class) {
-                    best_class = output[5 + cls];
-                    class_id = cls;
+    for (int level = 0; level < 3; ++level) {
+        int span = 1 << level;
+        int scale_height = (model->map_height + span - 1) / span;
+        int scale_width = (model->map_width + span - 1) / span;
+        float stride = (float)(RAD_STRIDE * span);
+        for (int y = 0; y < scale_height; ++y) {
+            for (int x = 0; x < scale_width; ++x) {
+                int y0 = y * span;
+                int x0 = x * span;
+                int y1 = y0 + span;
+                int x1 = x0 + span;
+                float output[5 + RAD_MAX_CLASSES] = {0.0f};
+                int class_id = 0;
+                float best_class;
+                float quality;
+                float features[32];
+                pooled_features(model, level, y, x, features);
+                if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+                    head_forward_quant(model, features, output);
+                } else {
+                    head_forward_f32(model, features, output);
                 }
-            }
-            {
-                float class_score = sigmoid(best_class);
-                float score = quality * class_score;
-                float cx = ((float)x + 0.5f) * (float)RAD_STRIDE;
-                float cy = ((float)y + 0.5f) * (float)RAD_STRIDE;
-                float left = fmaxf(0.0f, output[0]) * (float)RAD_STRIDE;
-                float top = fmaxf(0.0f, output[1]) * (float)RAD_STRIDE;
-                float right = fmaxf(0.0f, output[2]) * (float)RAD_STRIDE;
-                float bottom = fmaxf(0.0f, output[3]) * (float)RAD_STRIDE;
-                kshira_rad_detection candidate;
-                if (score < threshold) continue;
-                candidate.score = score;
-                candidate.quality = quality;
-                candidate.box.x1 = fminf((float)image->width, fmaxf(0.0f, cx - left));
-                candidate.box.y1 = fminf((float)image->height, fmaxf(0.0f, cy - top));
-                candidate.box.x2 = fminf((float)image->width, fmaxf(0.0f, cx + right));
-                candidate.box.y2 = fminf((float)image->height, fmaxf(0.0f, cy + bottom));
-                candidate.box.class_id = class_id;
-                if (!isfinite(candidate.box.x1) || !isfinite(candidate.box.y1) ||
-                    !isfinite(candidate.box.x2) || !isfinite(candidate.box.y2) ||
-                    candidate.box.x2 <= candidate.box.x1 || candidate.box.y2 <= candidate.box.y1) {
-                    continue;
+                quality = sigmoid(output[4]);
+                best_class = output[5];
+                for (int cls = 1; cls < model->spec.classes; ++cls) {
+                    if (output[5 + cls] > best_class) {
+                        best_class = output[5 + cls];
+                        class_id = cls;
+                    }
                 }
-                insert_top_k(detections, count, capacity, model->spec.top_k, &candidate);
+                {
+                    float class_score = sigmoid(best_class);
+                    float score = quality * class_score;
+                    float cx;
+                    float cy;
+                    float left = fmaxf(0.0f, output[0]) * stride;
+                    float top = fmaxf(0.0f, output[1]) * stride;
+                    float right = fmaxf(0.0f, output[2]) * stride;
+                    float bottom = fmaxf(0.0f, output[3]) * stride;
+                    kshira_rad_detection candidate;
+                    if (y1 > model->map_height) y1 = model->map_height;
+                    if (x1 > model->map_width) x1 = model->map_width;
+                    cx = ((float)x0 + (float)x1) * 0.5f * (float)RAD_STRIDE;
+                    cy = ((float)y0 + (float)y1) * 0.5f * (float)RAD_STRIDE;
+                    if (score < threshold) continue;
+                    candidate.score = score;
+                    candidate.quality = quality;
+                    candidate.box.x1 = fminf((float)image->width, fmaxf(0.0f, cx - left));
+                    candidate.box.y1 = fminf((float)image->height, fmaxf(0.0f, cy - top));
+                    candidate.box.x2 = fminf((float)image->width, fmaxf(0.0f, cx + right));
+                    candidate.box.y2 = fminf((float)image->height, fmaxf(0.0f, cy + bottom));
+                    candidate.box.class_id = class_id;
+                    if (!isfinite(candidate.box.x1) || !isfinite(candidate.box.y1) ||
+                        !isfinite(candidate.box.x2) || !isfinite(candidate.box.y2) ||
+                        candidate.box.x2 <= candidate.box.x1 || candidate.box.y2 <= candidate.box.y1) {
+                        continue;
+                    }
+                    insert_top_k(detections, count, capacity, model->spec.top_k, &candidate);
+                }
             }
         }
     }

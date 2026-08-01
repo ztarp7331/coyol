@@ -46,6 +46,13 @@ changing the baseline's accuracy and timing claims.
   release run reports FP32 IoU 0.311, INT8 IoU 0.475, and INT4 IoU 0.435, with
   quantized loss ratios 0.426 and 0.509; the plain ASAN harness also completes.
   These are synthetic proxy results, not COCO accuracy or board-power claims.
+- M13 adds an inference-only three-scale view: P4 and P5 are formed by
+  pooling the existing stride-4 fused map one cell at a time, then merged with
+  P3 through the bounded top-K path without allocating additional feature maps.
+  This keeps the 256 KiB high-water unchanged and raises recent held-out
+  evaluation to about 0.89--0.97 s aggregate (8.9--9.7 ms per image). The
+  current training step still supervises only the P3 head, so P4/P5 outputs are
+  experimental and are not a qualified multi-scale accuracy result.
 - Reusing the per-step input and stem-tile scales removes duplicate full-image
   scans from the scalar full-encoder path. M11 adds a transactional encoder
   delta cache: projection, dilated-branch, and stem deltas are preflighted
@@ -118,5 +125,7 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   sub-second training gate (landed on the synthetic 5,000-sample harness).
 - M12: arena-backed, spec-sized delta scratch (landed); multi-scale RAD
   feature integration and end-to-end dataset-scale qualification remain open.
-- M13+: multi-scale RAD feature integration, FPGA lowering, and measured
-  hardware energy qualification.
+- M13: inference-only pooled P3/P4/P5 candidate integration (landed); scale-
+  aware assignment and head training remain open.
+- M14+: scale-aware training, FPGA lowering, and measured hardware energy
+  qualification.
