@@ -92,6 +92,9 @@ static det_status det_kshira_predict(det_model *model, const det_image *image,
                                       float score_threshold,
                                       det_detection *detections, int capacity,
                                       int *count);
+static det_status det_kshira_save_file(const det_model *model, const char *path);
+static det_status det_kshira_load_file(det_context *ctx, const char *path,
+                                       det_model **out);
 
 static double now_ms(void) {
 #if defined(_WIN32)

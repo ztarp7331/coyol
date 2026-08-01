@@ -60,6 +60,7 @@ static det_status det_kshira_initialize(det_model *model, int seed) {
         status = kshira_session_set_channel(&model->kshira, (size_t)channel, 1);
         if (status != KSHIRA_OK) return det_status_from_kshira(status);
     }
+    model->spec.seed = seed;
     model->spec.feature_channels = features;
     model->precision = DET_PRECISION_F32;
     model->train_updates = 0U;
@@ -149,7 +150,8 @@ static det_status det_kshira_prepare_training(det_model *model,
     const kshira_phase_contract *contract;
     kshira_bit_mode bits;
     kshira_status status;
-    if (!det_kshira_precision_bits(config->precision, &bits) ||
+    if (config->momentum != 0.0f ||
+        !det_kshira_precision_bits(config->precision, &bits) ||
         config->mode == DET_TRAIN_GLOBAL_BP) return DET_ERR_UNSUPPORTED;
     contract = kshira_session_contract(&model->kshira);
     if (contract == NULL) return DET_ERR_FORMAT;

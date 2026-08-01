@@ -108,7 +108,9 @@ static int expected_payload_size(const det_file_header *header, size_t *out) {
 
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
-    if (model->architecture == DET_ARCH_KSHIRA) return DET_ERR_UNSUPPORTED;
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        return det_kshira_save_file(model, path);
+    }
     if (!valid_precision(model->precision)) return DET_ERR_FORMAT;
     for (int s = 0; s < DET_GRAPH_STAGES; ++s) {
         const det_stage *stage = &model->stages[s];
@@ -291,9 +293,20 @@ det_status det_save(const det_model *model, const char *path) {
 }
 
 det_status det_load(det_context *ctx, const char *path, det_model **out) {
+    char prefix_magic[4];
+    uint32_t prefix_version;
     if (ctx == NULL || path == NULL || out == NULL) return DET_ERR_ARGUMENT;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return DET_ERR_IO;
+    if (fread(prefix_magic, 1U, sizeof(prefix_magic), file) != sizeof(prefix_magic) ||
+        fread(&prefix_version, sizeof(prefix_version), 1U, file) != 1U) {
+        fclose(file);
+        return DET_ERR_FORMAT;
+    }
+    if (memcmp(prefix_magic, "CDET", 4U) == 0 && prefix_version == 9U) {
+        fclose(file);
+        return det_kshira_load_file(ctx, path, out);
+    }
     if (fseek(file, 0L, SEEK_END) != 0) {
         fclose(file);
         return DET_ERR_FORMAT;

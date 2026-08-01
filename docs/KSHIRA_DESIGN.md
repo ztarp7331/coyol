@@ -184,6 +184,18 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   INT8 TRAIN, and INT4 multi-scale ODT, while `det_predict` and `det_evaluate`
   dispatch through the same model handle. The shared raw-manifest adapter can
   therefore feed either architecture without a KSHIRA-specific dataset API.
-  The current integration explicitly rejects CDET W4A8 on KSHIRA, standalone
-  GLOBAL_BP semantics, zero-box negative training, and KSHIRA serialization
-  until those contracts are implemented rather than silently approximated.
+  The current integration explicitly rejects CDET W4A8, nonzero momentum,
+  GLOBAL_BP semantics, and zero-box negative training on KSHIRA rather than
+  silently approximating those contracts.
+- M18 adds the integrated version-9 checkpoint. Its pointer-free CRC32 payload
+  preserves phase/update counters, sparse-channel mask, calibration, base and
+  optional P4/P5 heads, and all persistent RAD parameters. Tests cover exact
+  prediction round trips, deterministic continuation, invalid checksums, and
+  CRC-valid truncation; the existing version-8 CDET loader remains available.
+  The unified `det_bench --architecture kshira` path also accepts the shared raw
+  manifest and executable F32/INT8/INT4 modes. Two 5,000-sample 160 x 160
+  in-memory Release checks measured 240.244--337.097/639.539--802.958/
+  610.714--777.428 ms through serialization, with 0.671--0.840/6.869--8.726/
+  7.994--9.916 ms mean inference respectively. They pass the 5,000-sample
+  generated-data timing gate only; the 5,000-image raw-input accuracy gate,
+  COCO qualification, FPGA lowering, and measured power remain open.

@@ -78,6 +78,11 @@ int kshira_rad_map_height(const kshira_rad_model *model);
 int kshira_rad_map_width(const kshira_rad_model *model);
 size_t kshira_rad_parameter_bytes(const kshira_rad_model *model);
 size_t kshira_rad_activation_bytes(const kshira_rad_model *model);
+size_t kshira_rad_state_bytes(const kshira_rad_model *model);
+kshira_status kshira_rad_export_state(const kshira_rad_model *model, void *buffer,
+                                       size_t capacity, size_t *written);
+kshira_status kshira_rad_import_state(kshira_rad_model *model, const void *buffer,
+                                       size_t bytes);
 
 #ifdef __cplusplus
 }

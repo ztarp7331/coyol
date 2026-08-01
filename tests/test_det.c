@@ -982,6 +982,8 @@ static void test_integrated_kshira_architecture(void) {
     det_context *ctx = NULL;
     det_model *model = NULL;
     det_model *peer = NULL;
+    det_model *loaded = NULL;
+    det_model *corrupt = NULL;
     det_model_spec spec = {32, 32, 1, 2, 8, 17, DET_ARCH_KSHIRA, 4};
     float pixels[32 * 32] = {0.0f};
     det_box boxes[2] = {{4.0f, 4.0f, 8.0f, 8.0f, 0},
@@ -992,7 +994,12 @@ static void test_integrated_kshira_architecture(void) {
                                1.0e-4f, 0.0f, 0.1f, 1, 17, 1};
     det_train_report report;
     det_detection detections[8];
+    det_detection loaded_detections[8];
     int count = 0;
+    int loaded_count = 0;
+    const char *path = "det_kshira_roundtrip.bin";
+    const char *continued_path = "det_kshira_continued.bin";
+    const char *truncated_path = "det_kshira_truncated.bin";
     for (int y = 4; y < 24; ++y) {
         for (int x = 4; x < 24; ++x) pixels[y * 32 + x] = 0.5f;
     }
@@ -1002,6 +1009,9 @@ static void test_integrated_kshira_architecture(void) {
     assert(det_model_architecture(model) == DET_ARCH_KSHIRA);
     assert(det_model_precision(model) == DET_PRECISION_F32);
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    config.momentum = 0.5f;
+    assert(det_train(model, &dataset, &config, &report) == DET_ERR_UNSUPPORTED);
+    config.momentum = 0.0f;
     assert(report.samples_seen == 1U && report.updates == 2U &&
            !report.used_global_backward && isfinite(report.mean_loss));
     assert(det_predict(model, &storage.sample.image, 0.0f, detections, 8,
@@ -1022,8 +1032,45 @@ static void test_integrated_kshira_architecture(void) {
     assert(det_predict(model, &storage.sample.image, 0.0f, detections, 8,
                        &count) == DET_OK);
     assert(count >= 0 && count <= 8);
-    assert(det_save(model, "det_kshira_unsupported.bin") == DET_ERR_UNSUPPORTED);
+    assert(det_save(model, path) == DET_OK);
+    assert(write_truncated_copy(path, truncated_path));
+    assert(det_load(ctx, truncated_path, &corrupt) == DET_ERR_FORMAT &&
+           corrupt == NULL);
+    (void)remove(truncated_path);
+    assert(det_load(ctx, path, &loaded) == DET_OK);
+    assert(det_model_architecture(loaded) == DET_ARCH_KSHIRA &&
+           det_model_precision(loaded) == DET_PRECISION_INT4);
+    assert(det_predict(loaded, &storage.sample.image, 0.0f, loaded_detections, 8,
+                       &loaded_count) == DET_OK);
+    assert(count == loaded_count);
+    for (int i = 0; i < count; ++i) {
+        assert(memcmp(&detections[i], &loaded_detections[i],
+                      sizeof(detections[i])) == 0);
+    }
+    assert(det_train(model, &dataset, &config, &report) == DET_OK);
+    assert(det_train(loaded, &dataset, &config, &report) == DET_OK);
+    assert(det_save(model, path) == DET_OK);
+    assert(det_save(loaded, continued_path) == DET_OK);
+    assert(files_equal(path, continued_path));
+    {
+        FILE *file = fopen(path, "r+b");
+        int byte;
+        assert(file != NULL && fseek(file, -1L, SEEK_END) == 0);
+        byte = fgetc(file);
+        assert(byte != EOF && fseek(file, -1L, SEEK_END) == 0);
+        assert(fputc(byte ^ 0xff, file) != EOF && fclose(file) == 0);
+    }
+    assert(det_load(ctx, path, &corrupt) == DET_ERR_FORMAT && corrupt == NULL);
+    (void)remove(path);
+    (void)remove(continued_path);
+    det_model_destroy(loaded);
+    loaded = NULL;
     assert(det_model_reset(model, 23) == DET_OK);
+    assert(det_save(model, path) == DET_OK);
+    assert(det_load(ctx, path, &loaded) == DET_OK);
+    det_model_destroy(loaded);
+    loaded = NULL;
+    (void)remove(path);
     storage.sample.box_count = 0;
     config = (det_train_config){DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1,
                                 1.0e-4f, 0.0f, 0.1f, 1, 23, 0};

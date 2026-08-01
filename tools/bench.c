@@ -80,9 +80,17 @@ static int parse_precision(const char *value, det_precision *out) {
     if (value == NULL || out == NULL) return 0;
     if (strcmp(value, "f32") == 0) *out = DET_PRECISION_F32;
     else if (strcmp(value, "int8") == 0) *out = DET_PRECISION_INT8;
-    else if (strcmp(value, "w4a8") == 0 || strcmp(value, "int4") == 0) {
-        *out = DET_PRECISION_W4A8;
-    } else return 0;
+    else if (strcmp(value, "w4a8") == 0) *out = DET_PRECISION_W4A8;
+    else if (strcmp(value, "int4") == 0) *out = DET_PRECISION_INT4;
+    else return 0;
+    return 1;
+}
+
+static int parse_architecture(const char *value, det_architecture *out) {
+    if (value == NULL || out == NULL) return 0;
+    if (strcmp(value, "cdet") == 0) *out = DET_ARCH_CDET;
+    else if (strcmp(value, "kshira") == 0) *out = DET_ARCH_KSHIRA;
+    else return 0;
     return 1;
 }
 
@@ -134,6 +142,7 @@ int main(int argc, char **argv) {
     const char *manifest_path = NULL;
     const char *eval_manifest_path = NULL;
     det_precision precision = DET_PRECISION_F32;
+    det_architecture architecture = DET_ARCH_CDET;
     float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--samples") == 0) {
@@ -156,7 +165,13 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--precision") == 0) {
             if (i + 1 >= argc || !parse_precision(argv[++i], &precision)) {
-                fprintf(stderr, "precision must be f32, int8, or w4a8\n");
+                fprintf(stderr, "precision must be f32, int8, w4a8, or int4\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--architecture") == 0) {
+            if (i + 1 >= argc || !parse_architecture(argv[++i], &architecture)) {
+                fprintf(stderr, "architecture must be cdet or kshira\n");
                 return EXIT_FAILURE;
             }
         }
@@ -190,11 +205,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "width and height must be at least 33\n");
         return EXIT_FAILURE;
     }
+    if ((architecture == DET_ARCH_CDET && precision == DET_PRECISION_INT4) ||
+        (architecture == DET_ARCH_KSHIRA && precision == DET_PRECISION_W4A8) ||
+        (architecture == DET_ARCH_KSHIRA && global)) {
+        fprintf(stderr, "requested architecture/precision/training mode combination is unsupported\n");
+        return EXIT_FAILURE;
+    }
     double e2e_start = wall_now_ms();
     det_context *ctx = NULL;
     det_model *model = NULL;
-    det_model_spec spec = {width, height, 1, 4, 100, 1};
-    det_status status = det_context_create(8U << 20, &ctx);
+    int max_detections = architecture == DET_ARCH_KSHIRA ? 64 : 100;
+    det_model_spec spec = {width, height, 1, 4, max_detections, 1,
+                           architecture, architecture == DET_ARCH_KSHIRA ? 8 : 0};
+    size_t arena_bytes = architecture == DET_ARCH_KSHIRA ? 256U << 10 : 8U << 20;
+    det_status status = det_context_create(arena_bytes, &ctx);
     if (status == DET_OK) status = det_model_build(ctx, &spec, &model);
     if (status != DET_OK) {
         fprintf(stderr, "bench setup failed: %d\n", status);
@@ -228,7 +252,9 @@ int main(int argc, char **argv) {
         dataset = (det_dataset){&storage, next_sample, reset_dataset, (size_t)sample_count};
     }
     det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
-                               DET_PRECISION_F32, 1, 0.01f, 0.8f, 0.1f,
+                               architecture == DET_ARCH_KSHIRA ? precision : DET_PRECISION_F32,
+                               1, 0.01f,
+                               architecture == DET_ARCH_KSHIRA ? 0.0f : 0.8f, 0.1f,
                                sample_count, 1, 1};
     det_train_report report;
     double core_start = wall_now_ms();
@@ -344,11 +370,14 @@ int main(int argc, char **argv) {
     }
     det_model_destroy(loaded);
     const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
-                                 (precision == DET_PRECISION_W4A8 ? "W4A8" : "F32");
-    printf("samples=%zu input=%dx%d source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
+                                 (precision == DET_PRECISION_W4A8 ? "W4A8" :
+                                  (precision == DET_PRECISION_INT4 ? "INT4" : "F32"));
+    const char *architecture_name = architecture == DET_ARCH_KSHIRA ? "KSHIRA" : "CDET";
+    printf("samples=%zu input=%dx%d architecture=%s source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           report.samples_seen, width, height, manifest_path == NULL ? "synthetic" : "manifest",
+           report.samples_seen, width, height, architecture_name,
+           manifest_path == NULL ? "synthetic" : "manifest",
            global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name, threshold,
            manifest_path == NULL ? "train_core_ms" : "train_plus_decode_ms",
            train_core_ms, manifest_path == NULL ? "synthetic_e2e_ms" : "train_e2e_ms",

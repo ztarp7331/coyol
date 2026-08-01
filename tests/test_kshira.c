@@ -534,6 +534,62 @@ static void test_proxy_metrics(void) {
     }
 }
 
+static void test_rad_state_roundtrip(void) {
+    unsigned char first_memory[64U << 10];
+    unsigned char second_memory[64U << 10];
+    unsigned char state[4096];
+    float pixels[32 * 32] = {0.0f};
+    kshira_arena first_arena;
+    kshira_arena second_arena;
+    kshira_rad_model *first = NULL;
+    kshira_rad_model *second = NULL;
+    kshira_rad_spec spec = {32, 32, 1, 2, 4, 4, 55, 1};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_box target = {8.0f, 8.0f, 20.0f, 20.0f, 1};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_INT8, KSHIRA_UPDATE_FULL, NULL, 1.0e-4f
+    };
+    kshira_rad_detection first_detections[4];
+    kshira_rad_detection second_detections[4];
+    float loss = 0.0f;
+    size_t written = 0U;
+    int first_count = 0;
+    int second_count = 0;
+    for (int y = 8; y < 20; ++y) {
+        for (int x = 8; x < 20; ++x) pixels[y * 32 + x] = 0.75f;
+    }
+    assert(kshira_arena_init(&first_arena, first_memory, sizeof(first_memory)) == KSHIRA_OK);
+    assert(kshira_arena_init(&second_arena, second_memory, sizeof(second_memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&first_arena, &spec, &first) == KSHIRA_OK);
+    assert(kshira_rad_build(&second_arena, &spec, &second) == KSHIRA_OK);
+    assert(kshira_rad_train_step(first, &image, &target, &config, &loss) == KSHIRA_OK);
+    assert(kshira_rad_state_bytes(first) > 0U &&
+           kshira_rad_state_bytes(first) <= sizeof(state));
+    assert(kshira_rad_export_state(first, state, 1U, &written) == KSHIRA_ERR_MEMORY &&
+           written == 0U);
+    assert(kshira_rad_export_state(first, state, sizeof(state), &written) == KSHIRA_OK &&
+           written == kshira_rad_state_bytes(first));
+    assert(kshira_rad_import_state(second, state, written) == KSHIRA_OK);
+    assert(kshira_rad_predict(first, &image, 0.0f, first_detections, 4,
+                              &first_count) == KSHIRA_OK);
+    assert(kshira_rad_predict(second, &image, 0.0f, second_detections, 4,
+                              &second_count) == KSHIRA_OK);
+    assert(first_count == second_count);
+    for (int i = 0; i < first_count; ++i) {
+        assert(memcmp(&first_detections[i], &second_detections[i],
+                      sizeof(first_detections[i])) == 0);
+    }
+    state[0] ^= 0xffU;
+    assert(kshira_rad_import_state(second, state, written) == KSHIRA_ERR_RANGE);
+    assert(kshira_rad_predict(second, &image, 0.0f, second_detections, 4,
+                              &second_count) == KSHIRA_OK);
+    assert(first_count == second_count);
+    for (int i = 0; i < first_count; ++i) {
+        assert(memcmp(&first_detections[i], &second_detections[i],
+                      sizeof(first_detections[i])) == 0);
+    }
+}
+
 int main(void) {
     test_arena();
     test_quant();
@@ -544,6 +600,7 @@ int main(void) {
     test_multiscale_session();
     test_domain_curriculum();
     test_proxy_metrics();
+    test_rad_state_roundtrip();
     puts("all kshira tests passed");
     return 0;
 }

@@ -2,68 +2,14 @@
  * Ownership: the model and every buffer live in the caller's KSHIRA arena.
  * Failure: invalid specs, exhausted arena, malformed images, or output capacity
  * return explicit status; prediction performs no allocation and no NMS. */
-#include "kshira/rad.h"
+#include "kshira_rad_internal.h"
 
 #include <math.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
-enum { RAD_BRANCHES = 3, RAD_SCALES = 3, RAD_KERNEL = 3, RAD_STRIDE = 4,
-       RAD_MAX_CLASSES = 80 };
 static const float RAD_QAS_GRADIENT_LIMIT = 1.0f;
-
-typedef struct {
-    float *project_weights;
-    float *project_bias;
-    float *branch_weights[RAD_BRANCHES];
-    float *branch_bias[RAD_BRANCHES];
-    float *stem_weights;
-    float *stem_bias;
-} rad_encoder_delta_buffer;
-
-typedef struct {
-    float *weights;
-    float *bias;
-} rad_head_delta_buffer;
-
-struct kshira_rad_model {
-    kshira_rad_spec spec;
-    kshira_arena *arena;
-    kshira_bit_mode bits;
-    int map_height;
-    int map_width;
-    int outputs;
-    size_t parameter_bytes;
-    size_t activation_bytes;
-    float *stem_weights;
-    float *stem_bias;
-    float *branch_weights[RAD_BRANCHES];
-    float *branch_bias[RAD_BRANCHES];
-    float *project_weights;
-    float *project_bias;
-    float *head_weights;
-    float *head_bias;
-    float *scale_head_weights[RAD_SCALES];
-    float *scale_head_bias[RAD_SCALES];
-    rad_head_delta_buffer *scale_head_deltas;
-    /* Both descriptors overlay the one update workspace allocated below. */
-    rad_encoder_delta_buffer encoder_delta_storage;
-    rad_head_delta_buffer scale_head_delta_storage;
-    int scale_heads_ready;
-    int scale_head_trained_mask;
-    float *stem;
-    float *branches[RAD_BRANCHES];
-    float *fused;
-    rad_encoder_delta_buffer *encoder_deltas;
-    float calibration_input_scale;
-    float calibration_stem_scale;
-    float calibration_branch_scale[RAD_BRANCHES];
-    size_t calibration_samples;
-    float transient_image_scale;
-    float transient_stem_scale;
-    int transient_scales_valid;
-};
 
 static int valid_spec(const kshira_rad_spec *spec) {
     return spec != NULL && spec->width >= 8 && spec->height >= 8 &&
@@ -1269,6 +1215,7 @@ fail:
 kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
     uint32_t state;
     if (model == NULL) return KSHIRA_ERR_ARGUMENT;
+    model->spec.seed = seed;
     state = (uint32_t)seed + 0x9e3779b9U;
     fill_random(model->stem_weights, (size_t)model->spec.feature_channels *
                 (size_t)model->spec.channels * 9U, &state, 0.05f);

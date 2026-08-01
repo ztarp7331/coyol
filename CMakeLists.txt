@@ -13,6 +13,7 @@ add_library(kshira STATIC
   src/kshira_sparse.c
   src/kshira_phase.c
   src/kshira_rad.c
+  src/kshira_rad_state.c
   src/kshira_session.c
   src/kshira_domain.c
   src/kshira_eval.c

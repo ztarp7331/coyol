@@ -449,6 +449,7 @@ det_status det_train(det_model *model, const det_dataset *dataset,
         return DET_ERR_ARGUMENT;
     }
     if (model->architecture == DET_ARCH_KSHIRA) {
+        if (config->momentum != 0.0f) return DET_ERR_UNSUPPORTED;
         return det_kshira_train(model, dataset, config, report);
     }
     if (config->mode == DET_TRAIN_ODT || config->precision == DET_PRECISION_INT4) {

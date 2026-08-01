@@ -158,9 +158,24 @@ integration contract is:
   reset, train, precision, prediction, evaluation, and dataset contracts.
   F32 local training, INT8 full-encoder training, and INT4 multi-scale ODT now
   share that API, and multiple KSHIRA models can coexist under one context
-  without aliasing state. KSHIRA model serialization is still explicitly
-  unsupported, zero-box negative learning and its GLOBAL_BP reference remain
-  open, and CDET W4A8 is kept distinct from KSHIRA W4A4/INT4 semantics.
+  without aliasing state. CDET W4A8 is kept distinct from KSHIRA W4A4/INT4
+  semantics. KSHIRA currently rejects nonzero momentum, zero-box negative
+  learning, and GLOBAL_BP instead of silently approximating those contracts.
+- M18 completes the first shared-runtime checkpoint path. KSHIRA models use a
+  pointer-free version-9 payload with CRC32 and exact-length validation; it
+  preserves RAD parameters, P4/P5 heads, calibration, sparse-channel mask,
+  precision, phase state, and update counters. Save/load produces identical
+  detections, deterministic continued training produces identical checkpoints,
+  and CRC-invalid or CRC-valid truncated files fail closed. The version-8 CDET
+  loader remains backward compatible. `det_bench --architecture kshira` now
+  drives the same synthetic or raw-manifest workflow in F32, INT8, and INT4.
+  On the current WSL CPU, two Release checks over 5,000 in-memory 160 x 160
+  samples measured 240.244--337.097 ms F32, 639.539--802.958 ms INT8, and
+  610.714--777.428 ms INT4 through model serialization; average loaded-model
+  inference measured 0.671--0.840, 6.869--8.726, and 7.994--9.916 ms
+  respectively. These pass the synthetic edge timing gate over 5,000 generated
+  moving-box samples, but they do not decode 5,000 image files and are not a
+  raw-dataset, accuracy, COCO, FPGA, or power claim.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
@@ -236,13 +251,14 @@ Two training times must be published:
 1. `train_core_ms`: prepared low-resolution tensors through final learned
    weights and model serialization;
 2. `train_e2e_ms`: raw files, decoding, resizing, labels, training, and model
-   serialization. The current synthetic benchmark reports this boundary as
-   `synthetic_e2e_ms` until a raw-file adapter is present.
+   serialization. An in-memory run reports its broader setup boundary as
+   `synthetic_e2e_ms`; a manifest run reports the raw boundary as
+   `train_e2e_ms`.
 
 Both target one second. Separating them is diagnostic, not an exclusion:
-`train_e2e_ms` will be the complete user-visible result once raw input exists,
-while `train_core_ms` identifies whether the bottleneck is learning or input
-I/O. Until then, `synthetic_e2e_ms` is explicitly not a raw-input claim.
+`train_e2e_ms` is the user-visible raw-input result, while `train_core_ms`
+identifies whether the bottleneck is learning or input I/O. A
+`synthetic_e2e_ms` result is explicitly not a raw-input claim.
 The raw boundary now has a small dependency-free adapter: `det_manifest_open`
 streams P2/P3/P5/P6 PNM files from a manifest, performs nearest-neighbor resize,
 converts 1/3-channel input to the model layout, and scales box coordinates. The
@@ -440,7 +456,8 @@ before adding the planned neck:
 - tiny-object assignment protection;
 - BCE classification loss;
 - IoU plus normalized L1 box loss;
-- SGD with momentum as the first optimizer.
+- SGD with momentum as the first CDET optimizer; KSHIRA currently exposes
+  direct SGD only and rejects nonzero momentum.
 
 Training preserves weights by default so a loaded model can resume. Set the
 public `reset_weights` flag for a deterministic fresh run; the benchmark and
@@ -544,10 +561,11 @@ Runtime dependencies are intentionally narrow:
 
 Validated precision profiles:
 
-- `F32` for reference training;
-- `Q8` for INT8 weights and activations;
-- `W4A8` for packed signed INT4 middle-layer weights and INT8 activations;
-- W4A4 remains experimental until W4A8 passes accuracy gates.
+- CDET: `F32` reference training, `Q8` INT8 weights/activations, and `W4A8`
+  packed signed INT4 middle-layer weights with INT8 activations;
+- KSHIRA: `F32`, symmetric `INT8`, and symmetric `INT4` weight/activation
+  execution with quantization-aware local updates. KSHIRA accuracy remains an
+  experimental gate even though all three runtime modes are executable.
 
 Use per-output-channel symmetric weight scales, per-tensor activation scales,
 INT32 accumulation, and integer multiplier-plus-shift requantization. Precision
@@ -564,6 +582,14 @@ work, not silently assumed properties.
 The loader validates the fixed header and exact payload length before its CRC
 buffer allocation. A separate device-memory budget check remains required
 before accepting very large edge-hosted dimensions.
+
+Integrated KSHIRA checkpoints use the same `CDET` magic with version 9 and an
+architecture tag. Their deterministic pointer-free payload includes the phase
+driver, channel mask, calibration state, base and optional scale heads, and all
+persistent RAD weights. CRC32 and exact-length checks cover the full payload.
+Like version 8, version 9 is currently native-endian/native-float and direct
+file replacement is not atomic; portable encoding and atomic save remain
+explicit hardening work.
 
 ## 4. Implementation phases
 
