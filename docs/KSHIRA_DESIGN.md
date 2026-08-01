@@ -28,7 +28,7 @@ changing the baseline's accuracy and timing claims.
   box per sample. The local training path computes only the nine-by-nine map
   tile needed by the largest dilation. On the development WSL host, the
   160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
-  latest three WSL runs with all encoder channels enabled and 258,349 bytes
+  latest three WSL runs with all encoder channels enabled and 258,365 bytes
   high-water inside a 256 KiB arena; host load and ASAN affect timing.
   The image buffer is caller-owned outside that arena (102,400 bytes for this
   harness), and the timer is a host diagnostic rather than an energy meter.
@@ -45,12 +45,12 @@ changing the baseline's accuracy and timing claims.
   release run reports FP32 IoU 0.311, INT8 IoU 0.475, and INT4 IoU 0.435, with
   quantized loss ratios 0.426 and 0.509; the plain ASAN harness also completes.
   These are synthetic proxy results, not COCO accuracy or board-power claims.
-- The current scalar full-encoder quantized profile measured 1.24--1.35 s for
-  5,000 training samples, plus 4.9--8.3 ms representative calibration and
-  1.03--1.09 s held-out evaluation across recent Release runs on the
-  development WSL host. This passes the recovery gate but not the sub-second
-  quantized edge timing gate; the next milestone targets kernel/layout
-  optimization.
+- Reusing the per-step input and stem-tile scales removes duplicate full-image
+  scans from the scalar full-encoder path. Recent Release runs now measure
+  0.92--1.08 s for 5,000 quantized training samples, plus 5.1--7.0 ms
+  representative calibration and about 1.06--1.07 s held-out evaluation on
+  the development WSL host. This nearly reaches, but does not yet pass, the
+  sub-second quantized edge timing gate; kernel/layout work remains.
 
 All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

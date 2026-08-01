@@ -77,7 +77,7 @@ contract is:
   boxes and caller-owned image storage. The 160 x 160, 5,000-sample Release
   harness (500 samples/domain) trains the FP32 local receptive-field path in
   315--359 ms across the latest three Release WSL runs with all encoder channels
-  enabled, and 258,349-byte high-water under the 256 KiB arena. Host load affects
+  enabled, and 258,365-byte high-water under the 256 KiB arena. Host load affects
   the timing; this is a synthetic throughput gate, not an accuracy, board-power,
   or real-dataset claim.
 - `kshira_eval` adds allocation-free IoU and class-hit accumulation for
@@ -86,9 +86,10 @@ contract is:
   then evaluates held-out samples at a 0.25 threshold. The latest Release run
   measured FP32/INT8/INT4 proxy IoU of 0.311/0.475/0.435 and quantized loss
   ratios of 0.426/0.509; the plain ASAN harness completes as well. Quantized
-  full-encoder training measured 1.24--1.35 s for 5,000 samples, with
-  4.9--8.3 ms calibration and 1.03--1.09 s held-out evaluation, so the
-  recovery gate is passed but the sub-second edge timing gate remains open. These are
+  full-encoder training now measures 0.92--1.08 s for 5,000 samples after
+  per-step scale reuse, with 5.1--7.0 ms calibration and 1.06--1.07 s
+  held-out evaluation. The recovery gate is passed and the sub-second edge
+  timing gate is close but still open. These are
   synthetic recovery gates; they are not COCO accuracy, FPGA timing, or 1 W
   measurements.
 

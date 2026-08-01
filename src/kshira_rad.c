@@ -36,6 +36,9 @@ struct kshira_rad_model {
     float calibration_stem_scale;
     float calibration_branch_scale[RAD_BRANCHES];
     size_t calibration_samples;
+    float transient_image_scale;
+    float transient_stem_scale;
+    int transient_scales_valid;
 };
 
 static int valid_spec(const kshira_rad_spec *spec) {
@@ -136,6 +139,12 @@ static void clear_calibration(kshira_rad_model *model) {
         model->calibration_branch_scale[branch] = 1.0f;
     }
     model->calibration_samples = 0U;
+}
+
+static void clear_transient_scales(kshira_rad_model *model) {
+    model->transient_image_scale = 1.0f;
+    model->transient_stem_scale = 1.0f;
+    model->transient_scales_valid = 0;
 }
 
 static float quantized_dot(const float *weights, const float *values, size_t count,
@@ -393,10 +402,11 @@ static float quant_scale_region(const float *values, int channels, int height, i
     return kshira_symmetric_scale(maximum, bits);
 }
 
-static void conv_stem_target(const kshira_rad_model *model, const kshira_image_f32 *image,
+static void conv_stem_target(kshira_rad_model *model, const kshira_image_f32 *image,
                              int target_y, int target_x) {
     int c = model->spec.feature_channels;
     int y0, y1, x0, x1;
+    model->transient_scales_valid = 0;
     target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = y0; y < y1; ++y) {
@@ -426,7 +436,7 @@ static void conv_stem_target(const kshira_rad_model *model, const kshira_image_f
     }
 }
 
-static void conv_stem_target_quant(const kshira_rad_model *model,
+static void conv_stem_target_quant(kshira_rad_model *model,
                                    const kshira_image_f32 *image,
                                    int target_y, int target_x) {
     int c = model->spec.feature_channels;
@@ -438,6 +448,8 @@ static void conv_stem_target_quant(const kshira_rad_model *model,
     float input_scale = calibrated_or_dynamic(model->calibration_input_scale, image->data,
                                               image_count, model->bits,
                                               model->calibration_samples);
+    model->transient_image_scale = input_scale;
+    model->transient_scales_valid = 1;
     target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = y0; y < y1; ++y) {
@@ -468,6 +480,11 @@ static void conv_stem_target_quant(const kshira_rad_model *model,
                          model->stem_bias[oc]);
             }
         }
+    }
+    if (model->calibration_samples == 0U) {
+        model->transient_stem_scale = quant_scale_region(
+            model->stem, c, model->map_height, model->map_width, y0, y1, x0, x1,
+            model->bits);
     }
 }
 
@@ -505,6 +522,8 @@ static void depthwise_branch_target_quant(const kshira_rad_model *model, int bra
     float input_scale;
     if (model->calibration_samples > 0U) {
         input_scale = model->calibration_stem_scale;
+    } else if (model->transient_scales_valid) {
+        input_scale = model->transient_stem_scale;
     } else {
         target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
         input_scale = quant_scale_region(model->stem, c, model->map_height,
@@ -694,12 +713,15 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
             model->project_weights, (size_t)c * (size_t)c, model->bits);
         stem_weight_scale = quant_scale_values(
             model->stem_weights, (size_t)c * (size_t)image->channels * 9U, model->bits);
-        image_scale = calibrated_or_dynamic(
-            model->calibration_input_scale, image->data,
-            (size_t)image->channels * (size_t)image->height * (size_t)image->width,
-            model->bits, model->calibration_samples);
+        image_scale = model->calibration_samples > 0U ? model->calibration_input_scale :
+            (model->transient_scales_valid ? model->transient_image_scale :
+             quant_scale_values(image->data,
+                                (size_t)image->channels * (size_t)image->height *
+                                (size_t)image->width, model->bits));
         if (model->calibration_samples > 0U) {
             stem_input_scale = model->calibration_stem_scale;
+        } else if (model->transient_scales_valid) {
+            stem_input_scale = model->transient_stem_scale;
         } else {
             int y0, y1, x0, x1;
             target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
@@ -1072,6 +1094,7 @@ kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
                 (size_t)model->spec.feature_channels, &state, 0.05f);
     fill_zero(model->head_bias, (size_t)model->outputs);
     clear_calibration(model);
+    clear_transient_scales(model);
     return KSHIRA_OK;
 }
 
