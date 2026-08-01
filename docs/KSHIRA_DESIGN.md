@@ -51,6 +51,8 @@ changing the baseline's accuracy and timing claims.
   representative calibration and about 1.06--1.07 s held-out evaluation on
   the development WSL host. This nearly reaches, but does not yet pass, the
   sub-second quantized edge timing gate; kernel/layout work remains.
+- `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
+  `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
 
 All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

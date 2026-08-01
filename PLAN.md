@@ -91,7 +91,9 @@ contract is:
   held-out evaluation. The recovery gate is passed and the sub-second edge
   timing gate is close but still open. These are
   synthetic recovery gates; they are not COCO accuracy, FPGA timing, or 1 W
-  measurements.
+  measurements. The harness now emits per-mode `train_gate` status,
+  aggregate INT8/INT4 `edge_train_gate`, and per-image evaluation latency so
+  host jitter cannot be mistaken for a completed timing gate.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
