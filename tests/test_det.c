@@ -546,9 +546,18 @@ static void test_math(void) {
 static void test_train_predict_roundtrip(void) {
     det_context *ctx = NULL;
     det_model *model = NULL;
+    det_memory_report memory;
     det_model_spec spec = {32, 32, 1, 1, 16, 7};
     assert(det_context_create(1U << 20, &ctx) == DET_OK);
     assert(det_model_build(ctx, &spec, &model) == DET_OK);
+    assert(det_model_memory(NULL, &memory) == DET_ERR_ARGUMENT);
+    assert(det_model_memory(model, NULL) == DET_ERR_ARGUMENT);
+    assert(det_model_memory(model, &memory) == DET_OK);
+    assert(memory.parameter_bytes > 0U && memory.optimizer_bytes > 0U &&
+           memory.quant_cache_bytes > 0U &&
+           memory.activation_workspace_bytes > 0U &&
+           memory.arena_high_water_bytes == 0U &&
+           memory.arena_capacity_bytes == 0U);
 
     float image_data[32 * 32];
     for (size_t i = 0; i < sizeof(image_data) / sizeof(image_data[0]); ++i) image_data[i] = 0.0f;
@@ -993,6 +1002,7 @@ static void test_integrated_kshira_architecture(void) {
     det_train_config config = {DET_TRAIN_LOCAL_FAST, DET_PRECISION_F32, 1,
                                1.0e-4f, 0.0f, 0.1f, 1, 17, 1};
     det_train_report report;
+    det_memory_report memory;
     det_detection detections[8];
     det_detection loaded_detections[8];
     int count = 0;
@@ -1008,6 +1018,14 @@ static void test_integrated_kshira_architecture(void) {
     assert(det_model_build(ctx, &spec, &peer) == DET_OK);
     assert(det_model_architecture(model) == DET_ARCH_KSHIRA);
     assert(det_model_precision(model) == DET_PRECISION_F32);
+    assert(det_model_memory(model, &memory) == DET_OK);
+    assert(memory.parameter_bytes > 0U && memory.optimizer_bytes == 0U &&
+           memory.quant_cache_bytes == 0U &&
+           memory.activation_workspace_bytes > 0U &&
+           memory.arena_high_water_bytes >=
+               memory.parameter_bytes + memory.activation_workspace_bytes &&
+           memory.arena_high_water_bytes <= memory.arena_capacity_bytes &&
+           memory.arena_capacity_bytes == (64U << 10));
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
     config.momentum = 0.5f;
     assert(det_train(model, &dataset, &config, &report) == DET_ERR_UNSUPPORTED);
@@ -1083,6 +1101,33 @@ static void test_integrated_kshira_architecture(void) {
     det_context_destroy(ctx);
 }
 
+static void test_kshira_resource_profiles(void) {
+    det_context *edge_ctx = NULL;
+    det_context *wide_ctx = NULL;
+    det_model *model = NULL;
+    det_memory_report memory;
+    det_model_spec spec = {160, 160, 1, 80, 64, 1,
+                           DET_ARCH_KSHIRA, 8};
+    assert(det_context_create(256U << 10, &edge_ctx) == DET_OK);
+    assert(det_model_build(edge_ctx, &spec, &model) == DET_ERR_MEMORY &&
+           model == NULL);
+    spec.feature_channels = 4;
+    assert(det_model_build(edge_ctx, &spec, &model) == DET_OK);
+    assert(det_model_memory(model, &memory) == DET_OK &&
+           memory.arena_high_water_bytes <= (256U << 10));
+    det_model_destroy(model);
+    model = NULL;
+    assert(det_context_create(272U << 10, &wide_ctx) == DET_OK);
+    spec.feature_channels = 8;
+    assert(det_model_build(wide_ctx, &spec, &model) == DET_OK);
+    assert(det_model_memory(model, &memory) == DET_OK &&
+           memory.arena_high_water_bytes > (256U << 10) &&
+           memory.arena_high_water_bytes <= (272U << 10));
+    det_model_destroy(model);
+    det_context_destroy(wide_ctx);
+    det_context_destroy(edge_ctx);
+}
+
 int main(void) {
     test_arena_and_conv();
     test_stride2_padding_parity();
@@ -1094,6 +1139,7 @@ int main(void) {
     test_multi_box_quantization_gate();
     test_streamed_size_class_stress();
     test_integrated_kshira_architecture();
+    test_kshira_resource_profiles();
     puts("all det tests passed");
     return 0;
 }

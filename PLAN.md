@@ -176,6 +176,22 @@ integration contract is:
   respectively. These pass the synthetic edge timing gate over 5,000 generated
   moving-box samples, but they do not decode 5,000 image files and are not a
   raw-dataset, accuracy, COCO, FPGA, or power claim.
+- M19 adds `det_model_memory`, so the shared runtime reports learned parameters,
+  optimizer state, persistent quantization caches, activation/workspace bytes,
+  and bounded-arena high-water/capacity without reaching into KSHIRA internals.
+  The benchmark also reports checkpoint bytes and accepts `--classes`,
+  `--features`, and `--arena-kib`. Automatic stack temporaries and allocator
+  metadata are explicitly outside this report. An 80-class, 8-feature profile
+  requires 270,233 bytes and therefore fails closed at 256 KiB; with a 272 KiB
+  arena, single F32/INT8/INT4 Release runs measured 258.049/681.717/706.914 ms
+  through serialization and 1.052/17.587/18.234 ms inference. The 4-feature
+  edge profile fits the original 256 KiB cap at 135,945 bytes and measured
+  194.601/472.574/478.287 ms through serialization with
+  0.765/8.098/9.038 ms inference. Checkpoints remain FP32-master resumable
+  state (10,945 bytes and 6,017 bytes respectively), not packed deployment
+  artifacts. These are single-run generated-data capacity measurements. F32
+  emitted no prediction above 0.25 while quantized modes filled the 64-entry
+  top-K, so confidence calibration and held-out accuracy are explicitly open.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

@@ -199,3 +199,17 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   7.994--9.916 ms mean inference respectively. They pass the 5,000-sample
   generated-data timing gate only; the 5,000-image raw-input accuracy gate,
   COCO qualification, FPGA lowering, and measured power remain open.
+- M19 adds architecture-neutral `det_model_memory` reporting and shared
+  benchmark controls for class count, KSHIRA feature width, and arena size.
+  Reported fields separate parameters, optimizer state, persistent quantization
+  caches, activation/workspace, arena high-water/capacity, and checkpoint size;
+  compiler stack temporaries and allocator metadata are not included. At 80
+  classes, the 8-feature profile needs 270,233 bytes, fails closed at 256 KiB,
+  and fits at 272 KiB. Its single F32/INT8/INT4 Release measurements were
+  258.049/681.717/706.914 ms through serialization and
+  1.052/17.587/18.234 ms inference. The 4-feature edge profile uses 135,945
+  bytes inside 256 KiB and measured 194.601/472.574/478.287 ms through
+  serialization with 0.765/8.098/9.038 ms inference. The resumable files retain
+  FP32 master parameters, so packed device export remains open. F32 emitted no
+  box above 0.25 while quantized modes filled top-K; these results qualify only
+  class-scale timing/memory, not detector quality or COCO accuracy.

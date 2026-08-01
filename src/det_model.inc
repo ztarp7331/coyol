@@ -451,6 +451,89 @@ det_architecture det_model_architecture(const det_model *model) {
     return model == NULL ? DET_ARCH_CDET : model->architecture;
 }
 
+static int add_memory_bytes(size_t *total, size_t elements,
+                            size_t element_bytes) {
+    size_t bytes;
+    if (total == NULL || element_bytes == 0U ||
+        elements > SIZE_MAX / element_bytes) return 0;
+    bytes = elements * element_bytes;
+    return checked_add_size(*total, bytes, total);
+}
+
+static int add_stage_memory(const det_stage *stage,
+                            det_memory_report *report) {
+    size_t weights = stage_weight_count(stage);
+    size_t biases = (size_t)stage->output_channels;
+    size_t outputs;
+    size_t inputs;
+    if (!checked_size3(stage->output_channels, stage->output_height,
+                       stage->output_width, &outputs) ||
+        !checked_size3(stage->input_channels, stage->input_height,
+                       stage->input_width, &inputs) ||
+        !add_memory_bytes(&report->parameter_bytes, weights + biases,
+                          sizeof(float)) ||
+        !add_memory_bytes(&report->optimizer_bytes, 2U * (weights + biases),
+                          sizeof(float)) ||
+        !add_memory_bytes(&report->quant_cache_bytes, weights,
+                          sizeof(int8_t)) ||
+        !add_memory_bytes(&report->quant_cache_bytes,
+                          stage_packed_weight_count(stage), sizeof(uint8_t)) ||
+        !add_memory_bytes(&report->quant_cache_bytes, biases, sizeof(float)) ||
+        !add_memory_bytes(&report->activation_workspace_bytes,
+                          2U * outputs + inputs, sizeof(float))) return 0;
+    return 1;
+}
+
+static int add_head_memory(const det_head *head,
+                           det_memory_report *report) {
+    size_t weights = (size_t)head->channels * (size_t)head->outputs;
+    size_t biases = (size_t)head->outputs;
+    size_t packed = biases * (((size_t)head->channels + 1U) / 2U);
+    return add_memory_bytes(&report->parameter_bytes, weights + biases,
+                            sizeof(float)) &&
+           add_memory_bytes(&report->optimizer_bytes, weights + biases,
+                            sizeof(float)) &&
+           add_memory_bytes(&report->quant_cache_bytes, weights,
+                            sizeof(int8_t)) &&
+           add_memory_bytes(&report->quant_cache_bytes, packed,
+                            sizeof(uint8_t)) &&
+           add_memory_bytes(&report->quant_cache_bytes, biases, sizeof(float));
+}
+
+det_status det_model_memory(const det_model *model, det_memory_report *report) {
+    if (model == NULL || report == NULL) return DET_ERR_ARGUMENT;
+    memset(report, 0, sizeof(*report));
+    if (model->architecture == DET_ARCH_KSHIRA) {
+        report->parameter_bytes = kshira_rad_parameter_bytes(model->kshira.rad);
+        report->activation_workspace_bytes =
+            kshira_rad_activation_bytes(model->kshira.rad);
+        report->arena_high_water_bytes =
+            kshira_session_arena_high_water(&model->kshira);
+        report->arena_capacity_bytes = model->kshira_memory_bytes;
+        return DET_OK;
+    }
+    for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
+        if (!add_stage_memory(&model->stages[i], report)) return DET_ERR_SHAPE;
+    }
+    for (int i = 0; i < DET_NECK_STAGES; ++i) {
+        size_t elements;
+        if (!add_stage_memory(&model->neck[i], report) ||
+            !checked_size3(model->neck[i].output_channels,
+                           model->neck[i].output_height,
+                           model->neck[i].output_width, &elements) ||
+            !add_memory_bytes(&report->activation_workspace_bytes,
+                              3U * elements, sizeof(float))) return DET_ERR_SHAPE;
+    }
+    for (int i = 0; i < DET_BOTTOMUP_STAGES; ++i) {
+        if (!add_stage_memory(&model->bottomup[i], report)) return DET_ERR_SHAPE;
+    }
+    for (int i = 0; i < DET_MAX_SCALES; ++i) {
+        if (!add_head_memory(&model->heads[i], report) ||
+            !add_head_memory(&model->aux_heads[i], report)) return DET_ERR_SHAPE;
+    }
+    return DET_OK;
+}
+
 void det_model_destroy(det_model *model) {
     if (model == NULL) return;
     if (model->architecture == DET_ARCH_KSHIRA) {

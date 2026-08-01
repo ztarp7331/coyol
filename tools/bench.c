@@ -17,6 +17,7 @@ typedef struct {
     int width;
     int height;
     int channels;
+    int classes;
     size_t total;
     size_t index;
     det_box box;
@@ -41,7 +42,7 @@ static int next_sample(void *user, det_sample *sample) {
     dataset->box.y1 = (float)y0;
     dataset->box.x2 = (float)(x0 + size);
     dataset->box.y2 = (float)(y0 + size);
-    dataset->box.class_id = (int)(dataset->index % 4U);
+    dataset->box.class_id = (int)(dataset->index % (size_t)dataset->classes);
     sample->image.data = dataset->pixels;
     sample->image.channels = dataset->channels;
     sample->image.height = dataset->height;
@@ -134,10 +135,28 @@ static int reserve_model_path(char *path, size_t capacity) {
     return 0;
 }
 
+static int file_size_bytes(const char *path, size_t *out) {
+    FILE *file;
+    long length;
+    if (path == NULL || out == NULL) return 0;
+    file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    if (fseek(file, 0L, SEEK_END) != 0 || (length = ftell(file)) < 0L) {
+        fclose(file);
+        return 0;
+    }
+    *out = (size_t)length;
+    return fclose(file) == 0;
+}
+
 int main(int argc, char **argv) {
     int sample_count = 5000;
     int width = 160;
     int height = 160;
+    int classes = 4;
+    int feature_channels = 8;
+    int arena_kib = 0;
+    int features_set = 0;
     int global = 0;
     const char *manifest_path = NULL;
     const char *eval_manifest_path = NULL;
@@ -160,6 +179,29 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--height") == 0) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &height)) {
                 fprintf(stderr, "height must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--classes") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &classes) ||
+                classes > DET_MAX_CLASSES) {
+                fprintf(stderr, "classes must be an integer from 1 to %d\n",
+                        DET_MAX_CLASSES);
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--features") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &feature_channels) ||
+                feature_channels > 32) {
+                fprintf(stderr, "features must be an integer from 1 to 32\n");
+                return EXIT_FAILURE;
+            }
+            features_set = 1;
+        }
+        else if (strcmp(argv[i], "--arena-kib") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &arena_kib) ||
+                arena_kib > 1048576) {
+                fprintf(stderr, "arena-kib must be an integer from 1 to 1048576\n");
                 return EXIT_FAILURE;
             }
         }
@@ -207,7 +249,8 @@ int main(int argc, char **argv) {
     }
     if ((architecture == DET_ARCH_CDET && precision == DET_PRECISION_INT4) ||
         (architecture == DET_ARCH_KSHIRA && precision == DET_PRECISION_W4A8) ||
-        (architecture == DET_ARCH_KSHIRA && global)) {
+        (architecture == DET_ARCH_KSHIRA && global) ||
+        (architecture == DET_ARCH_CDET && features_set)) {
         fprintf(stderr, "requested architecture/precision/training mode combination is unsupported\n");
         return EXIT_FAILURE;
     }
@@ -215,9 +258,11 @@ int main(int argc, char **argv) {
     det_context *ctx = NULL;
     det_model *model = NULL;
     int max_detections = architecture == DET_ARCH_KSHIRA ? 64 : 100;
-    det_model_spec spec = {width, height, 1, 4, max_detections, 1,
-                           architecture, architecture == DET_ARCH_KSHIRA ? 8 : 0};
-    size_t arena_bytes = architecture == DET_ARCH_KSHIRA ? 256U << 10 : 8U << 20;
+    det_model_spec spec = {width, height, 1, classes, max_detections, 1,
+                           architecture,
+                           architecture == DET_ARCH_KSHIRA ? feature_channels : 0};
+    if (arena_kib == 0) arena_kib = architecture == DET_ARCH_KSHIRA ? 256 : 8192;
+    size_t arena_bytes = (size_t)arena_kib << 10;
     det_status status = det_context_create(arena_bytes, &ctx);
     if (status == DET_OK) status = det_model_build(ctx, &spec, &model);
     if (status != DET_OK) {
@@ -247,7 +292,8 @@ int main(int argc, char **argv) {
             det_context_destroy(ctx);
             return EXIT_FAILURE;
         }
-        storage = (bench_dataset){pixels, width, height, 1, (size_t)sample_count, 0U,
+        storage = (bench_dataset){pixels, width, height, 1, classes,
+                                  (size_t)sample_count, 0U,
                                   {0, 0, 0, 0, 0}};
         dataset = (det_dataset){&storage, next_sample, reset_dataset, (size_t)sample_count};
     }
@@ -276,6 +322,16 @@ int main(int argc, char **argv) {
         det_context_destroy(ctx);
         return EXIT_FAILURE;
     }
+    det_memory_report memory;
+    status = det_model_memory(model, &memory);
+    if (status != DET_OK) {
+        fprintf(stderr, "memory reporting failed: %d\n", status);
+        free(pixels);
+        det_manifest_close(manifest_dataset);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
+    }
     char model_path[128];
     if (!reserve_model_path(model_path, sizeof(model_path))) {
         fprintf(stderr, "could not reserve a unique benchmark model path\n");
@@ -287,10 +343,14 @@ int main(int argc, char **argv) {
     }
     double io_start = wall_now_ms();
     det_model *loaded = NULL;
+    size_t checkpoint_bytes = 0U;
     status = det_save(model, model_path);
     double serialized_at = wall_now_ms();
     double train_core_ms = serialized_at - core_start;
     double synthetic_e2e_ms = serialized_at - e2e_start;
+    if (status == DET_OK && !file_size_bytes(model_path, &checkpoint_bytes)) {
+        status = DET_ERR_IO;
+    }
     if (status == DET_OK) status = det_load(ctx, model_path, &loaded);
     double io_ms = wall_now_ms() - io_start;
     (void)remove(model_path);
@@ -373,10 +433,12 @@ int main(int argc, char **argv) {
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" :
                                   (precision == DET_PRECISION_INT4 ? "INT4" : "F32"));
     const char *architecture_name = architecture == DET_ARCH_KSHIRA ? "KSHIRA" : "CDET";
-    printf("samples=%zu input=%dx%d architecture=%s source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
+    printf("samples=%zu input=%dx%d classes=%d features=%d architecture=%s source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           report.samples_seen, width, height, architecture_name,
+           report.samples_seen, width, height, classes,
+           architecture == DET_ARCH_KSHIRA ? feature_channels : 0,
+           architecture_name,
            manifest_path == NULL ? "synthetic" : "manifest",
            global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name, threshold,
            manifest_path == NULL ? "train_core_ms" : "train_plus_decode_ms",
@@ -385,6 +447,23 @@ int main(int argc, char **argv) {
            report.updates, report.mean_loss,
            train_core_ms > 0.0 ? (double)report.samples_seen * 1000.0 / train_core_ms : 0.0,
            detection_count);
+    printf("parameter_bytes=%zu optimizer_bytes=%zu quant_cache_bytes=%zu "
+           "activation_workspace_bytes=%zu arena_high_water_bytes=%zu "
+           "arena_capacity_bytes=%zu checkpoint_bytes=%zu\n",
+           memory.parameter_bytes, memory.optimizer_bytes,
+           memory.quant_cache_bytes, memory.activation_workspace_bytes,
+           memory.arena_high_water_bytes, memory.arena_capacity_bytes,
+           checkpoint_bytes);
+    printf("reference_profile=%s timing_scope=%s train_under_1s=%s "
+           "infer_under_33ms=%s arena_budget=%s\n",
+           report.samples_seen == 5000U && width == 160 && height == 160 ?
+               "YES" : "NO",
+           manifest_path == NULL ? "synthetic" : "raw_manifest",
+           synthetic_e2e_ms <= 1000.0 ? "PASS" : "FAIL",
+           infer_ms < 33.0 ? "PASS" : "FAIL",
+           memory.arena_capacity_bytes == 0U ? "NA" :
+               (memory.arena_high_water_bytes <= memory.arena_capacity_bytes ?
+                    "PASS" : "FAIL"));
     if (manifest_path != NULL || eval_manifest_path != NULL) {
         printf("eval_samples=%zu eval_ground_truths=%zu eval_predictions=%zu eval_tp=%zu "
                "eval_fp=%zu eval_fn=%zu precision=%.4f recall=%.4f mean_iou=%.4f "

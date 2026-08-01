@@ -101,6 +101,18 @@ typedef struct {
     int used_global_backward;
 } det_train_report;
 
+/* Model-owned payload bytes. Allocator metadata and automatic stack temporaries
+   are intentionally excluded; arena fields expose the bounded KSHIRA region. */
+typedef struct {
+    size_t parameter_bytes;
+    size_t optimizer_bytes;
+    size_t quant_cache_bytes; /* Persistent caches, not on-the-fly quantization. */
+    size_t activation_workspace_bytes;
+    /* Zero for heap-backed profiles; nonzero for bounded-arena profiles. */
+    size_t arena_high_water_bytes;
+    size_t arena_capacity_bytes;
+} det_memory_report;
+
 typedef struct {
     size_t samples_seen;
     size_t ground_truths;
@@ -179,6 +191,7 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
 det_status det_model_set_precision(det_model *model, det_precision precision);
 det_precision det_model_precision(const det_model *model);
 det_architecture det_model_architecture(const det_model *model);
+det_status det_model_memory(const det_model *model, det_memory_report *report);
 void det_model_destroy(det_model *model);
 det_status det_model_reset(det_model *model, int seed);
 
