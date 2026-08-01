@@ -46,11 +46,18 @@ changing the baseline's accuracy and timing claims.
   quantized loss ratios 0.426 and 0.509; the plain ASAN harness also completes.
   These are synthetic proxy results, not COCO accuracy or board-power claims.
 - Reusing the per-step input and stem-tile scales removes duplicate full-image
-  scans from the scalar full-encoder path. Recent Release runs now measure
-  0.92--1.08 s for 5,000 quantized training samples, plus 5.1--7.0 ms
-  representative calibration and about 1.06--1.07 s held-out evaluation on
-  the development WSL host. This nearly reaches, but does not yet pass, the
-  sub-second quantized edge timing gate; kernel/layout work remains.
+  scans from the scalar full-encoder path. M11 adds a transactional encoder
+  delta cache: projection, dilated-branch, and stem deltas are preflighted
+  against one frozen parameter snapshot, then committed only after the whole
+  update is finite. Three consecutive Release runs on the development WSL
+  host measured INT8 0.663--0.675 s and INT4 0.654--0.671 s for 5,000
+  quantized samples; every run reports `edge_train_gate=PASS`. Recent held-out
+  evaluation is about 0.76--0.86 s aggregate (7.6--8.6 ms per image).
+  Instrumented ASAN timing is diagnostic and remains above the strict gate;
+  the Release result is host-specific evidence, not a board or FPGA claim.
+- The delta cache is currently a fixed maximum 12.8 KiB stack scratch object.
+  This is safe for the current host harness, but an arena-backed scratch
+  allocation is required before claiming a small bare-metal stack profile.
 - `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
   `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
 - The balanced domain generator uses an exact zero-fill fast path for its
@@ -102,5 +109,7 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   (harness landed; recovery gate open).
 - M9: persistent full-map activation calibration, quantized class-balance
   updates, and INT4/INT8 proxy recovery (landed on the synthetic gate).
-- M10+: hardware-specific energy data, multi-scale integration, and end-to-end
-  dataset-scale qualification.
+- M11: transactional full-encoder delta cache and a strict Release INT8/INT4
+  sub-second training gate (landed on the synthetic 5,000-sample harness).
+- M12+: arena-backed delta scratch, multi-scale RAD feature integration, and
+  end-to-end dataset-scale qualification.

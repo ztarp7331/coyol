@@ -88,14 +88,19 @@ contract is:
   ratios of 0.426/0.509; the plain ASAN harness completes as well. Quantized
   full-encoder training now measures 0.92--1.08 s for 5,000 samples after
   per-step scale reuse, with 5.1--7.0 ms calibration and 1.06--1.07 s
-  held-out evaluation. The recovery gate is passed and the sub-second edge
-  timing gate is close but still open. These are
-  synthetic recovery gates; they are not COCO accuracy, FPGA timing, or 1 W
-  measurements. The harness now emits per-mode `train_gate` status,
-  aggregate INT8/INT4 `edge_train_gate`, and per-image evaluation latency so
-  host jitter cannot be mistaken for a completed timing gate. Non-noise domain
-  backgrounds use an exact zero-fill fast path; the measured network-bound
-  INT8 gate remains host-variable and is still open.
+  held-out evaluation. M11 adds a transactional encoder delta cache so the
+  full-encoder path preflights all projection, branch, and stem updates before
+  committing them. Three consecutive Release runs measured INT8 0.663--0.675 s
+  and INT4 0.654--0.671 s for 5,000 samples, with `edge_train_gate=PASS` on
+  every run; held-out evaluation is about 0.76--0.86 s aggregate (7.6--8.6 ms
+  per image). ASAN timing remains diagnostic and slower. These are synthetic
+  recovery/timing gates, not COCO accuracy, FPGA timing, or 1 W measurements.
+  The harness emits per-mode `train_gate`, aggregate `edge_train_gate`, and
+  per-image evaluation latency so host jitter cannot be mistaken for a
+  universal guarantee. Non-noise domain backgrounds use an exact zero-fill
+  fast path. The current delta cache is a fixed maximum 12.8 KiB stack scratch
+  object; arena-backed scratch is required for a small bare-metal stack
+  profile.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
