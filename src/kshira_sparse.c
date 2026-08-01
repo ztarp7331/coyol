@@ -74,3 +74,16 @@ size_t kshira_sparse_memory_bytes(size_t activation_bytes, size_t weight_bytes,
     if (activation_bytes > SIZE_MAX - gradient_bytes) return SIZE_MAX;
     return activation_bytes + gradient_bytes;
 }
+
+kshira_status kshira_sparse_plan(kshira_update_mode mode, size_t activation_bytes,
+                                 size_t weight_bytes, size_t bias_bytes,
+                                 size_t channel_count, size_t active_channels,
+                                 size_t arena_cap, size_t *peak_bytes) {
+    size_t estimate;
+    if (peak_bytes == NULL || arena_cap == 0U) return KSHIRA_ERR_ARGUMENT;
+    estimate = kshira_sparse_memory_bytes(activation_bytes, weight_bytes, bias_bytes,
+                                          channel_count, mode, active_channels);
+    if (estimate == SIZE_MAX) return KSHIRA_ERR_RANGE;
+    *peak_bytes = estimate;
+    return estimate <= arena_cap ? KSHIRA_OK : KSHIRA_ERR_MEMORY;
+}

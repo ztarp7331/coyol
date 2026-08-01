@@ -12,8 +12,10 @@ changing the baseline's accuracy and timing claims.
   packed nibbles, explicit INT4-to-INT8 toggle storage, and QAS gradient
   scaling.
 - `kshira_sparse`: channel masks and conservative peak-memory estimates for
-  freeze, bias-only, channel-sparse, and full updates.
-- `kshira_phase`: validation of PRE, TRAIN, and ODT bit/update/QAS contracts.
+  freeze, bias-only, channel-sparse, and full updates, plus arena-cap plan
+  admission.
+- `kshira_phase`: validation and ordered driver transitions for PRE, TRAIN, and
+  ODT bit/update/QAS contracts.
 
 All four modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

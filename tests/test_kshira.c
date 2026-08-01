@@ -102,6 +102,14 @@ static void test_qas_and_sparse(void) {
                                       KSHIRA_UPDATE_CHANNELS, 1U) == 161U);
     assert(kshira_sparse_memory_bytes(0U, SIZE_MAX, 1U, 1U,
                                       KSHIRA_UPDATE_FULL, 1U) == SIZE_MAX);
+    {
+        size_t peak = 0U;
+        assert(kshira_sparse_plan(KSHIRA_UPDATE_CHANNELS, 100U, 401U, 20U, 10U, 1U,
+                                  200U, &peak) == KSHIRA_OK);
+        assert(peak == 161U);
+        assert(kshira_sparse_plan(KSHIRA_UPDATE_FULL, 100U, 401U, 20U, 10U, 10U,
+                                  500U, &peak) == KSHIRA_ERR_MEMORY);
+    }
 }
 
 static void test_phases(void) {
@@ -120,6 +128,20 @@ static void test_phases(void) {
     assert(kshira_phase_validate(&contract) == KSHIRA_ERR_ARGUMENT);
     contract.update_mode = (kshira_update_mode)99;
     assert(kshira_phase_validate(&contract) == KSHIRA_ERR_ARGUMENT);
+    {
+        kshira_phase_driver driver;
+        kshira_phase_contract train = {KSHIRA_PHASE_TRAIN, KSHIRA_BITS_INT8,
+                                       KSHIRA_UPDATE_CHANNELS, 256U << 10, 1};
+        kshira_phase_contract odt = {KSHIRA_PHASE_ODT, KSHIRA_BITS_INT4,
+                                     KSHIRA_UPDATE_CHANNELS, 256U << 10, 1};
+        assert(kshira_phase_driver_init(&driver, 256U << 10) == KSHIRA_OK);
+        assert(kshira_phase_driver_step(&driver) == KSHIRA_OK);
+        assert(kshira_phase_driver_transition(&driver, odt) == KSHIRA_ERR_ARGUMENT);
+        assert(kshira_phase_driver_transition(&driver, train) == KSHIRA_OK);
+        assert(kshira_phase_driver_step(&driver) == KSHIRA_OK);
+        assert(kshira_phase_driver_transition(&driver, odt) == KSHIRA_OK);
+        assert(driver.transitions == 2U && driver.steps == 2U);
+    }
 }
 
 static void test_rad_top_k(void) {

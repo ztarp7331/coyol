@@ -61,6 +61,9 @@ contract is:
   detector. The RAD branch now has real INT8/INT4 forward arithmetic and a
   QAS-scaled sparse head update; the validated multi-scale detector's
   quantized modes remain inference-only until its own update path is wired.
+- KSHIRA phase drivers now enforce the ordered PRE -> TRAIN -> ODT transition,
+  and sparse plans reject conservative peak-memory estimates above the supplied
+  arena cap before a layer schedule is admitted.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

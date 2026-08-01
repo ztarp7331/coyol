@@ -33,6 +33,10 @@ size_t kshira_sparse_mask_active(const kshira_sparse_mask *mask);
 size_t kshira_sparse_memory_bytes(size_t activation_bytes, size_t weight_bytes,
                                   size_t bias_bytes, size_t channel_count,
                                   kshira_update_mode mode, size_t active_channels);
+kshira_status kshira_sparse_plan(kshira_update_mode mode, size_t activation_bytes,
+                                 size_t weight_bytes, size_t bias_bytes,
+                                 size_t channel_count, size_t active_channels,
+                                 size_t arena_cap, size_t *peak_bytes);
 
 #ifdef __cplusplus
 }

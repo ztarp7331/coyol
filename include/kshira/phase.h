@@ -24,8 +24,18 @@ typedef struct {
     int qas_enabled;
 } kshira_phase_contract;
 
+typedef struct {
+    kshira_phase_contract contract;
+    size_t steps;
+    size_t transitions;
+} kshira_phase_driver;
+
 kshira_status kshira_phase_validate(const kshira_phase_contract *contract);
 const char *kshira_phase_name(kshira_phase phase);
+kshira_status kshira_phase_driver_init(kshira_phase_driver *driver, size_t arena_cap);
+kshira_status kshira_phase_driver_transition(kshira_phase_driver *driver,
+                                              kshira_phase_contract next);
+kshira_status kshira_phase_driver_step(kshira_phase_driver *driver);
 
 #ifdef __cplusplus
 }
