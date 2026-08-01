@@ -353,6 +353,288 @@ static void head_forward_quant(const kshira_rad_model *model, const float *featu
     }
 }
 
+static kshira_status encoder_delta(float current, float gradient, float learning_rate,
+                                   float weight_scale, float input_scale, int bias,
+                                   float *delta) {
+    kshira_status status;
+    float updated;
+    if (delta == NULL || !isfinite(current) || !isfinite(gradient) ||
+        !isfinite(learning_rate) || learning_rate <= 0.0f) return KSHIRA_ERR_RANGE;
+    if (bias) {
+        status = kshira_apply_qas(NULL, 0U, &gradient, 1U, weight_scale, input_scale);
+    } else {
+        status = kshira_apply_qas(&gradient, 1U, NULL, 0U, weight_scale, input_scale);
+    }
+    if (status != KSHIRA_OK || !isfinite(gradient)) return KSHIRA_ERR_RANGE;
+    *delta = learning_rate * gradient;
+    updated = current - *delta;
+    return isfinite(*delta) && isfinite(updated) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
+}
+
+/* Apply a single-target straight-through gradient through project, depthwise,
+ * and stem operators. The first pass validates every aggregate update; the
+ * second pass commits the same values, keeping oversized updates transactional. */
+static kshira_status rad_update_encoder(kshira_rad_model *model,
+                                         const kshira_image_f32 *image, int target_x,
+                                         int target_y, const float *fused_gradient,
+                                         const kshira_sparse_mask *channel_mask,
+                                         float learning_rate, int commit) {
+    int c = model->spec.feature_channels;
+    size_t map_count = (size_t)c * (size_t)model->map_height * (size_t)model->map_width;
+    float project_weight_scale = quant_scale_values(
+        model->project_weights, (size_t)c * (size_t)c, model->bits);
+    float branch_weight_scale[RAD_BRANCHES];
+    float stem_weight_scale = quant_scale_values(
+        model->stem_weights, (size_t)c * (size_t)image->channels * 9U, model->bits);
+    float image_scale = quant_scale_values(
+        image->data, (size_t)image->channels * (size_t)image->height *
+                     (size_t)image->width, model->bits);
+    float branch_gradient[RAD_BRANCHES][32] = {{0.0f}};
+    float branch_input_scale = 1.0f;
+
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        branch_weight_scale[branch] = quant_scale_values(
+            model->branch_weights[branch], (size_t)c * 9U, model->bits);
+        {
+            float scale = quant_scale_values(model->branches[branch], map_count, model->bits);
+            if (scale > branch_input_scale) branch_input_scale = scale;
+        }
+    }
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        for (int ic = 0; ic < c; ++ic) {
+            size_t branch_index = rad_index(c, model->map_height, model->map_width,
+                                            ic, target_y, target_x);
+            float gradient = 0.0f;
+            if (model->branches[branch][branch_index] > 0.0f) {
+                for (int oc = 0; oc < c; ++oc) {
+                    size_t fused_index = rad_index(c, model->map_height, model->map_width,
+                                                   oc, target_y, target_x);
+                    if (model->fused[fused_index] > 0.0f) {
+                        gradient += fused_gradient[oc] *
+                                    model->project_weights[(size_t)oc * (size_t)c +
+                                                           (size_t)ic] /
+                                    (float)RAD_BRANCHES;
+                    }
+                }
+            }
+            branch_gradient[branch][ic] = gradient;
+        }
+    }
+
+    /* Project gradients. A mask selects output channels for encoder updates. */
+    for (int oc = 0; oc < c; ++oc) {
+        int enabled = channel_mask == NULL || kshira_sparse_mask_get(channel_mask, (size_t)oc);
+        float fused_index = model->fused[rad_index(c, model->map_height, model->map_width,
+                                                   oc, target_y, target_x)];
+        float fused_grad = fused_index > 0.0f ? fused_gradient[oc] : 0.0f;
+        if (enabled) {
+            float bias_delta;
+            if (encoder_delta(model->project_bias[oc], fused_grad, learning_rate,
+                              project_weight_scale, branch_input_scale, 1,
+                              &bias_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
+            if (commit) model->project_bias[oc] -= bias_delta;
+        }
+        for (int ic = 0; ic < c; ++ic) {
+            float branches = 0.0f;
+            float weight_gradient;
+            float weight_delta;
+            for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+                branches += model->branches[branch][rad_index(
+                    c, model->map_height, model->map_width, ic, target_y, target_x)];
+            }
+            weight_gradient = fused_grad * (branches / (float)RAD_BRANCHES);
+            if (enabled && encoder_delta(model->project_weights[(size_t)oc * (size_t)c +
+                                                                  (size_t)ic],
+                                         weight_gradient, learning_rate,
+                                         project_weight_scale, branch_input_scale, 0,
+                                         &weight_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
+            if (commit && enabled) {
+                model->project_weights[(size_t)oc * (size_t)c + (size_t)ic] -= weight_delta;
+            }
+        }
+    }
+
+    /* Depthwise branch gradients at the target cell. */
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        int dilation = 1 << branch;
+        for (int channel = 0; channel < c; ++channel) {
+            int enabled = channel_mask == NULL ||
+                          kshira_sparse_mask_get(channel_mask, (size_t)channel);
+            size_t branch_index = rad_index(c, model->map_height, model->map_width,
+                                            channel, target_y, target_x);
+            float branch_grad = branch_gradient[branch][channel];
+            if (model->branches[branch][branch_index] <= 0.0f) branch_grad = 0.0f;
+            if (enabled && !commit) {
+                float bias_delta;
+                if (encoder_delta(model->branch_bias[branch][channel], branch_grad,
+                                  learning_rate, branch_weight_scale[branch],
+                                  branch_input_scale, 1, &bias_delta) != KSHIRA_OK) {
+                    return KSHIRA_ERR_RANGE;
+                }
+            }
+            for (int ky = 0; ky < RAD_KERNEL; ++ky) {
+                int iy = target_y + (ky - 1) * dilation;
+                for (int kx = 0; kx < RAD_KERNEL; ++kx) {
+                    int ix = target_x + (kx - 1) * dilation;
+                    float weight_gradient = 0.0f;
+                    float weight_delta;
+                    if (iy >= 0 && iy < model->map_height && ix >= 0 &&
+                        ix < model->map_width) {
+                        weight_gradient = branch_grad * model->stem[
+                            rad_index(c, model->map_height, model->map_width,
+                                      channel, iy, ix)];
+                    }
+                    if (enabled && !commit && encoder_delta(
+                            model->branch_weights[branch][((size_t)channel * RAD_KERNEL +
+                                                            (size_t)ky) * RAD_KERNEL +
+                                                           (size_t)kx],
+                            weight_gradient, learning_rate, branch_weight_scale[branch],
+                            branch_input_scale, 0, &weight_delta) != KSHIRA_OK) {
+                        return KSHIRA_ERR_RANGE;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Stem gradients aggregate all branch receptive-field contributions per
+     * parameter before validation, avoiding partial updates on overlap. */
+    for (int channel = 0; channel < c; ++channel) {
+        int enabled = channel_mask == NULL ||
+                      kshira_sparse_mask_get(channel_mask, (size_t)channel);
+        float bias_gradient = 0.0f;
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            int dilation = 1 << branch;
+            for (int ky = 0; ky < RAD_KERNEL; ++ky) {
+                int iy = target_y + (ky - 1) * dilation;
+                if (iy < 0 || iy >= model->map_height) continue;
+                for (int kx = 0; kx < RAD_KERNEL; ++kx) {
+                    int ix = target_x + (kx - 1) * dilation;
+                    size_t stem_index;
+                    if (ix < 0 || ix >= model->map_width) continue;
+                    stem_index = rad_index(c, model->map_height, model->map_width,
+                                           channel, iy, ix);
+                    if (model->stem[stem_index] > 0.0f) {
+                        bias_gradient += branch_gradient[branch][channel] *
+                                          model->branch_weights[branch][
+                                              ((size_t)channel * RAD_KERNEL + (size_t)ky) *
+                                              RAD_KERNEL + (size_t)kx];
+                    }
+                }
+            }
+        }
+        if (enabled) {
+            float bias_delta;
+            if (encoder_delta(model->stem_bias[channel], bias_gradient, learning_rate,
+                              stem_weight_scale, image_scale, 1, &bias_delta) != KSHIRA_OK) {
+                return KSHIRA_ERR_RANGE;
+            }
+            if (commit) model->stem_bias[channel] -= bias_delta;
+        }
+        for (int input_channel = 0; input_channel < image->channels; ++input_channel) {
+            for (int stem_ky = 0; stem_ky < RAD_KERNEL; ++stem_ky) {
+                for (int stem_kx = 0; stem_kx < RAD_KERNEL; ++stem_kx) {
+                    float weight_gradient = 0.0f;
+                    float weight_delta;
+                    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+                        int dilation = 1 << branch;
+                        for (int branch_ky = 0; branch_ky < RAD_KERNEL; ++branch_ky) {
+                            int map_y = target_y + (branch_ky - 1) * dilation;
+                            if (map_y < 0 || map_y >= model->map_height) continue;
+                            for (int branch_kx = 0; branch_kx < RAD_KERNEL; ++branch_kx) {
+                                int map_x = target_x + (branch_kx - 1) * dilation;
+                                size_t stem_index;
+                                int image_y;
+                                int image_x;
+                                if (map_x < 0 || map_x >= model->map_width) continue;
+                                stem_index = rad_index(c, model->map_height, model->map_width,
+                                                       channel, map_y, map_x);
+                                if (model->stem[stem_index] <= 0.0f) continue;
+                                image_y = map_y * RAD_STRIDE + stem_ky - 1;
+                                image_x = map_x * RAD_STRIDE + stem_kx - 1;
+                                if (image_y < 0 || image_y >= image->height ||
+                                    image_x < 0 || image_x >= image->width) continue;
+                                weight_gradient += branch_gradient[branch][channel] *
+                                    model->branch_weights[branch][
+                                        ((size_t)channel * RAD_KERNEL +
+                                         (size_t)branch_ky) * RAD_KERNEL +
+                                        (size_t)branch_kx] *
+                                    image->data[((size_t)input_channel * (size_t)image->height +
+                                                 (size_t)image_y) * (size_t)image->width +
+                                                (size_t)image_x];
+                            }
+                        }
+                    }
+                    if (enabled && encoder_delta(
+                            model->stem_weights[((size_t)channel * (size_t)image->channels +
+                                                (size_t)input_channel) * RAD_KERNEL * RAD_KERNEL +
+                                               (size_t)stem_ky * RAD_KERNEL +
+                                               (size_t)stem_kx],
+                            weight_gradient, learning_rate, stem_weight_scale, image_scale, 0,
+                            &weight_delta) != KSHIRA_OK) return KSHIRA_ERR_RANGE;
+                    if (commit && enabled) {
+                        model->stem_weights[((size_t)channel * (size_t)image->channels +
+                                             (size_t)input_channel) * RAD_KERNEL * RAD_KERNEL +
+                                            (size_t)stem_ky * RAD_KERNEL + (size_t)stem_kx] -=
+                            weight_delta;
+                    }
+                }
+            }
+        }
+    }
+    if (commit) {
+        /* Branch parameters are committed after stem gradients so the latter
+         * use the same pre-update depthwise weights as the validation pass. */
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            int dilation = 1 << branch;
+            for (int channel = 0; channel < c; ++channel) {
+                int enabled = channel_mask == NULL ||
+                              kshira_sparse_mask_get(channel_mask, (size_t)channel);
+                size_t branch_index = rad_index(c, model->map_height, model->map_width,
+                                                channel, target_y, target_x);
+                float branch_grad = branch_gradient[branch][channel];
+                if (model->branches[branch][branch_index] <= 0.0f) branch_grad = 0.0f;
+                if (!enabled) continue;
+                {
+                    float bias_delta;
+                    if (encoder_delta(model->branch_bias[branch][channel], branch_grad,
+                                      learning_rate, branch_weight_scale[branch],
+                                      branch_input_scale, 1, &bias_delta) != KSHIRA_OK) {
+                        return KSHIRA_ERR_RANGE;
+                    }
+                    model->branch_bias[branch][channel] -= bias_delta;
+                }
+                for (int ky = 0; ky < RAD_KERNEL; ++ky) {
+                    int iy = target_y + (ky - 1) * dilation;
+                    for (int kx = 0; kx < RAD_KERNEL; ++kx) {
+                        int ix = target_x + (kx - 1) * dilation;
+                        float weight_gradient = 0.0f;
+                        float weight_delta;
+                        if (iy >= 0 && iy < model->map_height && ix >= 0 &&
+                            ix < model->map_width) {
+                            weight_gradient = branch_grad * model->stem[
+                                rad_index(c, model->map_height, model->map_width,
+                                          channel, iy, ix)];
+                        }
+                        if (encoder_delta(
+                                model->branch_weights[branch][((size_t)channel * RAD_KERNEL +
+                                                                (size_t)ky) * RAD_KERNEL +
+                                                               (size_t)kx],
+                                weight_gradient, learning_rate, branch_weight_scale[branch],
+                                branch_input_scale, 0, &weight_delta) != KSHIRA_OK) {
+                            return KSHIRA_ERR_RANGE;
+                        }
+                        model->branch_weights[branch][((size_t)channel * RAD_KERNEL +
+                                                       (size_t)ky) * RAD_KERNEL + (size_t)kx] -=
+                            weight_delta;
+                    }
+                }
+            }
+        }
+    }
+    return KSHIRA_OK;
+}
+
 static void insert_top_k(kshira_rad_detection *detections, int *count, int capacity,
                          int limit, const kshira_rad_detection *candidate) {
     int position;
@@ -548,6 +830,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
     float features[32];
     float output[5 + RAD_MAX_CLASSES] = {0.0f};
     float gradients[5 + RAD_MAX_CLASSES];
+    float fused_gradient[32] = {0.0f};
     int target_x;
     int target_y;
     int c;
@@ -629,6 +912,17 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         gradients[o] = gradient;
     }
     if (!isfinite(loss_sum)) return KSHIRA_ERR_RANGE;
+    if (config->update_mode == KSHIRA_UPDATE_FULL) {
+        for (int ic = 0; ic < c; ++ic) {
+            float gradient = 0.0f;
+            for (int o = 0; o < model->outputs; ++o) {
+                gradient += gradients[o] *
+                            model->head_weights[(size_t)o * (size_t)c + (size_t)ic];
+            }
+            if (!isfinite(gradient)) return KSHIRA_ERR_RANGE;
+            fused_gradient[ic] = gradient;
+        }
+    }
     if (config->update_mode != KSHIRA_UPDATE_FREEZE) {
         /* Preflight every update so an oversized learning rate cannot partially
          * mutate the model before returning KSHIRA_ERR_RANGE. */
@@ -658,6 +952,14 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                     updated = model->head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
                     if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
                 }
+            }
+        }
+        if (config->update_mode == KSHIRA_UPDATE_FULL) {
+            if (rad_update_encoder(model, image, target_x, target_y, fused_gradient,
+                                   config->channel_mask, config->learning_rate, 0) != KSHIRA_OK ||
+                rad_update_encoder(model, image, target_x, target_y, fused_gradient,
+                                   config->channel_mask, config->learning_rate, 1) != KSHIRA_OK) {
+                return KSHIRA_ERR_RANGE;
             }
         }
         for (int o = 0; o < model->outputs; ++o) {

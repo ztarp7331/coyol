@@ -68,6 +68,11 @@ contract is:
   gates each train step by the active phase, carries a channel mask, and exposes
   one prediction path. A 16 KiB session fixture covers FP32 PRE, INT8 TRAIN,
   and INT4 ODT transitions under the same arena.
+- `KSHIRA_UPDATE_FULL` now propagates the single-target supervised signal through
+  RAD's projection, depthwise dilated branches, and stem with straight-through
+  quantized updates. Encoder gradients are channel-maskable and preflighted for
+  finite aggregate updates before commit; the session fixture exercises this
+  path with nonzero input data.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

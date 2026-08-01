@@ -42,6 +42,8 @@ typedef struct {
     float quality;
 } kshira_rad_detection;
 
+/* FULL updates the RAD encoder as well as the head; CHANNELS keeps the sparse
+ * channel mask on the head-only path. All updates are caller-arena resident. */
 typedef struct {
     kshira_bit_mode bits;
     kshira_update_mode update_mode;

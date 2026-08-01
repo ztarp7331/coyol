@@ -19,6 +19,10 @@ changing the baseline's accuracy and timing claims.
 - `kshira_session`: caller-owned composition of the arena, RAD model, phase
   driver, and channel mask; the session test runs FP32 PRE, INT8 TRAIN, and
   INT4 ODT without reallocating.
+- Full-update training now uses a straight-through single-target gradient path
+  through projection, depthwise dilated branches, and the stem. Encoder updates
+  honor the sparse channel mask and validate aggregate finite deltas before
+  committing them, including INT8/INT4 modes.
 
 All four modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

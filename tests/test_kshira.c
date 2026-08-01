@@ -246,6 +246,9 @@ static void test_session_contract(void) {
     const kshira_phase_contract *contract;
     float loss = 0.0f;
     int count = 0;
+    for (size_t i = 0U; i < sizeof(pixels) / sizeof(pixels[0]); ++i) {
+        pixels[i] = 0.25f;
+    }
     assert(kshira_session_init(&session, memory, sizeof(memory), &spec) == KSHIRA_OK);
     contract = kshira_session_contract(&session);
     assert(contract != NULL && contract->phase == KSHIRA_PHASE_PRE &&
@@ -257,7 +260,7 @@ static void test_session_contract(void) {
     assert(isfinite(loss) && kshira_session_contract(&session)->phase == KSHIRA_PHASE_PRE);
     assert(kshira_session_set_channel(&session, 0U, 1) == KSHIRA_OK);
     assert(kshira_session_transition(&session, KSHIRA_BITS_INT8,
-                                     KSHIRA_UPDATE_CHANNELS, 1) == KSHIRA_OK);
+                                     KSHIRA_UPDATE_FULL, 1) == KSHIRA_OK);
     assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
     assert(kshira_session_transition(&session, KSHIRA_BITS_INT4,
                                      KSHIRA_UPDATE_CHANNELS, 1) == KSHIRA_OK);
