@@ -2,6 +2,7 @@
 #include "kshira/phase.h"
 #include "kshira/quant.h"
 #include "kshira/rad.h"
+#include "kshira/session.h"
 #include "kshira/sparse.h"
 
 #include <assert.h>
@@ -113,7 +114,7 @@ static void test_qas_and_sparse(void) {
 }
 
 static void test_phases(void) {
-    kshira_phase_contract contract = {KSHIRA_PHASE_PRE, KSHIRA_BITS_INT8,
+    kshira_phase_contract contract = {KSHIRA_PHASE_PRE, KSHIRA_BITS_FLOAT,
                                       KSHIRA_UPDATE_FULL, 256U << 10, 0};
     assert(kshira_phase_validate(&contract) == KSHIRA_OK);
     assert(strcmp(kshira_phase_name(KSHIRA_PHASE_PRE), "PRE") == 0);
@@ -234,12 +235,56 @@ static void test_rad_top_k(void) {
     }
 }
 
+static void test_session_contract(void) {
+    unsigned char memory[16U << 10];
+    float pixels[32 * 32] = {0.0f};
+    kshira_session session;
+    kshira_session_spec spec = {{32, 32, 1, 1, 4, 3, 29}, sizeof(memory)};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_box target = {8.0f, 8.0f, 16.0f, 16.0f, 0};
+    kshira_rad_detection detections[3];
+    const kshira_phase_contract *contract;
+    float loss = 0.0f;
+    int count = 0;
+    assert(kshira_session_init(&session, memory, sizeof(memory), &spec) == KSHIRA_OK);
+    contract = kshira_session_contract(&session);
+    assert(contract != NULL && contract->phase == KSHIRA_PHASE_PRE &&
+           contract->bits == KSHIRA_BITS_FLOAT);
+    assert(kshira_session_step(&session, &image, &target, FLT_MAX, &loss) ==
+           KSHIRA_ERR_RANGE);
+    assert(session.phase.steps == 0U);
+    assert(kshira_session_step(&session, &image, &target, 1.0e-4f, &loss) == KSHIRA_OK);
+    assert(isfinite(loss) && kshira_session_contract(&session)->phase == KSHIRA_PHASE_PRE);
+    assert(kshira_session_set_channel(&session, 0U, 1) == KSHIRA_OK);
+    assert(kshira_session_transition(&session, KSHIRA_BITS_INT8,
+                                     KSHIRA_UPDATE_CHANNELS, 1) == KSHIRA_OK);
+    assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
+    assert(kshira_session_transition(&session, KSHIRA_BITS_INT4,
+                                     KSHIRA_UPDATE_CHANNELS, 1) == KSHIRA_OK);
+    assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
+    assert(kshira_session_predict(&session, &image, 0.0f, detections, 3, &count) == KSHIRA_OK);
+    assert(count >= 0 && count <= 3 && isfinite(loss));
+    assert(kshira_session_arena_high_water(&session) <= sizeof(memory));
+    session.phase.steps = SIZE_MAX;
+    assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_ERR_RANGE);
+
+    {
+        unsigned char bad_memory[4096];
+        kshira_session bad_session;
+        kshira_session_spec bad_spec = {{INT_MAX, 32, 1, 1, 2, 4, 1}, sizeof(bad_memory)};
+        assert(kshira_session_init(&bad_session, bad_memory, sizeof(bad_memory), &bad_spec) ==
+               KSHIRA_ERR_ARGUMENT);
+        assert(bad_session.rad == NULL && kshira_arena_used(&bad_session.arena) == 0U);
+    }
+}
+
 int main(void) {
     test_arena();
     test_quant();
     test_qas_and_sparse();
     test_phases();
     test_rad_top_k();
+    test_session_contract();
     puts("all kshira tests passed");
     return 0;
 }

@@ -5,22 +5,25 @@
 
 kshira_status kshira_phase_validate(const kshira_phase_contract *contract) {
     if (contract == NULL || contract->arena_cap == 0U ||
-        !kshira_bit_mode_valid(contract->bits) ||
+        (contract->bits != KSHIRA_BITS_FLOAT && !kshira_bit_mode_valid(contract->bits)) ||
         contract->update_mode < KSHIRA_UPDATE_FREEZE ||
         contract->update_mode > KSHIRA_UPDATE_FULL ||
         contract->qas_enabled < 0 || contract->qas_enabled > 1) {
         return KSHIRA_ERR_ARGUMENT;
     }
     if (contract->phase == KSHIRA_PHASE_PRE) {
-        if (contract->update_mode == KSHIRA_UPDATE_FREEZE || contract->qas_enabled != 0) {
+        if (contract->bits != KSHIRA_BITS_FLOAT ||
+            contract->update_mode == KSHIRA_UPDATE_FREEZE || contract->qas_enabled != 0) {
             return KSHIRA_ERR_ARGUMENT;
         }
     } else if (contract->phase == KSHIRA_PHASE_TRAIN) {
-        if (contract->update_mode == KSHIRA_UPDATE_FREEZE || contract->qas_enabled == 0) {
+        if (contract->bits == KSHIRA_BITS_FLOAT ||
+            contract->update_mode == KSHIRA_UPDATE_FREEZE || contract->qas_enabled == 0) {
             return KSHIRA_ERR_ARGUMENT;
         }
     } else if (contract->phase == KSHIRA_PHASE_ODT) {
-        if (contract->update_mode == KSHIRA_UPDATE_FULL || contract->qas_enabled == 0) {
+        if (contract->bits == KSHIRA_BITS_FLOAT ||
+            contract->update_mode == KSHIRA_UPDATE_FULL || contract->qas_enabled == 0) {
             return KSHIRA_ERR_ARGUMENT;
         }
     } else return KSHIRA_ERR_ARGUMENT;
@@ -37,7 +40,7 @@ const char *kshira_phase_name(kshira_phase phase) {
 kshira_status kshira_phase_driver_init(kshira_phase_driver *driver, size_t arena_cap) {
     if (driver == NULL || arena_cap == 0U) return KSHIRA_ERR_ARGUMENT;
     driver->contract.phase = KSHIRA_PHASE_PRE;
-    driver->contract.bits = KSHIRA_BITS_INT8;
+    driver->contract.bits = KSHIRA_BITS_FLOAT;
     driver->contract.update_mode = KSHIRA_UPDATE_FULL;
     driver->contract.arena_cap = arena_cap;
     driver->contract.qas_enabled = 0;

@@ -16,6 +16,9 @@ changing the baseline's accuracy and timing claims.
   admission.
 - `kshira_phase`: validation and ordered driver transitions for PRE, TRAIN, and
   ODT bit/update/QAS contracts.
+- `kshira_session`: caller-owned composition of the arena, RAD model, phase
+  driver, and channel mask; the session test runs FP32 PRE, INT8 TRAIN, and
+  INT4 ODT without reallocating.
 
 All four modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /

@@ -13,6 +13,7 @@ add_library(kshira STATIC
   src/kshira_sparse.c
   src/kshira_phase.c
   src/kshira_rad.c
+  src/kshira_session.c
 )
 target_include_directories(kshira PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)

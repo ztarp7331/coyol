@@ -64,6 +64,10 @@ contract is:
 - KSHIRA phase drivers now enforce the ordered PRE -> TRAIN -> ODT transition,
   and sparse plans reject conservative peak-memory estimates above the supplied
   arena cap before a layer schedule is admitted.
+- `kshira_session` now composes those contracts with RAD: it owns no heap state,
+  gates each train step by the active phase, carries a channel mask, and exposes
+  one prediction path. A 16 KiB session fixture covers FP32 PRE, INT8 TRAIN,
+  and INT4 ODT transitions under the same arena.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
