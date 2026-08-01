@@ -141,6 +141,15 @@ contract is:
   quantized results. Latest repeated Release runs put INT8 ODT near
   0.94--0.96 s and INT4 near 0.90--0.94 s; both per-phase gates passed in those
   runs. Arena headroom and the combined gate remain open for M16b2.
+- M16b2 overlays the transactional encoder and optional multi-scale head delta
+  descriptors on one caller-owned float workspace because those update paths
+  are mutually exclusive. The optional profile high-water fell from 261,729 to
+  261,181 bytes (963 bytes free in the 256 KiB harness) while the default
+  profile remains covered by the same tests. The multiscale harness now reports
+  P4/P5 sample counts, per-level proxy IoU/class accuracy, and per-level ODT
+  loss; a current Release run measured INT8 P4/P5 IoU 0.451/0.562 and INT4
+  0.427/0.497 on the synthetic held-out stream. These are scale-aware proxy
+  diagnostics, not COCO accuracy, and the combined timing gate remains open.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

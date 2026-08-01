@@ -20,6 +20,8 @@ enum {
     ARENA_BYTES = 256 * 1024
 };
 
+enum { SCALE_LEVELS = 3 };
+
 static double now_ms(void) {
     struct timespec value;
     (void)timespec_get(&value, TIME_UTC);
@@ -64,9 +66,13 @@ static int run_mode(kshira_bit_mode bits) {
     kshira_rad_box target;
     kshira_rad_detection detections[TOP_K];
     kshira_proxy_metrics metrics;
+    kshira_proxy_metrics level_metrics[SCALE_LEVELS];
     float loss = 0.0f;
     float loss_sum = 0.0f;
     float odt_loss_sum = 0.0f;
+    float odt_level_loss[SCALE_LEVELS] = {0.0f};
+    size_t odt_level_samples[SCALE_LEVELS] = {0U};
+    size_t eval_level_samples[SCALE_LEVELS] = {0U};
     size_t processed = 0U;
     size_t odt_processed = 0U;
     int domain;
@@ -113,30 +119,42 @@ static int run_mode(kshira_bit_mode bits) {
     }
     start = now_ms();
     while (kshira_domain_index(&odt_stream) < kshira_domain_total(&odt_stream)) {
+        int level;
         if (kshira_domain_next(&odt_stream, image_data,
                                sizeof(image_data) / sizeof(image_data[0]), &target,
                                &domain) != KSHIRA_OK ||
+            (level = target_level(&target)) < 1 || level >= SCALE_LEVELS ||
             kshira_session_multiscale_step(&session, &image, &target,
-                                           target_level(&target),
+                                           level,
                                            bits == KSHIRA_BITS_INT8 ? 5.0e-4f : 2.5e-4f,
                                            &loss) != KSHIRA_OK || !isfinite(loss)) {
             return 0;
         }
         odt_loss_sum += loss;
+        odt_level_loss[level] += loss;
+        ++odt_level_samples[level];
         ++odt_processed;
     }
     odt_ms = now_ms() - start;
     start = now_ms();
     kshira_proxy_metrics_init(&metrics);
+    for (int level = 0; level < SCALE_LEVELS; ++level) {
+        kshira_proxy_metrics_init(&level_metrics[level]);
+    }
     while (kshira_domain_index(&eval_stream) < kshira_domain_total(&eval_stream)) {
+        int level;
         if (kshira_domain_next(&eval_stream, image_data,
                                sizeof(image_data) / sizeof(image_data[0]), &target,
                                &domain) != KSHIRA_OK ||
+            (level = target_level(&target)) < 1 || level >= SCALE_LEVELS ||
             kshira_session_predict(&session, &image, 0.25f, detections, TOP_K, &count) !=
                 KSHIRA_OK ||
-            kshira_proxy_metrics_add(&metrics, &target, detections, count) != KSHIRA_OK) {
+            kshira_proxy_metrics_add(&metrics, &target, detections, count) != KSHIRA_OK ||
+            kshira_proxy_metrics_add(&level_metrics[level], &target, detections, count) !=
+                KSHIRA_OK) {
             return 0;
         }
+        ++eval_level_samples[level];
     }
     eval_ms = now_ms() - start;
     {
@@ -151,7 +169,10 @@ static int run_mode(kshira_bit_mode bits) {
         printf("multiscale_bits=%s base_samples=%zu odt_samples=%zu base_train_ms=%.3f "
                "odt_ms=%.3f total_train_ms=%.3f eval_ms=%.3f eval_per_image_ms=%.3f "
                "base_mean_loss=%.6f odt_mean_loss=%.6f proxy_iou=%.6f "
-               "proxy_class=%.6f base_train_gate=%s odt_train_gate=%s "
+               "proxy_class=%.6f p4_samples=%zu p4_iou=%.6f p4_class=%.6f "
+               "p5_samples=%zu p5_iou=%.6f p5_class=%.6f "
+               "odt_p4_loss=%.6f odt_p5_loss=%.6f "
+               "base_train_gate=%s odt_train_gate=%s "
                "combined_train_gate=%s inference_gate=%s arena_high_water=%zu "
                "arena_cap=%u\n",
            mode_name(bits), processed, odt_processed, train_ms, odt_ms,
@@ -159,6 +180,14 @@ static int run_mode(kshira_bit_mode bits) {
            processed == 0U ? 0.0f : loss_sum / (float)processed,
            odt_processed == 0U ? 0.0f : odt_loss_sum / (float)odt_processed,
            kshira_proxy_mean_iou(&metrics), kshira_proxy_class_accuracy(&metrics),
+           eval_level_samples[1], kshira_proxy_mean_iou(&level_metrics[1]),
+           kshira_proxy_class_accuracy(&level_metrics[1]), eval_level_samples[2],
+           kshira_proxy_mean_iou(&level_metrics[2]),
+           kshira_proxy_class_accuracy(&level_metrics[2]),
+           odt_level_samples[1] == 0U ? 0.0f : odt_level_loss[1] /
+               (float)odt_level_samples[1],
+           odt_level_samples[2] == 0U ? 0.0f : odt_level_loss[2] /
+               (float)odt_level_samples[2],
            base_gate ? "PASS" : "FAIL", odt_gate ? "PASS" : "FAIL",
            combined_gate ? "PASS" : "FAIL", inference_gate ? "PASS" : "FAIL",
            kshira_session_arena_high_water(&session), ARENA_BYTES);
@@ -168,6 +197,11 @@ static int run_mode(kshira_bit_mode bits) {
            isfinite(loss_sum) && isfinite(odt_loss_sum) &&
            isfinite(kshira_proxy_mean_iou(&metrics)) &&
            isfinite(kshira_proxy_class_accuracy(&metrics)) &&
+           isfinite(odt_level_loss[1]) && isfinite(odt_level_loss[2]) &&
+           isfinite(kshira_proxy_mean_iou(&level_metrics[1])) &&
+           isfinite(kshira_proxy_mean_iou(&level_metrics[2])) &&
+           isfinite(kshira_proxy_class_accuracy(&level_metrics[1])) &&
+           isfinite(kshira_proxy_class_accuracy(&level_metrics[2])) &&
            kshira_session_arena_high_water(&session) <= ARENA_BYTES;
 }
 

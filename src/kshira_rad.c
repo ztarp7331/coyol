@@ -47,6 +47,9 @@ struct kshira_rad_model {
     float *scale_head_weights[RAD_SCALES];
     float *scale_head_bias[RAD_SCALES];
     rad_head_delta_buffer *scale_head_deltas;
+    /* Both descriptors overlay the one update workspace allocated below. */
+    rad_encoder_delta_buffer encoder_delta_storage;
+    rad_head_delta_buffer scale_head_delta_storage;
     int scale_heads_ready;
     int scale_head_trained_mask;
     float *stem;
@@ -92,43 +95,48 @@ static float *alloc_floats(kshira_arena *arena, size_t count) {
     return (float *)kshira_arena_alloc(arena, count * sizeof(float), _Alignof(float));
 }
 
-static rad_encoder_delta_buffer *alloc_encoder_deltas(kshira_arena *arena,
-                                                       const kshira_rad_spec *spec) {
-    rad_encoder_delta_buffer *buffer;
-    if (arena == NULL || spec == NULL) return NULL;
-    buffer = (rad_encoder_delta_buffer *)kshira_arena_alloc(
-        arena, sizeof(*buffer), _Alignof(rad_encoder_delta_buffer));
-    if (buffer == NULL) return NULL;
-    buffer->project_weights = alloc_floats(
-        arena, (size_t)spec->feature_channels * (size_t)spec->feature_channels);
-    buffer->project_bias = alloc_floats(arena, (size_t)spec->feature_channels);
-    buffer->stem_weights = alloc_floats(
-        arena, (size_t)spec->feature_channels * (size_t)spec->channels * 9U);
-    buffer->stem_bias = alloc_floats(arena, (size_t)spec->feature_channels);
-    if (buffer->project_weights == NULL || buffer->project_bias == NULL ||
-        buffer->stem_weights == NULL || buffer->stem_bias == NULL) return NULL;
+static int configure_update_workspace(kshira_arena *arena,
+                                      const kshira_rad_spec *spec, int outputs,
+                                      rad_encoder_delta_buffer *encoder,
+                                      rad_head_delta_buffer *head, size_t *workspace_bytes) {
+    size_t channels;
+    size_t input_channels;
+    size_t encoder_count;
+    size_t head_count;
+    size_t workspace_count;
+    float *storage;
+    size_t offset = 0U;
+    /* Full encoder and multi-scale head updates never run concurrently. */
+    if (arena == NULL || spec == NULL || outputs <= 0 || encoder == NULL ||
+        workspace_bytes == NULL) return 0;
+    channels = (size_t)spec->feature_channels;
+    input_channels = (size_t)spec->channels;
+    encoder_count = channels * channels + channels + channels * input_channels * 9U + channels;
+    encoder_count += (size_t)RAD_BRANCHES * (channels * 9U + channels);
+    head_count = (size_t)outputs * channels + (size_t)outputs;
+    workspace_count = encoder_count > head_count ? encoder_count : head_count;
+    storage = alloc_floats(arena, workspace_count);
+    if (storage == NULL) return 0;
+    encoder->project_weights = storage + offset;
+    offset += channels * channels;
+    encoder->project_bias = storage + offset;
+    offset += channels;
+    encoder->stem_weights = storage + offset;
+    offset += channels * input_channels * 9U;
+    encoder->stem_bias = storage + offset;
+    offset += channels;
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-        buffer->branch_weights[branch] = alloc_floats(
-            arena, (size_t)spec->feature_channels * 9U);
-        buffer->branch_bias[branch] = alloc_floats(
-            arena, (size_t)spec->feature_channels);
-        if (buffer->branch_weights[branch] == NULL ||
-            buffer->branch_bias[branch] == NULL) return NULL;
+        encoder->branch_weights[branch] = storage + offset;
+        offset += channels * 9U;
+        encoder->branch_bias[branch] = storage + offset;
+        offset += channels;
     }
-    return buffer;
-}
-
-static rad_head_delta_buffer *alloc_scale_head_deltas(kshira_arena *arena,
-                                                       int outputs, int channels) {
-    rad_head_delta_buffer *buffer;
-    if (arena == NULL || outputs <= 0 || channels <= 0) return NULL;
-    buffer = (rad_head_delta_buffer *)kshira_arena_alloc(
-        arena, sizeof(*buffer), _Alignof(rad_head_delta_buffer));
-    if (buffer == NULL) return NULL;
-    buffer->weights = alloc_floats(arena, (size_t)outputs * (size_t)channels);
-    buffer->bias = alloc_floats(arena, (size_t)outputs);
-    if (buffer->weights == NULL || buffer->bias == NULL) return NULL;
-    return buffer;
+    if (head != NULL) {
+        head->weights = storage;
+        head->bias = storage + (size_t)outputs * channels;
+    }
+    *workspace_bytes = workspace_count * sizeof(float);
+    return offset == encoder_count;
 }
 
 static float sigmoid(float value) {
@@ -1196,7 +1204,8 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                                (size_t)model->outputs) * sizeof(float);
     model->scale_heads_ready = 0;
     model->scale_head_trained_mask = 0;
-    model->scale_head_deltas = NULL;
+    model->encoder_deltas = &model->encoder_delta_storage;
+    model->scale_head_deltas = spec->multiscale_heads ? &model->scale_head_delta_storage : NULL;
     for (int level = 0; level < RAD_SCALES; ++level) {
         model->scale_head_weights[level] = NULL;
         model->scale_head_bias[level] = NULL;
@@ -1211,12 +1220,6 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                 status = KSHIRA_ERR_MEMORY;
                 goto fail;
             }
-        }
-        model->scale_head_deltas = alloc_scale_head_deltas(
-            arena, model->outputs, spec->feature_channels);
-        if (model->scale_head_deltas == NULL) {
-            status = KSHIRA_ERR_MEMORY;
-            goto fail;
         }
         model->scale_heads_ready = 1;
         model->parameter_bytes += (size_t)(RAD_SCALES - 1) *
@@ -1237,24 +1240,17 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
         }
         model->activation_bytes += map_elements * sizeof(float);
     }
-    model->encoder_deltas = alloc_encoder_deltas(arena, spec);
-    if (model->encoder_deltas == NULL) {
-        status = KSHIRA_ERR_MEMORY;
-        goto fail;
-    }
-    model->activation_bytes +=
-        (sizeof(*model->encoder_deltas) +
-         ((size_t)spec->feature_channels * (size_t)spec->feature_channels +
-          (size_t)spec->feature_channels +
-          (size_t)RAD_BRANCHES * (size_t)spec->feature_channels * 9U +
-          (size_t)RAD_BRANCHES * (size_t)spec->feature_channels +
-          (size_t)spec->feature_channels * (size_t)spec->channels * 9U +
-          (size_t)spec->feature_channels) * sizeof(float));
-    if (model->scale_head_deltas != NULL) {
-        model->activation_bytes += sizeof(*model->scale_head_deltas) +
-                                   ((size_t)model->outputs *
-                                    (size_t)spec->feature_channels +
-                                    (size_t)model->outputs) * sizeof(float);
+    {
+        size_t update_workspace_bytes;
+        if (!configure_update_workspace(arena, spec, model->outputs,
+                                         &model->encoder_delta_storage,
+                                         model->scale_head_deltas != NULL ?
+                                             &model->scale_head_delta_storage : NULL,
+                                         &update_workspace_bytes)) {
+            status = KSHIRA_ERR_MEMORY;
+            goto fail;
+        }
+        model->activation_bytes += update_workspace_bytes;
     }
     if (kshira_rad_reset(model, spec->seed) != KSHIRA_OK) {
         status = KSHIRA_ERR_ARGUMENT;

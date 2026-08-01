@@ -359,6 +359,8 @@ static void test_rad_top_k(void) {
         assert(kshira_arena_init(&base_arena, base_memory, sizeof(base_memory)) == KSHIRA_OK);
         assert(kshira_rad_build(&multi_arena, &multi_spec, &multi_model) == KSHIRA_OK);
         assert(kshira_rad_build(&base_arena, &base_spec, &base_model) == KSHIRA_OK);
+        assert(kshira_rad_activation_bytes(multi_model) ==
+               kshira_rad_activation_bytes(base_model));
         assert(kshira_rad_predict(multi_model, &image, 0.0f, multi_detections, 8,
                                   &multi_count) == KSHIRA_OK);
         assert(kshira_rad_predict(base_model, &image, 0.0f, base_detections, 8,
