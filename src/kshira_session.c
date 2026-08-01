@@ -76,6 +76,16 @@ kshira_status kshira_session_transition(kshira_session *session, kshira_bit_mode
     return kshira_phase_driver_transition(&session->phase, next);
 }
 
+kshira_status kshira_session_calibrate(kshira_session *session,
+                                        const kshira_image_f32 *image) {
+    const kshira_phase_contract *contract;
+    if (session == NULL) return KSHIRA_ERR_ARGUMENT;
+    contract = &session->phase.contract;
+    if (contract->phase != KSHIRA_PHASE_ODT ||
+        !kshira_bit_mode_valid(contract->bits)) return KSHIRA_ERR_ARGUMENT;
+    return kshira_rad_calibrate(session->rad, image);
+}
+
 kshira_status kshira_session_set_channel(kshira_session *session, size_t channel, int enabled) {
     if (session == NULL) return KSHIRA_ERR_ARGUMENT;
     return kshira_sparse_mask_set(&session->channel_mask, channel, enabled);

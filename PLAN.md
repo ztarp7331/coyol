@@ -77,15 +77,20 @@ contract is:
   boxes and caller-owned image storage. The 160 x 160, 5,000-sample Release
   harness (500 samples/domain) trains the FP32 local receptive-field path in
   315--359 ms across the latest three Release WSL runs with all encoder channels
-  enabled, and 258,317-byte high-water under the 256 KiB arena. Host load affects
+  enabled, and 258,349-byte high-water under the 256 KiB arena. Host load affects
   the timing; this is a synthetic throughput gate, not an accuracy, board-power,
   or real-dataset claim.
 - `kshira_eval` adds allocation-free IoU and class-hit accumulation for
-  calibration sets. The M8 harness runs the same 5,000-sample stream in FP32,
-  INT8, and INT4, then evaluates held-out samples and emits loss/proxy ratios.
-  A bounded QAS-gradient safeguard is required for the current real quantized
-  path; the latest run measured FP32 top-1 proxy IoU about 0.31 while INT8/INT4
-  proxy IoU was 0, so quantized recovery is not qualified.
+  calibration sets. The M9 harness runs the same 5,000-sample stream in FP32,
+  INT8, and INT4, calibrates quantized models on one sample from each domain,
+  then evaluates held-out samples at a 0.25 threshold. The latest Release run
+  measured FP32/INT8/INT4 proxy IoU of 0.311/0.475/0.435 and quantized loss
+  ratios of 0.426/0.509; the plain ASAN harness completes as well. Quantized
+  full-encoder training measured 1.24--1.35 s for 5,000 samples, with
+  4.9--8.3 ms calibration and 1.03--1.09 s held-out evaluation, so the
+  recovery gate is passed but the sub-second edge timing gate remains open. These are
+  synthetic recovery gates; they are not COCO accuracy, FPGA timing, or 1 W
+  measurements.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

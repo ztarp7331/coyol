@@ -10,10 +10,13 @@
 typedef struct {
     kshira_bit_mode bits;
     double train_ms;
+    double calibration_ms;
     double eval_ms;
     float mean_loss;
     float mean_iou;
     float class_accuracy;
+    size_t detections;
+    float max_score;
     size_t arena_high_water;
 } mode_result;
 
@@ -38,13 +41,17 @@ static int enable_all_channels(kshira_session *session, int channels) {
 
 static int run_mode(kshira_bit_mode bits, mode_result *result) {
     enum { WIDTH = 160, HEIGHT = 160, CLASSES = 10, SAMPLES_PER_DOMAIN = 500,
-           EVAL_SAMPLES_PER_DOMAIN = 10, ARENA_BYTES = 256 * 1024 };
+           EVAL_SAMPLES_PER_DOMAIN = 10, CALIBRATION_SAMPLES_PER_DOMAIN = 1,
+           ARENA_BYTES = 256 * 1024 };
     unsigned char arena_memory[ARENA_BYTES];
     float image_data[WIDTH * HEIGHT];
     kshira_domain_stream stream;
     kshira_domain_stream eval_stream;
+    kshira_domain_stream calibration_stream;
     kshira_domain_spec domain_spec = {WIDTH, HEIGHT, 1, CLASSES, SAMPLES_PER_DOMAIN, 97U};
     kshira_domain_spec eval_spec = {WIDTH, HEIGHT, 1, CLASSES, EVAL_SAMPLES_PER_DOMAIN, 197U};
+    kshira_domain_spec calibration_spec = {WIDTH, HEIGHT, 1, CLASSES,
+                                           CALIBRATION_SAMPLES_PER_DOMAIN, 53U};
     kshira_session session;
     kshira_session_spec session_spec = {{WIDTH, HEIGHT, 1, CLASSES, 8, 16, 97},
                                         sizeof(arena_memory)};
@@ -61,12 +68,13 @@ static int run_mode(kshira_bit_mode bits, mode_result *result) {
     double start;
     if (result == NULL || kshira_domain_init(&stream, &domain_spec) != KSHIRA_OK ||
         kshira_domain_init(&eval_stream, &eval_spec) != KSHIRA_OK ||
+        kshira_domain_init(&calibration_stream, &calibration_spec) != KSHIRA_OK ||
         kshira_session_init(&session, arena_memory, sizeof(arena_memory), &session_spec) !=
             KSHIRA_OK || !enable_all_channels(&session, session_spec.rad.feature_channels)) {
         return 0;
     }
     if (bits != KSHIRA_BITS_FLOAT &&
-        kshira_session_transition(&session, bits, KSHIRA_UPDATE_CHANNELS, 1) != KSHIRA_OK) {
+        kshira_session_transition(&session, bits, KSHIRA_UPDATE_FULL, 1) != KSHIRA_OK) {
         return 0;
     }
     start = now_ms();
@@ -77,7 +85,7 @@ static int run_mode(kshira_bit_mode bits, mode_result *result) {
         if (status == KSHIRA_OK) {
             status = kshira_session_step(&session, &image, &target,
                                          bits == KSHIRA_BITS_FLOAT ? 1.0e-4f :
-                                         (bits == KSHIRA_BITS_INT8 ? 1.0e-9f : 1.0e-10f),
+                                         (bits == KSHIRA_BITS_INT8 ? 1.0e-3f : 5.0e-4f),
                                          &loss);
         }
         if (status != KSHIRA_OK || !isfinite(loss)) {
@@ -91,7 +99,23 @@ static int run_mode(kshira_bit_mode bits, mode_result *result) {
     }
     result->train_ms = now_ms() - start;
     start = now_ms();
+    if (bits != KSHIRA_BITS_FLOAT) {
+        if (kshira_session_transition(&session, bits, KSHIRA_UPDATE_CHANNELS, 1) !=
+            KSHIRA_OK) return 0;
+        while (kshira_domain_index(&calibration_stream) <
+               kshira_domain_total(&calibration_stream)) {
+            if (kshira_domain_next(&calibration_stream, image_data,
+                                   sizeof(image_data) / sizeof(image_data[0]), &target,
+                                   &domain) != KSHIRA_OK ||
+                kshira_session_calibrate(&session, &image) != KSHIRA_OK) return 0;
+        }
+        if (!kshira_rad_calibration_ready(session.rad)) return 0;
+    }
+    result->calibration_ms = bits == KSHIRA_BITS_FLOAT ? 0.0 : now_ms() - start;
+    start = now_ms();
     kshira_proxy_metrics_init(&metrics);
+    result->detections = 0U;
+    result->max_score = 0.0f;
     while (kshira_domain_index(&eval_stream) < kshira_domain_total(&eval_stream)) {
         if (kshira_domain_next(&eval_stream, image_data,
                                sizeof(image_data) / sizeof(image_data[0]), &target,
@@ -100,6 +124,10 @@ static int run_mode(kshira_bit_mode bits, mode_result *result) {
                 KSHIRA_OK ||
             kshira_proxy_metrics_add(&metrics, &target, detections, count) != KSHIRA_OK) {
             return 0;
+        }
+        if (count > 0) {
+            result->detections += (size_t)count;
+            if (detections[0].score > result->max_score) result->max_score = detections[0].score;
         }
     }
     result->eval_ms = now_ms() - start;
@@ -121,12 +149,16 @@ int main(void) {
             fprintf(stderr, "KSHIRA %s curriculum run failed\n", mode_name(modes[i]));
             return EXIT_FAILURE;
         }
-        printf("rad_bits=%s domain_samples=5000 domains=%d train_ms=%.3f eval_ms=%.3f "
+        printf("rad_bits=%s domain_samples=5000 domains=%d train_ms=%.3f calibration_ms=%.3f "
+               "eval_ms=%.3f "
                "mean_loss=%.6f proxy_iou=%.6f proxy_class=%.6f "
+               "detections=%zu max_score=%.6f "
                "arena_high_water=%zu arena_cap=%u image_workspace_bytes=%zu\n",
                mode_name(results[i].bits), KSHIRA_DOMAIN_COUNT, results[i].train_ms,
-               results[i].eval_ms, results[i].mean_loss, results[i].mean_iou,
-               results[i].class_accuracy, results[i].arena_high_water,
+               results[i].calibration_ms, results[i].eval_ms, results[i].mean_loss,
+               results[i].mean_iou,
+               results[i].class_accuracy, results[i].detections, results[i].max_score,
+               results[i].arena_high_water,
                256U * 1024U, (size_t)160 * (size_t)160 * sizeof(float));
     }
     if (results[0].mean_loss > 0.0f) {

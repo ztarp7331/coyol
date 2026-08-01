@@ -26,6 +26,8 @@ kshira_status kshira_session_init(kshira_session *session, void *memory,
                                    size_t memory_bytes, const kshira_session_spec *spec);
 kshira_status kshira_session_transition(kshira_session *session, kshira_bit_mode bits,
                                          kshira_update_mode update_mode, int qas_enabled);
+kshira_status kshira_session_calibrate(kshira_session *session,
+                                        const kshira_image_f32 *image);
 kshira_status kshira_session_set_channel(kshira_session *session, size_t channel, int enabled);
 kshira_status kshira_session_step(kshira_session *session, const kshira_image_f32 *image,
                                    const kshira_rad_box *target, float learning_rate,

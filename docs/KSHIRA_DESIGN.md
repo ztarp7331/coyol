@@ -28,21 +28,29 @@ changing the baseline's accuracy and timing claims.
   box per sample. The local training path computes only the nine-by-nine map
   tile needed by the largest dilation. On the development WSL host, the
   160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
-  latest three WSL runs with all encoder channels enabled and 258,317 bytes
+  latest three WSL runs with all encoder channels enabled and 258,349 bytes
   high-water inside a 256 KiB arena; host load and ASAN affect timing.
   The image buffer is caller-owned outside that arena (102,400 bytes for this
   harness), and the timer is a host diagnostic rather than an energy meter.
-- The local INT4/INT8 target path calibrates stem scales on its live receptive
-  tile and branch scales at the supervised cell, while full-map inference uses
-  full-map calibration. This is an explicit local-fast approximation; M8 must
-  add calibrated persistent scales and a quantized proxy-recovery gate before
-  claiming deployment-equivalent accuracy.
-- `kshira_eval` supplies allocation-free IoU/class-hit metrics. The M8 harness
-  runs FP32, INT8, and INT4 over the same 5,000-sample curriculum and a held-out
-  calibration stream, using the highest-score detection at a 0.25 threshold.
-  The current quantized profile uses sparse channel updates plus a bounded QAS
-  gradient; it completes, but its latest top-1 proxy result is FP32 IoU about
-  0.31 versus 0 for INT8/INT4, leaving recovery unqualified.
+- `kshira_rad_calibrate` runs a full-map representative pass after quantized
+  training and persists input, stem, and per-branch activation scales in the
+  caller-owned model. Local target training and full-map inference then share
+  those deployment scales; changing bit mode or resetting the model clears the
+  calibration state. Head feature quantization remains per-cell so the bounded
+  top-K head does not lose small activation signals.
+- `kshira_eval` supplies allocation-free IoU/class-hit metrics. The M9 harness
+  runs FP32, INT8, and INT4 over the same 5,000-sample curriculum, calibrates
+  quantized models on one sample from each domain, and evaluates held-out
+  samples using the highest-score detection at a 0.25 threshold. The latest
+  release run reports FP32 IoU 0.311, INT8 IoU 0.475, and INT4 IoU 0.435, with
+  quantized loss ratios 0.426 and 0.509; the plain ASAN harness also completes.
+  These are synthetic proxy results, not COCO accuracy or board-power claims.
+- The current scalar full-encoder quantized profile measured 1.24--1.35 s for
+  5,000 training samples, plus 4.9--8.3 ms representative calibration and
+  1.03--1.09 s held-out evaluation across recent Release runs on the
+  development WSL host. This passes the recovery gate but not the sub-second
+  quantized edge timing gate; the next milestone targets kernel/layout
+  optimization.
 
 All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /
@@ -87,4 +95,7 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
   edge harness (landed; accuracy and energy gates remain open).
 - M8: quantized multi-domain recovery and proxy detection qualification
   (harness landed; recovery gate open).
-- M9+: hardware-specific energy data and deployment-equivalent quantized scales.
+- M9: persistent full-map activation calibration, quantized class-balance
+  updates, and INT4/INT8 proxy recovery (landed on the synthetic gate).
+- M10+: hardware-specific energy data, multi-scale integration, and end-to-end
+  dataset-scale qualification.

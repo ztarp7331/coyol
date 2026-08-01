@@ -32,6 +32,10 @@ struct kshira_rad_model {
     float *stem;
     float *branches[RAD_BRANCHES];
     float *fused;
+    float calibration_input_scale;
+    float calibration_stem_scale;
+    float calibration_branch_scale[RAD_BRANCHES];
+    size_t calibration_samples;
 };
 
 static int valid_spec(const kshira_rad_spec *spec) {
@@ -92,6 +96,12 @@ static int normalize_qas_gradient(float *gradient, int quantized) {
     return 1;
 }
 
+static float class_gradient_scale(const kshira_rad_model *model, int output,
+                                  int class_id) {
+    return model->bits != KSHIRA_BITS_FLOAT && output >= 5 && output - 5 == class_id ?
+        (float)model->spec.classes : 1.0f;
+}
+
 static float quant_scale_values(const float *values, size_t count, kshira_bit_mode bits) {
     float maximum = 0.0f;
     if (values == NULL || count == 0U) return 1.0f;
@@ -102,6 +112,30 @@ static float quant_scale_values(const float *values, size_t count, kshira_bit_mo
         if (value > maximum) maximum = value;
     }
     return kshira_symmetric_scale(maximum, bits);
+}
+
+static float calibrated_or_dynamic(float calibrated, const float *values, size_t count,
+                                   kshira_bit_mode bits, size_t samples) {
+    if (samples > 0U && isfinite(calibrated) && calibrated > 0.0f) return calibrated;
+    return quant_scale_values(values, count, bits);
+}
+
+static float activation_scale(const float *values, size_t count, kshira_bit_mode bits) {
+    float maximum = 0.0f;
+    if (values == NULL || count == 0U) return 1.0f;
+    for (size_t i = 0U; i < count; ++i) {
+        if (isfinite(values[i]) && fabsf(values[i]) > maximum) maximum = fabsf(values[i]);
+    }
+    return kshira_symmetric_scale(maximum, bits);
+}
+
+static void clear_calibration(kshira_rad_model *model) {
+    model->calibration_input_scale = 1.0f;
+    model->calibration_stem_scale = 1.0f;
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        model->calibration_branch_scale[branch] = 1.0f;
+    }
+    model->calibration_samples = 0U;
 }
 
 static float quantized_dot(const float *weights, const float *values, size_t count,
@@ -171,7 +205,9 @@ static void conv_stem_quant(const kshira_rad_model *model, const kshira_image_f3
     size_t image_count = (size_t)image->channels * (size_t)image->height *
                          (size_t)image->width;
     float weight_scale = quant_scale_values(model->stem_weights, weight_count, model->bits);
-    float input_scale = quant_scale_values(image->data, image_count, model->bits);
+    float input_scale = calibrated_or_dynamic(model->calibration_input_scale, image->data,
+                                              image_count, model->bits,
+                                              model->calibration_samples);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = 0; y < model->map_height; ++y) {
             for (int x = 0; x < model->map_width; ++x) {
@@ -238,7 +274,9 @@ static void depthwise_branch_quant(const kshira_rad_model *model, int branch) {
     size_t map_count = (size_t)c * (size_t)model->map_height * (size_t)model->map_width;
     float weight_scale = quant_scale_values(model->branch_weights[branch],
                                             (size_t)c * 9U, model->bits);
-    float input_scale = quant_scale_values(model->stem, map_count, model->bits);
+    float input_scale = calibrated_or_dynamic(model->calibration_stem_scale, model->stem,
+                                              map_count, model->bits,
+                                              model->calibration_samples);
     for (int channel = 0; channel < c; ++channel) {
         for (int y = 0; y < model->map_height; ++y) {
             for (int x = 0; x < model->map_width; ++x) {
@@ -297,7 +335,9 @@ static void project_fused_quant(const kshira_rad_model *model) {
     float weight_scale = quant_scale_values(model->project_weights, (size_t)c * (size_t)c,
                                             model->bits);
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-        float scale = quant_scale_values(model->branches[branch], map_count, model->bits);
+        float scale = calibrated_or_dynamic(model->calibration_branch_scale[branch],
+                                            model->branches[branch], map_count, model->bits,
+                                            model->calibration_samples);
         if (scale > input_scale) input_scale = scale;
     }
     if (input_scale <= 0.0f) input_scale = 1.0f;
@@ -395,7 +435,9 @@ static void conv_stem_target_quant(const kshira_rad_model *model,
     size_t image_count = (size_t)image->channels * (size_t)image->height *
                          (size_t)image->width;
     float weight_scale = quant_scale_values(model->stem_weights, weight_count, model->bits);
-    float input_scale = quant_scale_values(image->data, image_count, model->bits);
+    float input_scale = calibrated_or_dynamic(model->calibration_input_scale, image->data,
+                                              image_count, model->bits,
+                                              model->calibration_samples);
     target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
     for (int oc = 0; oc < c; ++oc) {
         for (int y = y0; y < y1; ++y) {
@@ -461,9 +503,13 @@ static void depthwise_branch_target_quant(const kshira_rad_model *model, int bra
     float weight_scale = quant_scale_values(model->branch_weights[branch],
                                             (size_t)c * 9U, model->bits);
     float input_scale;
-    target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
-    input_scale = quant_scale_region(model->stem, c, model->map_height, model->map_width,
-                                     y0, y1, x0, x1, model->bits);
+    if (model->calibration_samples > 0U) {
+        input_scale = model->calibration_stem_scale;
+    } else {
+        target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
+        input_scale = quant_scale_region(model->stem, c, model->map_height,
+                                         model->map_width, y0, y1, x0, x1, model->bits);
+    }
     for (int channel = 0; channel < c; ++channel) {
         int64_t accumulator = 0;
         for (int ky = 0; ky < RAD_KERNEL; ++ky) {
@@ -514,16 +560,19 @@ static void project_fused_target_quant(const kshira_rad_model *model,
                                             (size_t)c * (size_t)c, model->bits);
     float input_scale = 0.0f;
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-        float maximum = 0.0f;
-        for (int channel = 0; channel < c; ++channel) {
-            float value = model->branches[branch][rad_index(
-                c, model->map_height, model->map_width, channel, target_y, target_x)];
-            if (isfinite(value) && fabsf(value) > maximum) maximum = fabsf(value);
+        float scale;
+        if (model->calibration_samples > 0U) {
+            scale = model->calibration_branch_scale[branch];
+        } else {
+            float maximum = 0.0f;
+            for (int channel = 0; channel < c; ++channel) {
+                float value = model->branches[branch][rad_index(
+                    c, model->map_height, model->map_width, channel, target_y, target_x)];
+                if (isfinite(value) && fabsf(value) > maximum) maximum = fabsf(value);
+            }
+            scale = kshira_symmetric_scale(maximum, model->bits);
         }
-        {
-            float scale = kshira_symmetric_scale(maximum, model->bits);
-            if (scale > input_scale) input_scale = scale;
-        }
+        if (scale > input_scale) input_scale = scale;
     }
     if (input_scale <= 0.0f) input_scale = 1.0f;
     for (int oc = 0; oc < c; ++oc) {
@@ -645,10 +694,13 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
             model->project_weights, (size_t)c * (size_t)c, model->bits);
         stem_weight_scale = quant_scale_values(
             model->stem_weights, (size_t)c * (size_t)image->channels * 9U, model->bits);
-        image_scale = quant_scale_values(
-            image->data, (size_t)image->channels * (size_t)image->height *
-                         (size_t)image->width, model->bits);
-        {
+        image_scale = calibrated_or_dynamic(
+            model->calibration_input_scale, image->data,
+            (size_t)image->channels * (size_t)image->height * (size_t)image->width,
+            model->bits, model->calibration_samples);
+        if (model->calibration_samples > 0U) {
+            stem_input_scale = model->calibration_stem_scale;
+        } else {
             int y0, y1, x0, x1;
             target_bounds(model, target_y, target_x, &y0, &y1, &x0, &x1);
             stem_input_scale = quant_scale_region(
@@ -656,16 +708,22 @@ static kshira_status rad_update_encoder(kshira_rad_model *model,
                 y0, y1, x0, x1, model->bits);
         }
         for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-            float maximum = 0.0f;
             branch_weight_scale[branch] = quant_scale_values(
                 model->branch_weights[branch], (size_t)c * 9U, model->bits);
-            for (int channel = 0; channel < c; ++channel) {
-                float value = model->branches[branch][rad_index(
-                    c, model->map_height, model->map_width, channel, target_y, target_x)];
-                if (isfinite(value) && fabsf(value) > maximum) maximum = fabsf(value);
-            }
             {
-                float scale = kshira_symmetric_scale(maximum, model->bits);
+                float scale;
+                if (model->calibration_samples > 0U) {
+                    scale = model->calibration_branch_scale[branch];
+                } else {
+                    float maximum = 0.0f;
+                    for (int channel = 0; channel < c; ++channel) {
+                        float value = model->branches[branch][rad_index(
+                            c, model->map_height, model->map_width, channel,
+                            target_y, target_x)];
+                        if (isfinite(value) && fabsf(value) > maximum) maximum = fabsf(value);
+                    }
+                    scale = kshira_symmetric_scale(maximum, model->bits);
+                }
                 if (scale > branch_input_scale) branch_input_scale = scale;
             }
         }
@@ -1013,6 +1071,7 @@ kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
     fill_random(model->head_weights, (size_t)model->outputs *
                 (size_t)model->spec.feature_channels, &state, 0.05f);
     fill_zero(model->head_bias, (size_t)model->outputs);
+    clear_calibration(model);
     return KSHIRA_OK;
 }
 
@@ -1020,12 +1079,76 @@ kshira_status kshira_rad_set_bits(kshira_rad_model *model, kshira_bit_mode bits)
     if (model == NULL || (bits != KSHIRA_BITS_FLOAT && !kshira_bit_mode_valid(bits))) {
         return KSHIRA_ERR_ARGUMENT;
     }
+    if (model->bits != bits) clear_calibration(model);
     model->bits = bits;
     return KSHIRA_OK;
 }
 
 kshira_bit_mode kshira_rad_bits(const kshira_rad_model *model) {
     return model == NULL ? (kshira_bit_mode)0 : model->bits;
+}
+
+kshira_status kshira_rad_calibrate(kshira_rad_model *model,
+                                    const kshira_image_f32 *image) {
+    size_t image_count;
+    size_t map_count;
+    float input_scale;
+    float stem_scale;
+    float branch_scale[RAD_BRANCHES];
+    if (model == NULL || image == NULL || image->data == NULL ||
+        !kshira_bit_mode_valid(model->bits) ||
+        image->channels != model->spec.channels || image->height != model->spec.height ||
+        image->width != model->spec.width) return KSHIRA_ERR_ARGUMENT;
+    if ((size_t)image->channels > SIZE_MAX / (size_t)image->height ||
+        (size_t)image->channels * (size_t)image->height > SIZE_MAX / (size_t)image->width) {
+        return KSHIRA_ERR_RANGE;
+    }
+    image_count = (size_t)image->channels * (size_t)image->height * (size_t)image->width;
+    if ((size_t)model->spec.feature_channels > SIZE_MAX / (size_t)model->map_height ||
+        (size_t)model->spec.feature_channels * (size_t)model->map_height >
+            SIZE_MAX / (size_t)model->map_width) return KSHIRA_ERR_RANGE;
+    map_count = (size_t)model->spec.feature_channels * (size_t)model->map_height *
+                (size_t)model->map_width;
+    for (size_t i = 0U; i < image_count; ++i) {
+        if (!isfinite(image->data[i])) return KSHIRA_ERR_ARGUMENT;
+    }
+    /* Calibration intentionally uses the full floating-point map. The resulting
+     * ranges are then shared by local target training and deployment inference. */
+    conv_stem(model, image);
+    stem_scale = activation_scale(model->stem, map_count, model->bits);
+    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+        depthwise_branch(model, branch);
+        branch_scale[branch] = activation_scale(model->branches[branch], map_count,
+                                                model->bits);
+    }
+    project_fused(model);
+    input_scale = activation_scale(image->data, image_count, model->bits);
+    if (model->calibration_samples == SIZE_MAX) return KSHIRA_ERR_RANGE;
+    if (model->calibration_samples == 0U) {
+        model->calibration_input_scale = input_scale;
+        model->calibration_stem_scale = stem_scale;
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            model->calibration_branch_scale[branch] = branch_scale[branch];
+        }
+    } else {
+        if (input_scale > model->calibration_input_scale) {
+            model->calibration_input_scale = input_scale;
+        }
+        if (stem_scale > model->calibration_stem_scale) {
+            model->calibration_stem_scale = stem_scale;
+        }
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            if (branch_scale[branch] > model->calibration_branch_scale[branch]) {
+                model->calibration_branch_scale[branch] = branch_scale[branch];
+            }
+        }
+    }
+    ++model->calibration_samples;
+    return KSHIRA_OK;
+}
+
+int kshira_rad_calibration_ready(const kshira_rad_model *model) {
+    return model != NULL && model->calibration_samples > 0U;
 }
 
 kshira_status kshira_rad_predict(kshira_rad_model *model,
@@ -1147,6 +1270,9 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
     for (size_t i = 0U; i < image_count; ++i) {
         if (!isfinite(image->data[i])) return KSHIRA_ERR_ARGUMENT;
     }
+    if (model->bits != config->bits) {
+        clear_calibration(model);
+    }
     model->bits = config->bits;
     target_x = (int)(((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE);
     target_y = (int)(((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE);
@@ -1201,7 +1327,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         for (int ic = 0; ic < c; ++ic) {
             float gradient = 0.0f;
             for (int o = 0; o < model->outputs; ++o) {
-                gradient += gradients[o] *
+                gradient += gradients[o] * class_gradient_scale(model, o, target->class_id) *
                             model->head_weights[(size_t)o * (size_t)c + (size_t)ic];
             }
             if (!isfinite(gradient)) return KSHIRA_ERR_RANGE;
@@ -1220,6 +1346,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                 !normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
                 return KSHIRA_ERR_RANGE;
             }
+            gradient_bias *= class_gradient_scale(model, o, target->class_id);
             delta = config->learning_rate * gradient_bias;
             updated = model->head_bias[o] - delta;
             if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1238,6 +1365,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                                 model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
+                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
                     delta = config->learning_rate * gradient_weight;
                     updated = model->head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
                     if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1261,6 +1389,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
             if (!normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
                 return KSHIRA_ERR_RANGE;
             }
+            gradient_bias *= class_gradient_scale(model, o, target->class_id);
             model->head_bias[o] -= config->learning_rate * gradient_bias;
             if (config->update_mode == KSHIRA_UPDATE_CHANNELS ||
                 config->update_mode == KSHIRA_UPDATE_FULL) {
@@ -1278,12 +1407,14 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                                 model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
+                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
                     model->head_weights[(size_t)o * (size_t)c + (size_t)ic] -=
                         config->learning_rate * gradient_weight;
                 }
             }
         }
     }
+    if (config->update_mode != KSHIRA_UPDATE_FREEZE) clear_calibration(model);
     *loss = loss_sum / (float)model->outputs;
     return isfinite(*loss) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
 }

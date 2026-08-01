@@ -58,6 +58,9 @@ kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
 kshira_status kshira_rad_reset(kshira_rad_model *model, int seed);
 kshira_status kshira_rad_set_bits(kshira_rad_model *model, kshira_bit_mode bits);
 kshira_bit_mode kshira_rad_bits(const kshira_rad_model *model);
+kshira_status kshira_rad_calibrate(kshira_rad_model *model,
+                                    const kshira_image_f32 *image);
+int kshira_rad_calibration_ready(const kshira_rad_model *model);
 kshira_status kshira_rad_predict(kshira_rad_model *model,
                                  const kshira_image_f32 *image, float threshold,
                                  kshira_rad_detection *detections, int capacity, int *count);

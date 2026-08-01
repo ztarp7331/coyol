@@ -191,6 +191,8 @@ static void test_rad_top_k(void) {
     assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT4) == KSHIRA_OK);
     assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
     for (int i = 0; i < count; ++i) assert(isfinite(detections[i].score));
+    assert(kshira_rad_calibrate(model, &image) == KSHIRA_OK);
+    assert(kshira_rad_calibration_ready(model));
     {
         uint8_t channel_bits[1] = {0U};
         kshira_sparse_mask channel_mask;
@@ -202,8 +204,20 @@ static void test_rad_top_k(void) {
         assert(kshira_sparse_mask_init(&channel_mask, channel_bits, sizeof(channel_bits), 4U) ==
                KSHIRA_OK);
         assert(kshira_sparse_mask_set(&channel_mask, 0U, 1) == KSHIRA_OK);
+        train_config.learning_rate = NAN;
+        assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) ==
+               KSHIRA_ERR_ARGUMENT);
+        assert(kshira_rad_calibration_ready(model));
+        train_config.learning_rate = 1.0e-5f;
         assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
         assert(isfinite(loss) && loss >= 0.0f);
+        assert(!kshira_rad_calibration_ready(model));
+        assert(kshira_rad_calibrate(model, &image) == KSHIRA_OK);
+        assert(kshira_rad_calibration_ready(model));
+        train_config.bits = KSHIRA_BITS_INT8;
+        assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
+        assert(kshira_rad_bits(model) == KSHIRA_BITS_INT8);
+        assert(!kshira_rad_calibration_ready(model));
         train_config.update_mode = KSHIRA_UPDATE_FULL;
         assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
         assert(isfinite(loss) && loss >= 0.0f);
@@ -293,10 +307,15 @@ static void test_session_contract(void) {
     assert(isfinite(loss) && kshira_session_contract(&session)->phase == KSHIRA_PHASE_PRE);
     assert(kshira_session_transition(&session, KSHIRA_BITS_INT8,
                                      KSHIRA_UPDATE_FULL, 1) == KSHIRA_OK);
+    assert(kshira_session_calibrate(&session, &image) == KSHIRA_ERR_ARGUMENT);
     assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
-    assert(kshira_session_transition(&session, KSHIRA_BITS_INT4,
+    assert(!kshira_rad_calibration_ready(session.rad));
+    assert(kshira_session_transition(&session, KSHIRA_BITS_INT8,
                                      KSHIRA_UPDATE_CHANNELS, 1) == KSHIRA_OK);
+    assert(kshira_session_calibrate(&session, &image) == KSHIRA_OK);
+    assert(kshira_rad_calibration_ready(session.rad));
     assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
+    assert(!kshira_rad_calibration_ready(session.rad));
     assert(kshira_session_predict(&session, &image, 0.0f, detections, 3, &count) == KSHIRA_OK);
     assert(count >= 0 && count <= 3 && isfinite(loss));
     assert(kshira_session_arena_high_water(&session) <= sizeof(memory));
