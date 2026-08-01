@@ -1,0 +1,60 @@
+#ifndef KSHIRA_RAD_H
+#define KSHIRA_RAD_H
+
+#include <stddef.h>
+
+#include "kshira/core.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    const float *data;
+    int channels;
+    int height;
+    int width;
+} kshira_image_f32;
+
+typedef struct {
+    int width;
+    int height;
+    int channels;
+    int classes;
+    int feature_channels;
+    int top_k;
+    int seed;
+} kshira_rad_spec;
+
+typedef struct {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    int class_id;
+} kshira_rad_box;
+
+typedef struct {
+    kshira_rad_box box;
+    float score;
+    float quality;
+} kshira_rad_detection;
+
+typedef struct kshira_rad_model kshira_rad_model;
+
+kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
+                                kshira_rad_model **out);
+kshira_status kshira_rad_reset(kshira_rad_model *model, int seed);
+kshira_status kshira_rad_predict(kshira_rad_model *model,
+                                 const kshira_image_f32 *image, float threshold,
+                                 kshira_rad_detection *detections, int capacity, int *count);
+int kshira_rad_map_height(const kshira_rad_model *model);
+int kshira_rad_map_width(const kshira_rad_model *model);
+size_t kshira_rad_parameter_bytes(const kshira_rad_model *model);
+size_t kshira_rad_activation_bytes(const kshira_rad_model *model);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

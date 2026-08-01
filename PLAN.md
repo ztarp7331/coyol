@@ -34,6 +34,35 @@ The primary reference workload is dataset-neutral:
 - a whole-image pattern can be represented as a full-frame box, so a separate
   classifier is not required in v1.
 
+### KSHIRA integration direction
+
+The KSHIRA design is the research branch extending the validated detector, not
+an unmeasured replacement of its compatibility baseline. The integration
+contract is:
+
+- `src/det_*.inc` contains the existing detector in ordered core, quantization,
+  model, forward, training, evaluation, and serialization units; `src/det.c`
+  is only the implementation-unit aggregator.
+- `include/kshira/` and `src/kshira_*.c` provide the new M0--M2 contracts:
+  caller-owned arena/high-water accounting, symmetric INT4/INT8 packing and
+  toggle, QAS gradient scaling, sparse channel masks/memory estimates, and
+  PRE/TRAIN/ODT phase validation.
+- The current multi-scale detector remains the measured baseline. KSHIRA's
+  SMRE single-map RAD encoder and bounded top-K head are the next model branch,
+  so their small-object and quantized-training hypotheses are measured against
+  the baseline instead of silently changing the published graph.
+- The first RAD edge harness now runs a 160 x 160, 8-feature, 16-candidate
+  single-map model inside a 256 KiB caller-owned arena. Its current Release
+  checkpoint uses 258,100 bytes high-water (1,892 parameter bytes plus 256,000
+  activation bytes) and measured about 0.47 ms per image on the pinned
+  development CPU; this is a software/memory checkpoint, not a 1 W claim.
+- Real INT4/INT8 training, QAS inside the detector update path, sparse ODT, and
+  the hard 256 KiB arena gate remain implementation milestones; the current
+  detector's quantized modes are inference-only until those paths are wired.
+
+Every KSHIRA optimization must carry memory high-water, bit-mode,
+proxy-detection, and latency measurements.
+
 Timing targets:
 
 - stretch target: at most 1 second;
