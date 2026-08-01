@@ -1,3 +1,4 @@
+/* Core public tensors, arena, convolution, and scalar math operators. */
 #include "det.h"
 
 #include <errno.h>
@@ -486,5 +487,4 @@ int8_t det_requantize_i32(int64_t accumulator, int32_t multiplier, int shift,
     return (int8_t)rounded;
 #endif
 }
-
 

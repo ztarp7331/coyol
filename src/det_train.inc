@@ -1,3 +1,4 @@
+    /* Local/global training schedules, assignment banks, and streamed training. */
     size_t weight_count = stage_weight_count(stage);
     for (size_t i = 0U; i < weight_count; ++i) {
         float gradient = stage->gradient_w[i] * scale;
@@ -506,5 +507,4 @@ static void sort_detections_descending(det_detection *detections, int count) {
         detections[j] = value;
     }
 }
-
 

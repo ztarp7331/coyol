@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 typedef enum {
+    KSHIRA_BITS_FLOAT = 0,
     KSHIRA_BITS_INT4 = 4,
     KSHIRA_BITS_INT8 = 8
 } kshira_bit_mode;

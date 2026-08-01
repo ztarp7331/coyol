@@ -21,9 +21,12 @@ unpack round trips, QAS identities, sparse masks, and phase compatibility.
 
 The RAD M3--M4 branch is also present behind `kshira_rad.h`: its 160 x 160
 8-feature configuration uses 258,100 bytes high-water inside a 256 KiB arena
-and emits at most 16 top-K candidates without NMS. The Release harness measured
-about 0.47 ms per image on the pinned development CPU. These measurements do
-not imply quantized training, board power, or detector accuracy yet.
+and emits at most 16 top-K candidates without NMS. M5 now dispatches real
+integer MACs for FP32/INT8/INT4 modes and applies QAS to a sparse head update;
+the Release harness measured approximately 1.35 ms F32, 9.52 ms INT8, and
+9.10 ms INT4 per image on the pinned development CPU. These measurements do
+not imply board power or detector accuracy yet, and the full multi-scale
+detector still needs its own quantized update integration.
 
 ## Architecture combination
 
@@ -46,8 +49,9 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
 
 ## Next milestones
 
-- M3: static explicit forward/backward interfaces for the KSHIRA operators.
-- M4: RAD single-map detector and top-K head behind a separate API.
-- M5: detector-integrated real INT8/INT4 training, QAS, and sparse schedules.
+- M3: static explicit forward/backward interfaces for the KSHIRA operators. (forward path landed)
+- M4: RAD single-map detector and top-K head behind a separate API. (landed)
+- M5: detector-integrated real INT8/INT4 forward plus QAS-scaled sparse head
+  training. (head-only path landed; full encoder update remains)
 - M6: PRE/TRAIN/ODT driver with checkpoint contracts and hard arena failure.
 - M7+: ten-domain generators, edge harness, and hardware-specific energy data.

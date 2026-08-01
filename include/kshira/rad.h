@@ -4,6 +4,8 @@
 #include <stddef.h>
 
 #include "kshira/core.h"
+#include "kshira/sparse.h"
+#include "kshira/quant.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,14 +42,26 @@ typedef struct {
     float quality;
 } kshira_rad_detection;
 
+typedef struct {
+    kshira_bit_mode bits;
+    kshira_update_mode update_mode;
+    const kshira_sparse_mask *channel_mask;
+    float learning_rate;
+} kshira_rad_train_config;
+
 typedef struct kshira_rad_model kshira_rad_model;
 
 kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                                 kshira_rad_model **out);
 kshira_status kshira_rad_reset(kshira_rad_model *model, int seed);
+kshira_status kshira_rad_set_bits(kshira_rad_model *model, kshira_bit_mode bits);
+kshira_bit_mode kshira_rad_bits(const kshira_rad_model *model);
 kshira_status kshira_rad_predict(kshira_rad_model *model,
                                  const kshira_image_f32 *image, float threshold,
                                  kshira_rad_detection *detections, int capacity, int *count);
+kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_f32 *image,
+                                     const kshira_rad_box *target,
+                                     const kshira_rad_train_config *config, float *loss);
 int kshira_rad_map_height(const kshira_rad_model *model);
 int kshira_rad_map_width(const kshira_rad_model *model);
 size_t kshira_rad_parameter_bytes(const kshira_rad_model *model);

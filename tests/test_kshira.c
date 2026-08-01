@@ -87,6 +87,7 @@ static void test_qas_and_sparse(void) {
     assert(fabsf(gradients[0] - 4.0f) < 1e-6f);
     assert(fabsf(gradients[1] + 8.0f) < 1e-6f);
     assert(fabsf(bias[0] - 32.0f) < 1e-6f);
+    assert(kshira_apply_qas(gradients, 2U, bias, 1U, FLT_MIN, 1.0f) == KSHIRA_ERR_RANGE);
     assert(kshira_sparse_mask_init(&mask, bits, sizeof(bits), 10U) == KSHIRA_OK);
     assert(kshira_sparse_mask_set(&mask, 0U, 1) == KSHIRA_OK);
     assert(kshira_sparse_mask_set(&mask, 9U, 1) == KSHIRA_OK);
@@ -157,6 +158,28 @@ static void test_rad_top_k(void) {
     }
     pixels[0] = NAN;
     assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_ERR_ARGUMENT);
+    pixels[0] = 0.0f;
+    assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT8) == KSHIRA_OK);
+    assert(kshira_rad_bits(model) == KSHIRA_BITS_INT8);
+    assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
+    for (int i = 0; i < count; ++i) assert(isfinite(detections[i].score));
+    assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT4) == KSHIRA_OK);
+    assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
+    for (int i = 0; i < count; ++i) assert(isfinite(detections[i].score));
+    {
+        uint8_t channel_bits[1] = {0U};
+        kshira_sparse_mask channel_mask;
+        kshira_rad_train_config train_config = {
+            KSHIRA_BITS_INT4, KSHIRA_UPDATE_CHANNELS, &channel_mask, 1.0e-5f
+        };
+        kshira_rad_box target = {8.0f, 8.0f, 16.0f, 16.0f, 0};
+        float loss = 0.0f;
+        assert(kshira_sparse_mask_init(&channel_mask, channel_bits, sizeof(channel_bits), 4U) ==
+               KSHIRA_OK);
+        assert(kshira_sparse_mask_set(&channel_mask, 0U, 1) == KSHIRA_OK);
+        assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
+        assert(isfinite(loss) && loss >= 0.0f);
+    }
 
     {
         unsigned char odd_memory[16U << 10];

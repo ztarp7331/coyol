@@ -1,3 +1,4 @@
+/* Versioned CDET serialization, CRC validation, and canonical cache loading. */
 typedef struct {
     char magic[4];
     uint32_t version;
@@ -523,4 +524,3 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     *out = model;
     return DET_OK;
 }
-

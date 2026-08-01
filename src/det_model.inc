@@ -1,3 +1,4 @@
+/* Model allocation, reset, precision selection, and quantized cache rebuild. */
 static void free_head(det_head *head) {
     if (head == NULL) return;
     free(head->weights);
@@ -527,5 +528,4 @@ det_status det_model_reset(det_model *model, int seed) {
     model->train_updates = 0U;
     return det_model_set_precision(model, DET_PRECISION_F32);
 }
-
 

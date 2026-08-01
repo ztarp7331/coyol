@@ -1,3 +1,4 @@
+/* Bounded inference decoding plus class/size/multi-IoU evaluation metrics. */
 typedef struct {
     det_detection detection;
     size_t sample_index;
@@ -453,5 +454,4 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
     free(ranges);
     return status;
 }
-
 

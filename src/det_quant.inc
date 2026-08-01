@@ -1,3 +1,4 @@
+/* Deployment quantization helpers shared by model construction and I/O. */
 det_status det_quantize_per_channel_s8(const float *weights, int rows, int cols,
                                         int8_t *quantized, float *scales) {
     if (weights == NULL || quantized == NULL || scales == NULL || rows <= 0 || cols <= 0) {
@@ -52,5 +53,4 @@ det_status det_quantize_pack_w4(const float *weights, int rows, int cols,
     }
     return DET_OK;
 }
-
 

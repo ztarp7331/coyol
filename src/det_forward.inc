@@ -1,3 +1,4 @@
+/* Backbone, neck, forward quantization, and explicit global backward kernels. */
 static void stage_forward(det_stage *stage, const det_tensor_f32 *input) {
     det_tensor_f32 output = {stage->activation, stage->output_channels,
                              stage->output_height, stage->output_width};
@@ -554,4 +555,3 @@ static void backbone_backward(det_model *model, const det_image *image) {
 }
 
 static void apply_stage_gradient(det_stage *stage, float lr, float momentum, float scale) {
-

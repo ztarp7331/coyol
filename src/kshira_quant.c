@@ -94,14 +94,21 @@ kshira_status kshira_quantize_int8(const float *values, size_t count, float scal
 kshira_status kshira_apply_qas(float *gradient_weights, size_t weight_count,
                                float *gradient_bias, size_t bias_count,
                                float weight_scale, float input_scale) {
+    float weight_square;
+    float input_square;
     float weight_factor;
     float bias_factor;
     if ((gradient_weights == NULL && weight_count != 0U) ||
         (gradient_bias == NULL && bias_count != 0U) ||
         !isfinite(weight_scale) || !isfinite(input_scale) ||
         weight_scale <= 0.0f || input_scale <= 0.0f) return KSHIRA_ERR_ARGUMENT;
-    weight_factor = 1.0f / (weight_scale * weight_scale);
-    bias_factor = weight_factor / (input_scale * input_scale);
+    weight_square = weight_scale * weight_scale;
+    input_square = input_scale * input_scale;
+    if (!isfinite(weight_square) || !isfinite(input_square) ||
+        weight_square <= 0.0f || input_square <= 0.0f) return KSHIRA_ERR_RANGE;
+    weight_factor = 1.0f / weight_square;
+    bias_factor = weight_factor / input_square;
+    if (!isfinite(weight_factor) || !isfinite(bias_factor)) return KSHIRA_ERR_RANGE;
     for (size_t i = 0U; i < weight_count; ++i) gradient_weights[i] *= weight_factor;
     for (size_t i = 0U; i < bias_count; ++i) gradient_bias[i] *= bias_factor;
     return KSHIRA_OK;

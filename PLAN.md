@@ -57,8 +57,10 @@ contract is:
   activation bytes) and measured about 0.47 ms per image on the pinned
   development CPU; this is a software/memory checkpoint, not a 1 W claim.
 - Real INT4/INT8 training, QAS inside the detector update path, sparse ODT, and
-  the hard 256 KiB arena gate remain implementation milestones; the current
-  detector's quantized modes are inference-only until those paths are wired.
+  the hard 256 KiB arena gate remain implementation milestones for the full
+  detector. The RAD branch now has real INT8/INT4 forward arithmetic and a
+  QAS-scaled sparse head update; the validated multi-scale detector's
+  quantized modes remain inference-only until its own update path is wired.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.
