@@ -73,6 +73,13 @@ contract is:
   quantized updates. Encoder gradients are channel-maskable and preflighted for
   finite aggregate updates before commit; the session fixture exercises this
   path with nonzero input data.
+- `kshira_domain` adds a balanced ten-domain curriculum stream with deterministic
+  boxes and caller-owned image storage. The 160 x 160, 5,000-sample Release
+  harness (500 samples/domain) trains the FP32 local receptive-field path in
+  315--359 ms across the latest three Release WSL runs with all encoder channels
+  enabled, and 258,317-byte high-water under the 256 KiB arena. Host load affects
+  the timing; this is a synthetic throughput gate, not an accuracy, board-power,
+  or real-dataset claim.
 
 Every KSHIRA optimization must carry memory high-water, bit-mode,
 proxy-detection, and latency measurements.

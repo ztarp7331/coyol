@@ -14,6 +14,7 @@ add_library(kshira STATIC
   src/kshira_phase.c
   src/kshira_rad.c
   src/kshira_session.c
+  src/kshira_domain.c
 )
 target_include_directories(kshira PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(MSVC)
@@ -69,6 +70,13 @@ else()
   target_link_libraries(kshira_bench PRIVATE kshira m)
 endif()
 
+add_executable(kshira_domain_bench tools/kshira_domain_bench.c)
+if(MSVC)
+  target_link_libraries(kshira_domain_bench PRIVATE kshira)
+else()
+  target_link_libraries(kshira_domain_bench PRIVATE kshira m)
+endif()
+
 if(DET_ENABLE_ASAN AND NOT MSVC)
   target_compile_options(det_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(det_tests PRIVATE -fsanitize=address,undefined)
@@ -78,4 +86,6 @@ if(DET_ENABLE_ASAN AND NOT MSVC)
   target_link_options(det_bench PRIVATE -fsanitize=address,undefined)
   target_compile_options(kshira_bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(kshira_bench PRIVATE -fsanitize=address,undefined)
+  target_compile_options(kshira_domain_bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(kshira_domain_bench PRIVATE -fsanitize=address,undefined)
 endif()

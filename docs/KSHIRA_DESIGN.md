@@ -23,8 +23,22 @@ changing the baseline's accuracy and timing claims.
   through projection, depthwise dilated branches, and the stem. Encoder updates
   honor the sparse channel mask and validate aggregate finite deltas before
   committing them, including INT8/INT4 modes.
+- `kshira_domain` provides ten deterministic, balanced curriculum domains
+  (textures, edges, rings, gradients, sparse points, and noise) with one target
+  box per sample. The local training path computes only the nine-by-nine map
+  tile needed by the largest dilation. On the pinned development CPU, the
+  160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
+  latest three WSL runs with all encoder channels enabled and 258,317 bytes
+  high-water inside a 256 KiB arena; host load and ASAN affect timing.
+  The image buffer is caller-owned outside that arena (102,400 bytes for this
+  harness), and the timer is a host diagnostic rather than an energy meter.
+- The local INT4/INT8 target path calibrates stem scales on its live receptive
+  tile and branch scales at the supervised cell, while full-map inference uses
+  full-map calibration. This is an explicit local-fast approximation; M8 must
+  add calibrated persistent scales and a quantized proxy-recovery gate before
+  claiming deployment-equivalent accuracy.
 
-All four modules use caller-owned buffers and return explicit failure statuses.
+All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
 The `kshira_tests` executable covers alignment, overflow/failure paths, pack /
 unpack round trips, QAS identities, sparse masks, and phase compatibility.
 
@@ -61,6 +75,9 @@ No 1 W or 256 KiB claim is made until measured on selected hardware.
 - M3: static explicit forward/backward interfaces for the KSHIRA operators. (forward path landed)
 - M4: RAD single-map detector and top-K head behind a separate API. (landed)
 - M5: detector-integrated real INT8/INT4 forward plus QAS-scaled sparse head
-  training. (head-only path landed; full encoder update remains)
+  training. (landed; M7 adds the sparse full-encoder path)
 - M6: PRE/TRAIN/ODT driver with checkpoint contracts and hard arena failure.
-- M7+: ten-domain generators, edge harness, and hardware-specific energy data.
+- M7: ten-domain generators, local receptive-field training, and the 5,000-image
+  edge harness (landed; accuracy and energy gates remain open).
+- M8+: quantized multi-domain recovery, proxy detection qualification, and
+  hardware-specific energy data.

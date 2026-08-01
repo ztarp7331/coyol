@@ -1,4 +1,5 @@
 #include "kshira/core.h"
+#include "kshira/domain.h"
 #include "kshira/phase.h"
 #include "kshira/quant.h"
 #include "kshira/rad.h"
@@ -202,6 +203,36 @@ static void test_rad_top_k(void) {
         assert(kshira_sparse_mask_set(&channel_mask, 0U, 1) == KSHIRA_OK);
         assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
         assert(isfinite(loss) && loss >= 0.0f);
+        train_config.update_mode = KSHIRA_UPDATE_FULL;
+        assert(kshira_rad_train_step(model, &image, &target, &train_config, &loss) == KSHIRA_OK);
+        assert(isfinite(loss) && loss >= 0.0f);
+    }
+
+    {
+        unsigned char first_memory[16U << 10];
+        unsigned char second_memory[16U << 10];
+        kshira_arena first_arena;
+        kshira_arena second_arena;
+        kshira_rad_model *first_model = NULL;
+        kshira_rad_model *second_model = NULL;
+        kshira_rad_train_config train_config = {
+            KSHIRA_BITS_INT4, KSHIRA_UPDATE_FULL, NULL, 1.0e-5f
+        };
+        kshira_rad_box target = {8.0f, 8.0f, 16.0f, 16.0f, 0};
+        float first_loss = 0.0f;
+        float second_loss = 0.0f;
+        assert(kshira_arena_init(&first_arena, first_memory, sizeof(first_memory)) == KSHIRA_OK);
+        assert(kshira_arena_init(&second_arena, second_memory, sizeof(second_memory)) == KSHIRA_OK);
+        assert(kshira_rad_build(&first_arena, &spec, &first_model) == KSHIRA_OK);
+        assert(kshira_rad_build(&second_arena, &spec, &second_model) == KSHIRA_OK);
+        assert(kshira_rad_set_bits(first_model, KSHIRA_BITS_INT4) == KSHIRA_OK);
+        assert(kshira_rad_predict(first_model, &image, 0.0f, detections, 4, &count) ==
+               KSHIRA_OK);
+        assert(kshira_rad_train_step(first_model, &image, &target, &train_config, &first_loss) ==
+               KSHIRA_OK);
+        assert(kshira_rad_train_step(second_model, &image, &target, &train_config, &second_loss) ==
+               KSHIRA_OK);
+        assert(fabsf(first_loss - second_loss) <= 1.0e-6f);
     }
 
     {
@@ -256,9 +287,9 @@ static void test_session_contract(void) {
     assert(kshira_session_step(&session, &image, &target, FLT_MAX, &loss) ==
            KSHIRA_ERR_RANGE);
     assert(session.phase.steps == 0U);
+    assert(kshira_session_set_channel(&session, 0U, 1) == KSHIRA_OK);
     assert(kshira_session_step(&session, &image, &target, 1.0e-4f, &loss) == KSHIRA_OK);
     assert(isfinite(loss) && kshira_session_contract(&session)->phase == KSHIRA_PHASE_PRE);
-    assert(kshira_session_set_channel(&session, 0U, 1) == KSHIRA_OK);
     assert(kshira_session_transition(&session, KSHIRA_BITS_INT8,
                                      KSHIRA_UPDATE_FULL, 1) == KSHIRA_OK);
     assert(kshira_session_step(&session, &image, &target, 1.0e-5f, &loss) == KSHIRA_OK);
@@ -281,6 +312,29 @@ static void test_session_contract(void) {
     }
 }
 
+static void test_domain_curriculum(void) {
+    enum { WIDTH = 32, HEIGHT = 32, SAMPLES = 7 };
+    float image[WIDTH * HEIGHT];
+    int counts[KSHIRA_DOMAIN_COUNT] = {0};
+    kshira_domain_stream stream;
+    kshira_domain_spec spec = {WIDTH, HEIGHT, 1, KSHIRA_DOMAIN_COUNT, SAMPLES, 41U};
+    kshira_rad_box target;
+    int domain;
+    assert(kshira_domain_init(&stream, &spec) == KSHIRA_OK);
+    assert(kshira_domain_total(&stream) == (size_t)KSHIRA_DOMAIN_COUNT * SAMPLES);
+    while (kshira_domain_index(&stream) < kshira_domain_total(&stream)) {
+        assert(kshira_domain_next(&stream, image, sizeof(image) / sizeof(image[0]),
+                                  &target, &domain) == KSHIRA_OK);
+        assert(domain >= 0 && domain < KSHIRA_DOMAIN_COUNT);
+        assert(target.x1 >= 0.0f && target.y1 >= 0.0f && target.x2 <= WIDTH &&
+               target.y2 <= HEIGHT && target.x2 > target.x1 && target.y2 > target.y1);
+        ++counts[domain];
+    }
+    assert(kshira_domain_next(&stream, image, sizeof(image) / sizeof(image[0]),
+                              &target, &domain) == KSHIRA_ERR_RANGE);
+    for (int i = 0; i < KSHIRA_DOMAIN_COUNT; ++i) assert(counts[i] == SAMPLES);
+}
+
 int main(void) {
     test_arena();
     test_quant();
@@ -288,6 +342,7 @@ int main(void) {
     test_phases();
     test_rad_top_k();
     test_session_contract();
+    test_domain_curriculum();
     puts("all kshira tests passed");
     return 0;
 }
