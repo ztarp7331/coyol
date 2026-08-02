@@ -248,6 +248,9 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
     start = now_ms();
     for (int epoch = 0; epoch < config->epochs; ++epoch) {
         size_t seen = 0U;
+        /* Inverse-time LR decay: keeps multi-epoch from collapsing objectness. */
+        float epoch_lr = config->learning_rate / (1.0f + 0.35f * (float)epoch);
+        if (!(epoch_lr > 0.0f) || !isfinite(epoch_lr)) return DET_ERR_ARGUMENT;
         if (dataset->reset != NULL) dataset->reset(dataset->user);
         while (config->max_samples <= 0 || seen < (size_t)config->max_samples) {
             det_sample sample;
@@ -268,8 +271,7 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
                                                  model->train_updates + updates,
                                                  &cell_index)) return DET_ERR_SHAPE;
                 step_status = kshira_session_background_step(
-                    &model->kshira, &image, cell_index,
-                    config->learning_rate, &loss);
+                    &model->kshira, &image, cell_index, epoch_lr, &loss);
                 if (step_status != KSHIRA_OK) {
                     return det_status_from_kshira(step_status);
                 }
@@ -288,11 +290,10 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
                 if (config->mode == DET_TRAIN_ODT) {
                     step_status = kshira_session_multiscale_step(
                         &model->kshira, &image, &target,
-                        det_kshira_target_level(model, box), config->learning_rate,
-                        &loss);
+                        det_kshira_target_level(model, box), epoch_lr, &loss);
                 } else {
                     step_status = kshira_session_step(&model->kshira, &image, &target,
-                                                      config->learning_rate, &loss);
+                                                      epoch_lr, &loss);
                 }
                 if (step_status != KSHIRA_OK) return det_status_from_kshira(step_status);
                 sample_loss += loss;
@@ -300,34 +301,74 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
                 ++sample_terms;
             }
             if (sample.box_count > 0) {
-                for (int background = 0;
-                     background < DET_KSHIRA_BACKGROUND_SAMPLES; ++background) {
-                    size_t total_updates;
+                /* Hard-negative mining: probe several outside-box cells and train
+                 * the ones with the highest current objectness (classic HNM). */
+                kshira_image_f32 image = {
+                    sample.image.data, sample.image.channels,
+                    sample.image.height, sample.image.width
+                };
+                size_t hard_cells[DET_KSHIRA_BACKGROUND_SAMPLES];
+                float hard_scores[DET_KSHIRA_BACKGROUND_SAMPLES];
+                int hard_count = 0;
+                size_t probe_base = model->train_updates + updates;
+                int map_width = kshira_rad_map_width(model->kshira.rad);
+                int map_height = kshira_rad_map_height(model->kshira.rad);
+                for (int probe = 0; probe < 8; ++probe) {
                     size_t cell_index;
-                    size_t background_index;
+                    float objectness = 0.0f;
+                    int cell_x;
+                    int cell_y;
+                    int already = 0;
+                    if (map_width <= 0 || map_height <= 0) break;
+                    if (!det_kshira_background_cell(
+                            model, &sample,
+                            probe_base + (size_t)probe * 97U + (size_t)probe * 13U,
+                            &cell_index)) {
+                        break;
+                    }
+                    for (int i = 0; i < hard_count; ++i) {
+                        if (hard_cells[i] == cell_index) {
+                            already = 1;
+                            break;
+                        }
+                    }
+                    if (already) continue;
+                    cell_x = (int)(cell_index % (size_t)map_width);
+                    cell_y = (int)(cell_index / (size_t)map_width);
+                    if (kshira_rad_objectness_at(model->kshira.rad, &image, cell_y, cell_x,
+                                                 &objectness) != KSHIRA_OK) {
+                        return DET_ERR_SHAPE;
+                    }
+                    if (hard_count < DET_KSHIRA_BACKGROUND_SAMPLES) {
+                        hard_cells[hard_count] = cell_index;
+                        hard_scores[hard_count] = objectness;
+                        ++hard_count;
+                    } else {
+                        int worst = 0;
+                        for (int i = 1; i < hard_count; ++i) {
+                            if (hard_scores[i] < hard_scores[worst]) worst = i;
+                        }
+                        if (objectness > hard_scores[worst]) {
+                            hard_cells[worst] = cell_index;
+                            hard_scores[worst] = objectness;
+                        }
+                    }
+                }
+                for (int background = 0; background < hard_count; ++background) {
+                    float loss = 0.0f;
+                    kshira_status step_status;
                     if (model->train_updates > SIZE_MAX - updates) {
                         return DET_ERR_SHAPE;
                     }
-                    total_updates = model->train_updates + updates;
-                    background_index = total_updates ^ (total_updates >> 2U);
-                    if (det_kshira_background_cell(model, &sample, background_index,
-                                                    &cell_index)) {
-                        kshira_image_f32 image = {
-                            sample.image.data, sample.image.channels,
-                            sample.image.height, sample.image.width
-                        };
-                        float loss = 0.0f;
-                        kshira_status step_status =
-                            kshira_session_background_step(
-                                &model->kshira, &image, cell_index,
-                                config->learning_rate, &loss);
-                        if (step_status != KSHIRA_OK) {
-                            return det_status_from_kshira(step_status);
-                        }
-                        sample_loss += loss;
-                        ++updates;
-                        ++sample_terms;
+                    step_status = kshira_session_background_step(
+                        &model->kshira, &image, hard_cells[background],
+                        epoch_lr, &loss);
+                    if (step_status != KSHIRA_OK) {
+                        return det_status_from_kshira(step_status);
                     }
+                    sample_loss += loss;
+                    ++updates;
+                    ++sample_terms;
                 }
             }
             if (sample_terms > 0) sample_loss /= (float)sample_terms;

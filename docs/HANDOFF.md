@@ -43,6 +43,22 @@ RAD encoder (compact):
 - Inference: skip untrained P4/P5 scales; class-aware IoU suppress (0.5) on
   fixed top-K list (duplicate FP reduction without full NMS heap).
 
+### Research innovations landed (gap-driven, 2026-08-02)
+
+Literature gaps vs TinyML/YOLO edge practice that we closed in-code:
+
+| Gap in prior KSHIRA | Research source idea | Implementation |
+|---|---|---|
+| Single-cell positives only | FCOS/ATSS center sampling | 3×3 in-box neighbor positives (head-only, class at center only) |
+| Random background negatives | Hard-negative mining | Probe 8 outside cells, train top objectness cells |
+| Flat mid scores flood top-K | Varifocal / quality ranking | Deploy score = `quality² × class` |
+| Soft objectness gradients | Focal loss | Positive focusing `(1−p)²`, negative `p³` style |
+| Multi-epoch collapse | LR schedules | Inverse-time epoch LR: `lr/(1+0.35·epoch)` |
+| L2 box residuals explode | Smooth-L1 | Clamped smooth-L1 on box distances |
+
+Honest result: **FP flood is substantially down** (preds ~1100→~500–770); TP not yet
+competitive. This is compositional systems research progress, not SOTA accuracy.
+
 ## 3. Source map
 
 | Area | Location |
@@ -95,8 +111,10 @@ runs when `--eval-manifest` is set (F1-max threshold).
 
 | Config | epochs | lr | pred | TP | precision | recall | mean IoU | notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| F32 | 1 | 0.01 | 1098 | 6 | 0.0055 | 0.0132 | 0.564 | baseline after FP fixes |
-| **F32** | **5** | **0.003** | **1292** | **14** | **0.0108** | **0.0308** | **0.632** | **best so far** |
+| F32 pre-innovation | 1 | 0.01 | 1098 | 6 | 0.0055 | 0.0132 | 0.564 | after IoU-suppress only |
+| F32 pre-innovation | 5 | 0.003 | 1292 | 14 | 0.0108 | 0.0308 | 0.632 | prior multi-epoch best |
+| F32 **post-innovation** | 1 | 0.01 | **516** | 0 | 0.0000 | 0.0000 | 0.000 | hard-neg + quality² cut FP hard |
+| F32 **post-innovation** | **5** | **0.005** | **770** | **8** | **0.0104** | **0.0176** | **0.553** | fewer FP; TP mid; loss≈0.97 |
 | F32 | 10 | 0.01 | 330 | 2 | 0.0061 | 0.0044 | 0.529 | collapsed (LR too high) |
 | INT8 | 5 | 0.003 | 1324 | 0 | 0.0000 | 0.0000 | 0.000 | multi-epoch INT8 failed class/IoU match |
 
