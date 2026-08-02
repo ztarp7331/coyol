@@ -61,6 +61,9 @@ struct kshira_rad_model {
     float transient_image_scale;
     float transient_stem_scale;
     int transient_scales_valid;
+    /* Online class frequencies for inverse-frequency CE (training only). */
+    float class_count[RAD_MAX_CLASSES];
+    float class_total;
 };
 
 #endif

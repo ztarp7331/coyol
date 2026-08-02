@@ -1316,6 +1316,10 @@ kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
     }
     clear_calibration(model);
     clear_transient_scales(model);
+    for (int class_id = 0; class_id < RAD_MAX_CLASSES; ++class_id) {
+        model->class_count[class_id] = 0.0f;
+    }
+    model->class_total = 0.0f;
     return KSHIRA_OK;
 }
 
@@ -1467,10 +1471,10 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
                     }
                 }
                 {
-                    /* Quality-squared ranking (Varifocal-style sharpening without
-                     * extra parameters): suppresses mid-confidence clutter so
-                     * true objectness peaks rank above flat noise. */
-                    float score = quality * quality * best_class;
+                    /* Mild quality emphasis: q * (0.5 + 0.5 q) * class.
+                     * Softer than pure q² (which killed 1-ep recall) while still
+                     * ranking high-objectness peaks above mid clutter. */
+                    float score = quality * (0.5f + 0.5f * quality) * best_class;
                     float cx;
                     float cy;
                     float left = fmaxf(0.0f, output[0]) * stride;
@@ -1547,60 +1551,105 @@ static kshira_status rad_train_positive_at_cell(
         feature_scale = 1.0f;
     }
     if (!class_softmax(model, output, class_probabilities)) return KSHIRA_ERR_RANGE;
-    for (int o = 0; o < model->outputs; ++o) {
-        float gradient;
-        float error;
-        if (o < 4) {
-            float center_x = ((float)cell_x + 0.5f) * (float)RAD_STRIDE;
-            float center_y = ((float)cell_y + 0.5f) * (float)RAD_STRIDE;
-            float target_value[4] = {
-                fmaxf(0.0f, (center_x - target->x1) / (float)RAD_STRIDE),
-                fmaxf(0.0f, (center_y - target->y1) / (float)RAD_STRIDE),
-                fmaxf(0.0f, (target->x2 - center_x) / (float)RAD_STRIDE),
-                fmaxf(0.0f, (target->y2 - center_y) / (float)RAD_STRIDE)
-            };
-            /* Smooth-L1 on clamped residual so extreme head logits cannot
-             * overflow the running loss to inf. */
-            error = output[o] - target_value[o];
-            if (!isfinite(error)) {
-                error = error > 0.0f ? 1.0e6f : -1.0e6f;
-            } else if (error > 1.0e6f) {
-                error = 1.0e6f;
-            } else if (error < -1.0e6f) {
-                error = -1.0e6f;
-            }
-            if (fabsf(error) < 1.0f) {
-                gradient = error;
-                loss_sum += 0.5f * error * error;
-            } else {
-                gradient = error > 0.0f ? 1.0f : -1.0f;
-                loss_sum += fabsf(error) - 0.5f;
-            }
-        } else if (o == 4) {
-            float probability = sigmoid(output[o]);
-            float focusing = (1.0f - probability) * (1.0f - probability);
-            error = probability - 1.0f;
-            /* Focal positive objectness: strong pull when quality is low. */
-            gradient = 2.0f * focusing * error;
-            loss_sum += focusing * error * error;
-        } else {
-            float probability = class_probabilities[o - 5];
-            float desired = o - 5 == target->class_id ? 1.0f : 0.0f;
-            if (train_scope != 0) {
-                /* Neighbor cells only expand objectness/box, not class. */
-                error = 0.0f;
-                gradient = 0.0f;
-            } else {
-                error = probability - desired;
-                gradient = error;
-                if (desired > 0.0f) {
-                    loss_sum -= logf(fmaxf(probability, 1.0e-12f));
-                }
+    {
+        float center_x = ((float)cell_x + 0.5f) * (float)RAD_STRIDE;
+        float center_y = ((float)cell_y + 0.5f) * (float)RAD_STRIDE;
+        float target_value[4] = {
+            fmaxf(0.0f, (center_x - target->x1) / (float)RAD_STRIDE),
+            fmaxf(0.0f, (center_y - target->y1) / (float)RAD_STRIDE),
+            fmaxf(0.0f, (target->x2 - center_x) / (float)RAD_STRIDE),
+            fmaxf(0.0f, (target->y2 - center_y) / (float)RAD_STRIDE)
+        };
+        float pred_left = fmaxf(0.0f, output[0]);
+        float pred_top = fmaxf(0.0f, output[1]);
+        float pred_right = fmaxf(0.0f, output[2]);
+        float pred_bottom = fmaxf(0.0f, output[3]);
+        kshira_rad_box pred_box = {
+            fmaxf(0.0f, center_x - pred_left * (float)RAD_STRIDE),
+            fmaxf(0.0f, center_y - pred_top * (float)RAD_STRIDE),
+            center_x + pred_right * (float)RAD_STRIDE,
+            center_y + pred_bottom * (float)RAD_STRIDE,
+            target->class_id
+        };
+        float iou = rad_box_iou(&pred_box, target);
+        float class_weight = 1.0f;
+        float obj_desired = 1.0f;
+        if (train_scope != 0) {
+            /* Soft Gaussian objectness for neighbor cells (center≈1). */
+            float map_cx = ((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE;
+            float map_cy = ((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE;
+            float dx = (float)cell_x - map_cx;
+            float dy = (float)cell_y - map_cy;
+            float sigma2 = 2.0f;
+            obj_desired = expf(-(dx * dx + dy * dy) / (2.0f * sigma2));
+            if (obj_desired < 0.25f) obj_desired = 0.25f;
+        }
+        if (train_scope == 0 && target->class_id >= 0 &&
+            target->class_id < model->spec.classes) {
+            float count;
+            float prior;
+            model->class_count[target->class_id] += 1.0f;
+            model->class_total += 1.0f;
+            /* Warm up before rebalancing so majority classes still learn. */
+            if (model->class_total >= 64.0f) {
+                count = model->class_count[target->class_id];
+                prior = count / fmaxf(1.0f, model->class_total);
+                /* Mild sqrt inverse-frequency, tight clip (cars is Car-heavy). */
+                class_weight = sqrtf(1.0f / fmaxf(0.2f, prior * (float)model->spec.classes));
+                if (class_weight < 0.75f) class_weight = 0.75f;
+                if (class_weight > 2.0f) class_weight = 2.0f;
             }
         }
-        if (!isfinite(error) || !isfinite(gradient)) return KSHIRA_ERR_RANGE;
-        gradients[o] = gradient;
-        bias_gradients[o] = gradient;
+        if (!isfinite(iou)) iou = 0.0f;
+        /* Light IoU term so it regularizes without drowning CE/objectness. */
+        loss_sum += 0.5f * (1.0f - iou);
+        for (int o = 0; o < model->outputs; ++o) {
+            float gradient;
+            float error;
+            if (o < 4) {
+                error = output[o] - target_value[o];
+                if (!isfinite(error)) {
+                    error = error > 0.0f ? 1.0e6f : -1.0e6f;
+                } else if (error > 1.0e6f) {
+                    error = 1.0e6f;
+                } else if (error < -1.0e6f) {
+                    error = -1.0e6f;
+                }
+                if (fabsf(error) < 1.0f) {
+                    gradient = error;
+                    loss_sum += 0.5f * error * error;
+                } else {
+                    gradient = error > 0.0f ? 1.0f : -1.0f;
+                    loss_sum += fabsf(error) - 0.5f;
+                }
+                /* Mild IoU-aware scale: [1.0, 1.25]. */
+                gradient *= (1.0f + 0.25f * (1.0f - iou));
+            } else if (o == 4) {
+                float probability = sigmoid(output[o]);
+                float focusing = (obj_desired - probability);
+                if (focusing < 0.0f) focusing = -focusing;
+                focusing = focusing * focusing;
+                error = probability - obj_desired;
+                gradient = 2.0f * focusing * error;
+                loss_sum += focusing * error * error;
+            } else {
+                float probability = class_probabilities[o - 5];
+                float desired = o - 5 == target->class_id ? 1.0f : 0.0f;
+                if (train_scope != 0) {
+                    error = 0.0f;
+                    gradient = 0.0f;
+                } else {
+                    error = probability - desired;
+                    gradient = class_weight * error;
+                    if (desired > 0.0f) {
+                        loss_sum -= class_weight * logf(fmaxf(probability, 1.0e-12f));
+                    }
+                }
+            }
+            if (!isfinite(error) || !isfinite(gradient)) return KSHIRA_ERR_RANGE;
+            gradients[o] = gradient;
+            bias_gradients[o] = gradient;
+        }
     }
     if (!isfinite(loss_sum)) return KSHIRA_ERR_RANGE;
     if (update_encoder && config->update_mode == KSHIRA_UPDATE_FULL) {
