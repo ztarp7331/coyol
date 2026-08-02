@@ -69,6 +69,12 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
 kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_f32 *image,
                                      const kshira_rad_box *target,
                                      const kshira_rad_train_config *config, float *loss);
+/* Updates objectness only at one known-background P3 cell. FULL intentionally
+ * leaves the encoder unchanged because an empty sample has no localization or
+ * class target. */
+kshira_status kshira_rad_train_background_step(
+    kshira_rad_model *model, const kshira_image_f32 *image, int cell_y, int cell_x,
+    const kshira_rad_train_config *config, float *loss);
 kshira_status kshira_rad_train_multiscale_step(kshira_rad_model *model,
                                                 const kshira_image_f32 *image,
                                                 const kshira_rad_box *target, int level,

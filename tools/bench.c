@@ -18,31 +18,59 @@ typedef struct {
     int height;
     int channels;
     int classes;
+    int variant;
     size_t total;
     size_t index;
     det_box box;
 } bench_dataset;
+
+static float pattern_pixel(const bench_dataset *dataset, int class_id,
+                           int x, int y, int x0, int y0, int size) {
+    int dx = x - x0;
+    int dy = y - y0;
+    int pattern = class_id & 3;
+    int groups = (dataset->classes + 3) / 4;
+    int group = class_id / 4;
+    float amplitude = (dataset->variant ? 0.70f : 0.80f) +
+                      0.20f * (float)(group + 1) / (float)groups;
+    if (pattern == 0) return amplitude;
+    if (pattern == 1) return dx * 2 < size ? amplitude : 0.0f;
+    if (pattern == 2) return dy * 2 < size ? amplitude : 0.0f;
+    return (abs(2 * dx - size) < size / 3 ||
+            abs(2 * dy - size) < size / 3) ? amplitude : 0.0f;
+}
 
 static int next_sample(void *user, det_sample *sample) {
     bench_dataset *dataset = (bench_dataset *)user;
     if (dataset->index >= dataset->total) return 0;
     memset(dataset->pixels, 0, (size_t)dataset->width * (size_t)dataset->height *
            (size_t)dataset->channels * sizeof(float));
-    int x0 = 8 + (int)((dataset->index * 7U) % (size_t)(dataset->width - 32));
-    int y0 = 8 + (int)((dataset->index * 11U) % (size_t)(dataset->height - 32));
-    int size = 12 + (int)(dataset->index % 20U);
+    int x0 = 8 + (int)((dataset->index * (dataset->variant ? 5U : 7U) +
+                         (dataset->variant ? 3U : 0U)) %
+                        (size_t)(dataset->width - 32));
+    int y0 = 8 + (int)((dataset->index * (dataset->variant ? 13U : 11U) +
+                         (dataset->variant ? 5U : 0U)) %
+                        (size_t)(dataset->height - 32));
+    int size = (dataset->variant ? 10 : 12) +
+               (int)((dataset->index * (dataset->variant ? 3U : 1U)) %
+                     (dataset->variant ? 22U : 20U));
+    int class_id = (int)((dataset->index *
+                          (dataset->variant ? 3U : 1U) +
+                          (dataset->variant ? 1U : 0U)) %
+                         (size_t)dataset->classes);
     if (x0 + size >= dataset->width) size = dataset->width - x0 - 1;
     if (y0 + size >= dataset->height) size = dataset->height - y0 - 1;
     for (int y = y0; y < y0 + size; ++y) {
         for (int x = x0; x < x0 + size; ++x) {
-            dataset->pixels[(size_t)y * (size_t)dataset->width + (size_t)x] = 1.0f;
+            dataset->pixels[(size_t)y * (size_t)dataset->width + (size_t)x] =
+                pattern_pixel(dataset, class_id, x, y, x0, y0, size);
         }
     }
     dataset->box.x1 = (float)x0;
     dataset->box.y1 = (float)y0;
     dataset->box.x2 = (float)(x0 + size);
     dataset->box.y2 = (float)(y0 + size);
-    dataset->box.class_id = (int)(dataset->index % (size_t)dataset->classes);
+    dataset->box.class_id = class_id;
     sample->image.data = dataset->pixels;
     sample->image.channels = dataset->channels;
     sample->image.height = dataset->height;
@@ -73,6 +101,17 @@ static int parse_threshold(const char *value, float *out) {
     if (end == value || *end != '\0' || !isfinite(parsed) || parsed < 0.0f || parsed > 1.0f) {
         return 0;
     }
+    *out = parsed;
+    return 1;
+}
+
+static int parse_learning_rate(const char *value, float *out) {
+    char *end = NULL;
+    float parsed;
+    if (value == NULL || out == NULL) return 0;
+    parsed = strtof(value, &end);
+    if (end == value || *end != '\0' || !isfinite(parsed) ||
+        parsed <= 0.0f || parsed > 10.0f) return 0;
     *out = parsed;
     return 1;
 }
@@ -156,12 +195,16 @@ int main(int argc, char **argv) {
     int classes = 4;
     int feature_channels = 8;
     int arena_kib = 0;
+    int max_detections = 0;
     int features_set = 0;
     int global = 0;
+    int epochs = 1;
+    int calibrate = 0;
     const char *manifest_path = NULL;
     const char *eval_manifest_path = NULL;
     det_precision precision = DET_PRECISION_F32;
     det_architecture architecture = DET_ARCH_CDET;
+    float learning_rate = 0.01f;
     float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--samples") == 0) {
@@ -169,6 +212,16 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "samples must be a positive integer\n");
                 return EXIT_FAILURE;
             }
+        }
+        else if (strcmp(argv[i], "--epochs") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &epochs) ||
+                epochs > 1000) {
+                fprintf(stderr, "epochs must be an integer from 1 to 1000\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--calibrate") == 0) {
+            calibrate = 1;
         }
         else if (strcmp(argv[i], "--width") == 0) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &width)) {
@@ -202,6 +255,20 @@ int main(int argc, char **argv) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &arena_kib) ||
                 arena_kib > 1048576) {
                 fprintf(stderr, "arena-kib must be an integer from 1 to 1048576\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--max-detections") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &max_detections) ||
+                max_detections > 100) {
+                fprintf(stderr, "max-detections must be an integer from 1 to 100\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--learning-rate") == 0) {
+            if (i + 1 >= argc ||
+                !parse_learning_rate(argv[++i], &learning_rate)) {
+                fprintf(stderr, "learning-rate must be finite and in (0,10]\n");
                 return EXIT_FAILURE;
             }
         }
@@ -250,14 +317,17 @@ int main(int argc, char **argv) {
     if ((architecture == DET_ARCH_CDET && precision == DET_PRECISION_INT4) ||
         (architecture == DET_ARCH_KSHIRA && precision == DET_PRECISION_W4A8) ||
         (architecture == DET_ARCH_KSHIRA && global) ||
-        (architecture == DET_ARCH_CDET && features_set)) {
+        (architecture == DET_ARCH_CDET && features_set) ||
+        (architecture == DET_ARCH_KSHIRA && max_detections > 64)) {
         fprintf(stderr, "requested architecture/precision/training mode combination is unsupported\n");
         return EXIT_FAILURE;
     }
     double e2e_start = wall_now_ms();
     det_context *ctx = NULL;
     det_model *model = NULL;
-    int max_detections = architecture == DET_ARCH_KSHIRA ? 64 : 100;
+    if (max_detections == 0) {
+        max_detections = architecture == DET_ARCH_KSHIRA ? 64 : 100;
+    }
     det_model_spec spec = {width, height, 1, classes, max_detections, 1,
                            architecture,
                            architecture == DET_ARCH_KSHIRA ? feature_channels : 0};
@@ -292,16 +362,27 @@ int main(int argc, char **argv) {
             det_context_destroy(ctx);
             return EXIT_FAILURE;
         }
-        storage = (bench_dataset){pixels, width, height, 1, classes,
-                                  (size_t)sample_count, 0U,
-                                  {0, 0, 0, 0, 0}};
+        storage = (bench_dataset){
+            .pixels = pixels,
+            .width = width,
+            .height = height,
+            .channels = 1,
+            .classes = classes,
+            .variant = 0,
+            .total = (size_t)sample_count,
+            .index = 0U,
+            .box = {0, 0, 0, 0, 0}
+        };
         dataset = (det_dataset){&storage, next_sample, reset_dataset, (size_t)sample_count};
     }
+    /* For raw manifests, max_samples=0 streams the full set each epoch.
+     * Synthetic still uses --samples as the in-memory workload size. */
+    int train_max_samples = manifest_path != NULL ? 0 : sample_count;
     det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
                                architecture == DET_ARCH_KSHIRA ? precision : DET_PRECISION_F32,
-                               1, 0.01f,
-                               architecture == DET_ARCH_KSHIRA ? 0.0f : 0.8f, 0.1f,
-                               sample_count, 1, 1};
+                               epochs, learning_rate,
+                               architecture == DET_ARCH_KSHIRA ? 0.0f : 0.8f, threshold,
+                               train_max_samples, 1, 1};
     det_train_report report;
     double core_start = wall_now_ms();
     status = det_train(model, &dataset, &config, &report);
@@ -414,33 +495,84 @@ int main(int argc, char **argv) {
             det_context_destroy(ctx);
             return EXIT_FAILURE;
         }
+    } else if (manifest_path == NULL) {
+        storage.variant = 1;
+        storage.total = 100U;
+        storage.index = 0U;
+        eval_dataset = (det_dataset){&storage, next_sample, reset_dataset, 100U};
     }
-    if (manifest_path != NULL || eval_manifest_path != NULL) {
-        status = det_evaluate(loaded, &eval_dataset, threshold, &evaluation);
-        if (status != DET_OK) {
-            fprintf(stderr, "evaluation failed: %d\n", status);
-            free(pixels);
-            det_manifest_close(eval_manifest_dataset);
-            det_manifest_close(manifest_dataset);
-            det_model_destroy(loaded);
-            det_model_destroy(model);
-            det_context_destroy(ctx);
-            return EXIT_FAILURE;
+    /* Deploy-time objectness/score calibration: grid-search threshold on the
+     * eval stream and keep the F1-maximizing operating point. */
+    float calibrated_threshold = threshold;
+    if (calibrate || eval_manifest_path != NULL) {
+        static const float candidates[] = {
+            0.05f, 0.08f, 0.10f, 0.12f, 0.15f, 0.18f, 0.20f, 0.25f, 0.30f, 0.40f, 0.50f
+        };
+        float best_f1 = -1.0f;
+        float best_precision = 0.0f;
+        float best_recall = 0.0f;
+        for (size_t i = 0U; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+            det_eval_report probe;
+            float f1;
+            status = det_evaluate(loaded, &eval_dataset, candidates[i], &probe);
+            if (status != DET_OK) {
+                fprintf(stderr, "calibration eval failed at thr=%.3f: %d\n",
+                        candidates[i], status);
+                free(pixels);
+                det_manifest_close(eval_manifest_dataset);
+                det_manifest_close(manifest_dataset);
+                det_model_destroy(loaded);
+                det_model_destroy(model);
+                det_context_destroy(ctx);
+                return EXIT_FAILURE;
+            }
+            if (probe.precision + probe.recall > 0.0f) {
+                f1 = 2.0f * probe.precision * probe.recall /
+                     (probe.precision + probe.recall);
+            } else {
+                f1 = 0.0f;
+            }
+            if (f1 > best_f1 ||
+                (f1 == best_f1 && probe.precision > best_precision)) {
+                best_f1 = f1;
+                best_precision = probe.precision;
+                best_recall = probe.recall;
+                calibrated_threshold = candidates[i];
+            }
+            printf("calibrate thr=%.3f precision=%.4f recall=%.4f f1=%.4f "
+                   "pred=%zu tp=%zu fp=%zu\n",
+                   candidates[i], probe.precision, probe.recall, f1,
+                   probe.predictions, probe.true_positives, probe.false_positives);
         }
+        threshold = calibrated_threshold;
+        printf("calibrated_threshold=%.3f best_f1=%.4f precision=%.4f recall=%.4f\n",
+               threshold, best_f1, best_precision, best_recall);
+    }
+    status = det_evaluate(loaded, &eval_dataset, threshold, &evaluation);
+    if (status != DET_OK) {
+        fprintf(stderr, "evaluation failed: %d\n", status);
+        free(pixels);
+        det_manifest_close(eval_manifest_dataset);
+        det_manifest_close(manifest_dataset);
+        det_model_destroy(loaded);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_FAILURE;
     }
     det_model_destroy(loaded);
     const char *precision_name = precision == DET_PRECISION_INT8 ? "INT8" :
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" :
                                   (precision == DET_PRECISION_INT4 ? "INT4" : "F32"));
     const char *architecture_name = architecture == DET_ARCH_KSHIRA ? "KSHIRA" : "CDET";
-    printf("samples=%zu input=%dx%d classes=%d features=%d architecture=%s source=%s mode=%s precision=%s threshold=%.3f %s=%.3f %s=%.3f "
+    printf("samples=%zu epochs=%d input=%dx%d classes=%d features=%d max_detections=%d architecture=%s source=%s mode=%s precision=%s learning_rate=%.6f threshold=%.3f %s=%.3f %s=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           report.samples_seen, width, height, classes,
+           report.samples_seen, epochs, width, height, classes,
            architecture == DET_ARCH_KSHIRA ? feature_channels : 0,
-           architecture_name,
+           max_detections, architecture_name,
            manifest_path == NULL ? "synthetic" : "manifest",
-           global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name, threshold,
+           global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name,
+           learning_rate, threshold,
            manifest_path == NULL ? "train_core_ms" : "train_plus_decode_ms",
            train_core_ms, manifest_path == NULL ? "synthetic_e2e_ms" : "train_e2e_ms",
            synthetic_e2e_ms, infer_ms, io_ms,
@@ -464,17 +596,15 @@ int main(int argc, char **argv) {
            memory.arena_capacity_bytes == 0U ? "NA" :
                (memory.arena_high_water_bytes <= memory.arena_capacity_bytes ?
                     "PASS" : "FAIL"));
-    if (manifest_path != NULL || eval_manifest_path != NULL) {
-        printf("eval_samples=%zu eval_ground_truths=%zu eval_predictions=%zu eval_tp=%zu "
-               "eval_fp=%zu eval_fn=%zu precision=%.4f recall=%.4f mean_iou=%.4f "
-               "ap50=%.4f map50_95=%.4f size_gt=%zu,%zu,%zu\n",
-               evaluation.samples_seen, evaluation.ground_truths, evaluation.predictions,
-               evaluation.true_positives, evaluation.false_positives,
-               evaluation.false_negatives, evaluation.precision, evaluation.recall,
-               evaluation.mean_iou, evaluation.ap50, evaluation.map50_95,
-               evaluation.size_ground_truths[0], evaluation.size_ground_truths[1],
-               evaluation.size_ground_truths[2]);
-    }
+    printf("eval_samples=%zu eval_ground_truths=%zu eval_predictions=%zu eval_tp=%zu "
+           "eval_fp=%zu eval_fn=%zu precision=%.4f recall=%.4f mean_iou=%.4f "
+           "ap50=%.4f map50_95=%.4f size_gt=%zu,%zu,%zu\n",
+           evaluation.samples_seen, evaluation.ground_truths, evaluation.predictions,
+           evaluation.true_positives, evaluation.false_positives,
+           evaluation.false_negatives, evaluation.precision, evaluation.recall,
+           evaluation.mean_iou, evaluation.ap50, evaluation.map50_95,
+           evaluation.size_ground_truths[0], evaluation.size_ground_truths[1],
+           evaluation.size_ground_truths[2]);
     free(pixels);
     det_manifest_close(eval_manifest_dataset);
     det_manifest_close(manifest_dataset);

@@ -32,6 +32,10 @@ kshira_status kshira_session_set_channel(kshira_session *session, size_t channel
 kshira_status kshira_session_step(kshira_session *session, const kshira_image_f32 *image,
                                    const kshira_rad_box *target, float learning_rate,
                                    float *loss);
+kshira_status kshira_session_background_step(kshira_session *session,
+                                              const kshira_image_f32 *image,
+                                              size_t sample_index,
+                                              float learning_rate, float *loss);
 kshira_status kshira_session_multiscale_step(kshira_session *session,
                                                const kshira_image_f32 *image,
                                                const kshira_rad_box *target, int level,

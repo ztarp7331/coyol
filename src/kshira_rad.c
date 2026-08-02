@@ -96,6 +96,30 @@ static float sigmoid(float value) {
     }
 }
 
+static int class_softmax(const kshira_rad_model *model, const float *output,
+                         float *probabilities) {
+    float maximum;
+    float sum = 0.0f;
+    if (model == NULL || output == NULL || probabilities == NULL ||
+        model->spec.classes < 1 || model->spec.classes > RAD_MAX_CLASSES) return 0;
+    maximum = output[5];
+    for (int class_id = 1; class_id < model->spec.classes; ++class_id) {
+        if (output[5 + class_id] > maximum) maximum = output[5 + class_id];
+    }
+    if (!isfinite(maximum)) return 0;
+    for (int class_id = 0; class_id < model->spec.classes; ++class_id) {
+        float value = expf(output[5 + class_id] - maximum);
+        if (!isfinite(value)) return 0;
+        probabilities[class_id] = value;
+        sum += value;
+    }
+    if (!isfinite(sum) || sum <= 0.0f) return 0;
+    for (int class_id = 0; class_id < model->spec.classes; ++class_id) {
+        probabilities[class_id] /= sum;
+    }
+    return 1;
+}
+
 static float relu(float value) {
     if (!isfinite(value) || value <= 0.0f) return 0.0f;
     return value > 1000000.0f ? 1000000.0f : value;
@@ -112,12 +136,6 @@ static int normalize_qas_gradient(float *gradient, int quantized) {
     if (gradient == NULL || !isfinite(*gradient)) return 0;
     if (quantized) return clamp_qas_gradient(gradient);
     return 1;
-}
-
-static float class_gradient_scale(const kshira_rad_model *model, int output,
-                                  int class_id) {
-    return model->bits != KSHIRA_BITS_FLOAT && output >= 5 && output - 5 == class_id ?
-        (float)model->spec.classes : 1.0f;
 }
 
 static float quant_scale_values(const float *values, size_t count, kshira_bit_mode bits) {
@@ -1085,6 +1103,53 @@ static void insert_top_k(kshira_rad_detection *detections, int *count, int capac
     detections[position] = *candidate;
 }
 
+static float rad_box_iou(const kshira_rad_box *a, const kshira_rad_box *b) {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    float intersection;
+    float area_a;
+    float area_b;
+    float denom;
+    if (a == NULL || b == NULL) return 0.0f;
+    x1 = fmaxf(a->x1, b->x1);
+    y1 = fmaxf(a->y1, b->y1);
+    x2 = fminf(a->x2, b->x2);
+    y2 = fminf(a->y2, b->y2);
+    intersection = fmaxf(0.0f, x2 - x1) * fmaxf(0.0f, y2 - y1);
+    area_a = fmaxf(0.0f, a->x2 - a->x1) * fmaxf(0.0f, a->y2 - a->y1);
+    area_b = fmaxf(0.0f, b->x2 - b->x1) * fmaxf(0.0f, b->y2 - b->y1);
+    denom = area_a + area_b - intersection;
+    return denom > 0.0f ? intersection / denom : 0.0f;
+}
+
+/* Fixed-capacity, class-aware greedy suppress on the already score-sorted top-K
+ * list. Keeps NMS-free training/deploy structure (no variable candidate heap)
+ * while removing the duplicate flood that made precision look broken. */
+static void suppress_duplicate_detections(kshira_rad_detection *detections, int *count,
+                                          float iou_threshold) {
+    int write = 0;
+    if (detections == NULL || count == NULL || *count <= 1) return;
+    if (!isfinite(iou_threshold) || iou_threshold <= 0.0f) return;
+    for (int i = 0; i < *count; ++i) {
+        int keep = 1;
+        for (int j = 0; j < write; ++j) {
+            if (detections[i].box.class_id == detections[j].box.class_id &&
+                rad_box_iou(&detections[i].box, &detections[j].box) >=
+                    iou_threshold) {
+                keep = 0;
+                break;
+            }
+        }
+        if (keep) {
+            if (write != i) detections[write] = detections[i];
+            ++write;
+        }
+    }
+    *count = write;
+}
+
 kshira_status kshira_rad_build(kshira_arena *arena, const kshira_rad_spec *spec,
                                 kshira_rad_model **out) {
     kshira_rad_model *model;
@@ -1214,22 +1279,27 @@ fail:
 
 kshira_status kshira_rad_reset(kshira_rad_model *model, int seed) {
     uint32_t state;
+    float encoder_limit;
+    float head_limit;
     if (model == NULL) return KSHIRA_ERR_ARGUMENT;
     model->spec.seed = seed;
     state = (uint32_t)seed + 0x9e3779b9U;
+    encoder_limit = sqrtf(6.0f /
+                          ((float)model->spec.channels * (float)(RAD_KERNEL * RAD_KERNEL)));
+    head_limit = sqrtf(6.0f / (float)model->spec.feature_channels);
     fill_random(model->stem_weights, (size_t)model->spec.feature_channels *
-                (size_t)model->spec.channels * 9U, &state, 0.05f);
+                (size_t)model->spec.channels * 9U, &state, encoder_limit);
     fill_zero(model->stem_bias, (size_t)model->spec.feature_channels);
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
         fill_random(model->branch_weights[branch], (size_t)model->spec.feature_channels * 9U,
-                    &state, 0.05f);
+                    &state, sqrtf(6.0f / 9.0f));
         fill_zero(model->branch_bias[branch], (size_t)model->spec.feature_channels);
     }
     fill_random(model->project_weights, (size_t)model->spec.feature_channels *
-                (size_t)model->spec.feature_channels, &state, 0.05f);
+                (size_t)model->spec.feature_channels, &state, head_limit);
     fill_zero(model->project_bias, (size_t)model->spec.feature_channels);
     fill_random(model->head_weights, (size_t)model->outputs *
-                (size_t)model->spec.feature_channels, &state, 0.05f);
+                (size_t)model->spec.feature_channels, &state, head_limit);
     fill_zero(model->head_bias, (size_t)model->outputs);
     if (model->scale_heads_ready) {
         size_t head_count = (size_t)model->outputs *
@@ -1356,6 +1426,12 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
         int scale_height = (model->map_height + span - 1) / span;
         int scale_width = (model->map_width + span - 1) / span;
         float stride = (float)(RAD_STRIDE * span);
+        const int use_scale_head = level > 0 && model->scale_heads_ready &&
+                                   (model->scale_head_trained_mask & (1 << level));
+        /* Untrained P4/P5 heads used to reuse the stride-4 head on pooled maps,
+         * flooding near-duplicate boxes. Only emit coarser levels when that
+         * scale head was actually trained (ODT path). */
+        if (level > 0 && !use_scale_head) continue;
         for (int y = 0; y < scale_height; ++y) {
             for (int x = 0; x < scale_width; ++x) {
                 int y0 = y * span;
@@ -1363,12 +1439,11 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
                 int y1 = y0 + span;
                 int x1 = x0 + span;
                 float output[5 + RAD_MAX_CLASSES] = {0.0f};
+                float class_probabilities[RAD_MAX_CLASSES];
                 int class_id = 0;
                 float best_class;
                 float quality;
                 float features[32];
-                const int use_scale_head = level > 0 && model->scale_heads_ready &&
-                                           (model->scale_head_trained_mask & (1 << level));
                 const float *head_weights = use_scale_head ?
                                              model->scale_head_weights[level] :
                                              model->head_weights;
@@ -1381,16 +1456,18 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
                     head_forward_f32(model, head_weights, head_bias, features, output);
                 }
                 quality = sigmoid(output[4]);
-                best_class = output[5];
+                if (!class_softmax(model, output, class_probabilities)) {
+                    return KSHIRA_ERR_RANGE;
+                }
+                best_class = class_probabilities[0];
                 for (int cls = 1; cls < model->spec.classes; ++cls) {
-                    if (output[5 + cls] > best_class) {
-                        best_class = output[5 + cls];
+                    if (class_probabilities[cls] > best_class) {
+                        best_class = class_probabilities[cls];
                         class_id = cls;
                     }
                 }
                 {
-                    float class_score = sigmoid(best_class);
-                    float score = quality * class_score;
+                    float score = quality * best_class;
                     float cx;
                     float cy;
                     float left = fmaxf(0.0f, output[0]) * stride;
@@ -1420,6 +1497,8 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
             }
         }
     }
+    /* Class-aware IoU suppress on the fixed top-K list (K <= 64). */
+    suppress_duplicate_detections(detections, count, 0.5f);
     return KSHIRA_OK;
 }
 
@@ -1429,6 +1508,8 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
     float features[32];
     float output[5 + RAD_MAX_CLASSES] = {0.0f};
     float gradients[5 + RAD_MAX_CLASSES];
+    float bias_gradients[5 + RAD_MAX_CLASSES];
+    float class_probabilities[RAD_MAX_CLASSES];
     float fused_gradient[32] = {0.0f};
     int target_x;
     int target_y;
@@ -1495,6 +1576,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         weight_scale = 1.0f;
         feature_scale = 1.0f;
     }
+    if (!class_softmax(model, output, class_probabilities)) return KSHIRA_ERR_RANGE;
     for (int o = 0; o < model->outputs; ++o) {
         float gradient;
         float error;
@@ -1509,22 +1591,33 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
             };
             error = output[o] - target_value[o];
             gradient = error;
-        } else {
+        } else if (o == 4) {
             float probability = sigmoid(output[o]);
-            float desired = o == 4 ? 1.0f : (o - 5 == target->class_id ? 1.0f : 0.0f);
+            float desired = 1.0f;
+            /* Emphasize objectness so positives outrank background clutter. */
+            error = probability - desired;
+            gradient = 2.0f * error;
+            loss_sum += error * error;
+        } else {
+            float probability = class_probabilities[o - 5];
+            float desired = o - 5 == target->class_id ? 1.0f : 0.0f;
             error = probability - desired;
             gradient = error;
+            if (desired > 0.0f) {
+                loss_sum -= logf(fmaxf(probability, 1.0e-12f));
+            }
         }
         if (!isfinite(error) || !isfinite(gradient)) return KSHIRA_ERR_RANGE;
-        loss_sum += 0.5f * error * error;
+        if (o < 4) loss_sum += 0.5f * error * error;
         gradients[o] = gradient;
+        bias_gradients[o] = gradient;
     }
     if (!isfinite(loss_sum)) return KSHIRA_ERR_RANGE;
     if (config->update_mode == KSHIRA_UPDATE_FULL) {
         for (int ic = 0; ic < c; ++ic) {
             float gradient = 0.0f;
             for (int o = 0; o < model->outputs; ++o) {
-                gradient += gradients[o] * class_gradient_scale(model, o, target->class_id) *
+                gradient += gradients[o] *
                             model->head_weights[(size_t)o * (size_t)c + (size_t)ic];
             }
             if (!isfinite(gradient)) return KSHIRA_ERR_RANGE;
@@ -1535,7 +1628,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
         /* Preflight every update so an oversized learning rate cannot partially
          * mutate the model before returning KSHIRA_ERR_RANGE. */
         for (int o = 0; o < model->outputs; ++o) {
-            float gradient_bias = gradients[o];
+            float gradient_bias = bias_gradients[o];
             float delta;
             float updated;
             if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
@@ -1543,7 +1636,6 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                 !normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
                 return KSHIRA_ERR_RANGE;
             }
-            gradient_bias *= class_gradient_scale(model, o, target->class_id);
             delta = config->learning_rate * gradient_bias;
             updated = model->head_bias[o] - delta;
             if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1562,7 +1654,6 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                                 model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
-                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
                     delta = config->learning_rate * gradient_weight;
                     updated = model->head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
                     if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1580,7 +1671,7 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
             }
         }
         for (int o = 0; o < model->outputs; ++o) {
-            float gradient_bias = gradients[o];
+            float gradient_bias = bias_gradients[o];
             if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
                                  weight_scale, feature_scale) != KSHIRA_OK) {
                 return KSHIRA_ERR_RANGE;
@@ -1588,7 +1679,6 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
             if (!normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
                 return KSHIRA_ERR_RANGE;
             }
-            gradient_bias *= class_gradient_scale(model, o, target->class_id);
             model->head_bias[o] -= config->learning_rate * gradient_bias;
             if (config->update_mode == KSHIRA_UPDATE_CHANNELS ||
                 config->update_mode == KSHIRA_UPDATE_FULL) {
@@ -1606,7 +1696,6 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                                 model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
-                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
                     model->head_weights[(size_t)o * (size_t)c + (size_t)ic] -=
                         config->learning_rate * gradient_weight;
                 }
@@ -1618,6 +1707,116 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
     return isfinite(*loss) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
 }
 
+kshira_status kshira_rad_train_background_step(
+    kshira_rad_model *model, const kshira_image_f32 *image, int cell_y, int cell_x,
+    const kshira_rad_train_config *config, float *loss) {
+    float features[32];
+    float weight_deltas[32] = {0.0f};
+    float weight_scale = 1.0f;
+    float feature_scale = 1.0f;
+    float logit;
+    float probability;
+    float bias_delta = 0.0f;
+    size_t image_count;
+    int c;
+    if (model == NULL || image == NULL || image->data == NULL || config == NULL ||
+        loss == NULL || cell_y < 0 || cell_y >= model->map_height || cell_x < 0 ||
+        cell_x >= model->map_width ||
+        (config->bits != KSHIRA_BITS_FLOAT &&
+         !kshira_bit_mode_valid(config->bits)) ||
+        config->update_mode < KSHIRA_UPDATE_FREEZE ||
+        config->update_mode > KSHIRA_UPDATE_FULL ||
+        !isfinite(config->learning_rate) || config->learning_rate <= 0.0f ||
+        image->channels != model->spec.channels ||
+        image->height != model->spec.height || image->width != model->spec.width) {
+        return KSHIRA_ERR_ARGUMENT;
+    }
+    c = model->spec.feature_channels;
+    if (config->channel_mask != NULL &&
+        config->channel_mask->channel_count != (size_t)c) {
+        return KSHIRA_ERR_ARGUMENT;
+    }
+    if ((size_t)image->channels > SIZE_MAX / (size_t)image->height ||
+        (size_t)image->channels * (size_t)image->height >
+            SIZE_MAX / (size_t)image->width) return KSHIRA_ERR_RANGE;
+    image_count = (size_t)image->channels * (size_t)image->height *
+                  (size_t)image->width;
+    for (size_t i = 0U; i < image_count; ++i) {
+        if (!isfinite(image->data[i])) return KSHIRA_ERR_ARGUMENT;
+    }
+    if (model->bits != config->bits) clear_calibration(model);
+    model->bits = config->bits;
+    rad_forward_target(model, image, cell_y, cell_x);
+    for (int ic = 0; ic < c; ++ic) {
+        features[ic] = model->fused[rad_index(c, model->map_height,
+                                              model->map_width, ic,
+                                              cell_y, cell_x)];
+    }
+    if (model->bits == KSHIRA_BITS_INT4 || model->bits == KSHIRA_BITS_INT8) {
+        weight_scale = quant_scale_values(model->head_weights,
+                                          (size_t)model->outputs * (size_t)c,
+                                          model->bits);
+        feature_scale = quant_scale_values(features, (size_t)c, model->bits);
+        logit = quantized_dot(&model->head_weights[4U * (size_t)c], features,
+                              (size_t)c, weight_scale, feature_scale,
+                              model->bits) + model->head_bias[4];
+    } else {
+        logit = model->head_bias[4];
+        for (int ic = 0; ic < c; ++ic) {
+            logit += model->head_weights[4U * (size_t)c + (size_t)ic] *
+                     features[ic];
+        }
+    }
+    if (!isfinite(logit)) return KSHIRA_ERR_RANGE;
+    probability = sigmoid(logit);
+    if (!isfinite(probability)) return KSHIRA_ERR_RANGE;
+    if (config->update_mode != KSHIRA_UPDATE_FREEZE) {
+        float gradient_bias = probability;
+        float updated;
+        if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
+                             weight_scale, feature_scale) != KSHIRA_OK ||
+            !normalize_qas_gradient(&gradient_bias,
+                                    model->bits != KSHIRA_BITS_FLOAT)) {
+            return KSHIRA_ERR_RANGE;
+        }
+        bias_delta = config->learning_rate * gradient_bias;
+        updated = model->head_bias[4] - bias_delta;
+        if (!isfinite(bias_delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
+        if (config->update_mode == KSHIRA_UPDATE_CHANNELS ||
+            config->update_mode == KSHIRA_UPDATE_FULL) {
+            for (int ic = 0; ic < c; ++ic) {
+                float gradient_weight;
+                float delta;
+                if (config->update_mode == KSHIRA_UPDATE_CHANNELS &&
+                    config->channel_mask != NULL && !kshira_sparse_mask_get(
+                        config->channel_mask, (size_t)ic)) continue;
+                gradient_weight = probability * features[ic];
+                if (kshira_apply_qas(&gradient_weight, 1U, NULL, 0U,
+                                     weight_scale, feature_scale) != KSHIRA_OK ||
+                    !normalize_qas_gradient(&gradient_weight,
+                                            model->bits != KSHIRA_BITS_FLOAT)) {
+                    return KSHIRA_ERR_RANGE;
+                }
+                delta = config->learning_rate * gradient_weight;
+                updated = model->head_weights[4U * (size_t)c + (size_t)ic] - delta;
+                if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
+                weight_deltas[ic] = delta;
+            }
+        }
+        model->head_bias[4] -= bias_delta;
+        if (config->update_mode == KSHIRA_UPDATE_CHANNELS ||
+            config->update_mode == KSHIRA_UPDATE_FULL) {
+            for (int ic = 0; ic < c; ++ic) {
+                model->head_weights[4U * (size_t)c + (size_t)ic] -=
+                    weight_deltas[ic];
+            }
+        }
+        clear_calibration(model);
+    }
+    *loss = 0.5f * probability * probability;
+    return isfinite(*loss) ? KSHIRA_OK : KSHIRA_ERR_RANGE;
+}
+
 kshira_status kshira_rad_train_multiscale_step(
     kshira_rad_model *model, const kshira_image_f32 *image,
     const kshira_rad_box *target, int level,
@@ -1625,6 +1824,8 @@ kshira_status kshira_rad_train_multiscale_step(
     float features[32];
     float output[5 + RAD_MAX_CLASSES] = {0.0f};
     float gradients[5 + RAD_MAX_CLASSES];
+    float bias_gradients[5 + RAD_MAX_CLASSES];
+    float class_probabilities[RAD_MAX_CLASSES];
     int target_x;
     int target_y;
     int span;
@@ -1787,6 +1988,7 @@ kshira_status kshira_rad_train_multiscale_step(
         weight_scale = 1.0f;
         feature_scale = 1.0f;
     }
+    if (!class_softmax(model, output, class_probabilities)) return KSHIRA_ERR_RANGE;
     for (int o = 0; o < model->outputs; ++o) {
         float center_x = ((float)source_x + (float)source_x1) *
                          0.5f * (float)RAD_STRIDE;
@@ -1806,22 +2008,30 @@ kshira_status kshira_rad_train_multiscale_step(
             gradients[o] = output[o] - target_value;
             if (!isfinite(gradients[o])) return KSHIRA_ERR_RANGE;
             loss_sum += 0.5f * gradients[o] * gradients[o];
-        } else {
+        } else if (o == 4) {
             probability = sigmoid(output[o]);
-            target_value = o == 4 ? 1.0f :
-                           (o - 5 == target->class_id ? 1.0f : 0.0f);
+            target_value = 1.0f;
             gradients[o] = probability - target_value;
             if (!isfinite(gradients[o])) return KSHIRA_ERR_RANGE;
             loss_sum += 0.5f * (probability - target_value) *
                         (probability - target_value);
+        } else {
+            probability = class_probabilities[o - 5];
+            target_value = o - 5 == target->class_id ? 1.0f : 0.0f;
+            gradients[o] = probability - target_value;
+            if (!isfinite(gradients[o])) return KSHIRA_ERR_RANGE;
+            if (target_value > 0.0f) {
+                loss_sum -= logf(fmaxf(probability, 1.0e-12f));
+            }
         }
+        bias_gradients[o] = gradients[o];
     }
     if (!isfinite(loss_sum)) return KSHIRA_ERR_RANGE;
     if (config->update_mode != KSHIRA_UPDATE_FREEZE) {
         rad_head_delta_buffer *deltas = model->scale_head_deltas;
         if (deltas == NULL) return KSHIRA_ERR_MEMORY;
         for (int o = 0; o < model->outputs; ++o) {
-            float gradient_bias = gradients[o];
+            float gradient_bias = bias_gradients[o];
             float delta;
             float updated;
             if (kshira_apply_qas(NULL, 0U, &gradient_bias, 1U,
@@ -1829,7 +2039,6 @@ kshira_status kshira_rad_train_multiscale_step(
                 !normalize_qas_gradient(&gradient_bias, model->bits != KSHIRA_BITS_FLOAT)) {
                 return KSHIRA_ERR_RANGE;
             }
-            gradient_bias *= class_gradient_scale(model, o, target->class_id);
             delta = config->learning_rate * gradient_bias;
             updated = head_bias[o] - delta;
             if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;
@@ -1847,7 +2056,6 @@ kshira_status kshira_rad_train_multiscale_step(
                                                 model->bits != KSHIRA_BITS_FLOAT)) {
                         return KSHIRA_ERR_RANGE;
                     }
-                    gradient_weight *= class_gradient_scale(model, o, target->class_id);
                     delta = config->learning_rate * gradient_weight;
                     updated = head_weights[(size_t)o * (size_t)c + (size_t)ic] - delta;
                     if (!isfinite(delta) || !isfinite(updated)) return KSHIRA_ERR_RANGE;

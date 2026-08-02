@@ -1,6 +1,12 @@
 /* KSHIRA architecture adapter behind the public detector lifecycle. */
 
-enum { DET_KSHIRA_DEFAULT_CHANNELS = 8, DET_KSHIRA_MAX_DETECTIONS = 64 };
+enum {
+    DET_KSHIRA_DEFAULT_CHANNELS = 8,
+    DET_KSHIRA_MAX_DETECTIONS = 64,
+    /* Outside-box objectness negatives per sample. Two is enough to cut empty
+     * clutter without drowning the single positive update. */
+    DET_KSHIRA_BACKGROUND_SAMPLES = 2
+};
 
 static det_status det_status_from_kshira(kshira_status status) {
     switch (status) {
@@ -145,6 +151,46 @@ static int det_kshira_target_level(const det_model *model, const det_box *box) {
     return box_area / image_area < (1.0f / 16.0f) ? 1 : 2;
 }
 
+static int det_kshira_background_cell(const det_model *model,
+                                       const det_sample *sample, size_t start,
+                                       size_t *cell_index) {
+    int map_height;
+    int map_width;
+    size_t cells;
+    if (model == NULL || sample == NULL || cell_index == NULL) return 0;
+    map_height = kshira_rad_map_height(model->kshira.rad);
+    map_width = kshira_rad_map_width(model->kshira.rad);
+    if (map_height <= 0 || map_width <= 0 ||
+        (size_t)map_height > SIZE_MAX / (size_t)map_width) return 0;
+    cells = (size_t)map_height * (size_t)map_width;
+    for (size_t attempt = 0U; attempt < cells; ++attempt) {
+        size_t index = (start % cells + attempt) % cells;
+        int y = (int)(index / (size_t)map_width);
+        int x = (int)(index % (size_t)map_width);
+        /* Cell center in image pixels. Treat any center that lands inside a GT
+         * box as positive territory so background steps do not punch holes in
+         * objects and so interior object cells are not used as negatives. */
+        float cell_cx = ((float)x + 0.5f) * (float)sample->image.width /
+                        (float)map_width;
+        float cell_cy = ((float)y + 0.5f) * (float)sample->image.height /
+                        (float)map_height;
+        int on_object = 0;
+        for (int box_index = 0; box_index < sample->box_count; ++box_index) {
+            const det_box *box = &sample->boxes[box_index];
+            if (cell_cx >= box->x1 && cell_cx <= box->x2 &&
+                cell_cy >= box->y1 && cell_cy <= box->y2) {
+                on_object = 1;
+                break;
+            }
+        }
+        if (!on_object) {
+            *cell_index = index;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static det_status det_kshira_prepare_training(det_model *model,
                                                const det_train_config *config) {
     const kshira_phase_contract *contract;
@@ -206,11 +252,31 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
         while (config->max_samples <= 0 || seen < (size_t)config->max_samples) {
             det_sample sample;
             float sample_loss = 0.0f;
+            int sample_terms = 0;
             int next_status = dataset->next(dataset->user, &sample);
             if (next_status < 0) return DET_ERR_IO;
             if (next_status == 0) break;
             if (!det_kshira_sample_valid(model, &sample)) return DET_ERR_ARGUMENT;
-            if (sample.box_count == 0) return DET_ERR_UNSUPPORTED;
+            if (sample.box_count == 0) {
+                kshira_image_f32 image = {sample.image.data, sample.image.channels,
+                                          sample.image.height, sample.image.width};
+                float loss = 0.0f;
+                kshira_status step_status;
+                size_t cell_index;
+                if (model->train_updates > SIZE_MAX - updates) return DET_ERR_SHAPE;
+                if (!det_kshira_background_cell(model, &sample,
+                                                 model->train_updates + updates,
+                                                 &cell_index)) return DET_ERR_SHAPE;
+                step_status = kshira_session_background_step(
+                    &model->kshira, &image, cell_index,
+                    config->learning_rate, &loss);
+                if (step_status != KSHIRA_OK) {
+                    return det_status_from_kshira(step_status);
+                }
+                sample_loss = loss;
+                ++updates;
+                ++sample_terms;
+            }
             for (int box_index = 0; box_index < sample.box_count; ++box_index) {
                 const det_box *box = &sample.boxes[box_index];
                 kshira_image_f32 image = {sample.image.data, sample.image.channels,
@@ -231,8 +297,40 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
                 if (step_status != KSHIRA_OK) return det_status_from_kshira(step_status);
                 sample_loss += loss;
                 ++updates;
+                ++sample_terms;
             }
-            if (sample.box_count > 0) sample_loss /= (float)sample.box_count;
+            if (sample.box_count > 0) {
+                for (int background = 0;
+                     background < DET_KSHIRA_BACKGROUND_SAMPLES; ++background) {
+                    size_t total_updates;
+                    size_t cell_index;
+                    size_t background_index;
+                    if (model->train_updates > SIZE_MAX - updates) {
+                        return DET_ERR_SHAPE;
+                    }
+                    total_updates = model->train_updates + updates;
+                    background_index = total_updates ^ (total_updates >> 2U);
+                    if (det_kshira_background_cell(model, &sample, background_index,
+                                                    &cell_index)) {
+                        kshira_image_f32 image = {
+                            sample.image.data, sample.image.channels,
+                            sample.image.height, sample.image.width
+                        };
+                        float loss = 0.0f;
+                        kshira_status step_status =
+                            kshira_session_background_step(
+                                &model->kshira, &image, cell_index,
+                                config->learning_rate, &loss);
+                        if (step_status != KSHIRA_OK) {
+                            return det_status_from_kshira(step_status);
+                        }
+                        sample_loss += loss;
+                        ++updates;
+                        ++sample_terms;
+                    }
+                }
+            }
+            if (sample_terms > 0) sample_loss /= (float)sample_terms;
             loss_sum += sample_loss;
             ++seen;
             ++report->samples_seen;

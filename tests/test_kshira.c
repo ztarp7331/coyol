@@ -590,6 +590,36 @@ static void test_rad_state_roundtrip(void) {
     }
 }
 
+static void test_background_training(void) {
+    unsigned char memory[64U << 10];
+    float pixels[32 * 32] = {0.0f};
+    kshira_arena arena;
+    kshira_rad_model *model = NULL;
+    kshira_rad_spec spec = {32, 32, 1, 1, 4, 4, 71, 1};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_FULL, NULL, 0.1f
+    };
+    float first_loss = 0.0f;
+    float last_loss = 0.0f;
+    assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
+    assert(kshira_rad_train_background_step(model, &image, -1, 0,
+                                             &config, &last_loss) ==
+           KSHIRA_ERR_ARGUMENT);
+    assert(kshira_rad_train_background_step(model, &image, 0, 0,
+                                             &config, &first_loss) == KSHIRA_OK);
+    for (int step = 0; step < 20; ++step) {
+        assert(kshira_rad_train_background_step(model, &image, step % 8,
+                                                 (step * 3) % 8, &config,
+                                                 &last_loss) == KSHIRA_OK);
+    }
+    assert(isfinite(first_loss) && isfinite(last_loss) && last_loss < first_loss);
+    config.bits = KSHIRA_BITS_INT8;
+    assert(kshira_rad_train_background_step(model, &image, 1, 1,
+                                             &config, &last_loss) == KSHIRA_OK);
+}
+
 int main(void) {
     test_arena();
     test_quant();
@@ -601,6 +631,7 @@ int main(void) {
     test_domain_curriculum();
     test_proxy_metrics();
     test_rad_state_roundtrip();
+    test_background_training();
     puts("all kshira tests passed");
     return 0;
 }
