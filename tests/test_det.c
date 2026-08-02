@@ -1030,8 +1030,8 @@ static void test_integrated_kshira_architecture(void) {
     config.momentum = 0.5f;
     assert(det_train(model, &dataset, &config, &report) == DET_ERR_UNSUPPORTED);
     config.momentum = 0.0f;
-    /* 2 positive boxes + DET_KSHIRA_BACKGROUND_SAMPLES outside-box negatives. */
-    assert(report.samples_seen == 1U && report.updates == 4U &&
+    /* 2 positive boxes + 1 ordinary negative on epoch 0 (HNM warm-up). */
+    assert(report.samples_seen == 1U && report.updates == 3U &&
            !report.used_global_backward && isfinite(report.mean_loss));
     assert(det_predict(model, &storage.sample.image, 0.0f, detections, 8,
                        &count) == DET_OK);
@@ -1041,12 +1041,12 @@ static void test_integrated_kshira_architecture(void) {
     config = (det_train_config){DET_TRAIN_LOCAL_FAST, DET_PRECISION_INT8, 1,
                                 1.0e-4f, 0.0f, 0.1f, 1, 17, 0};
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
-    assert(report.samples_seen == 1U && report.updates == 4U &&
+    assert(report.samples_seen == 1U && report.updates == 3U &&
            det_model_precision(model) == DET_PRECISION_INT8);
     config = (det_train_config){DET_TRAIN_ODT, DET_PRECISION_INT4, 1,
                                 1.0e-4f, 0.0f, 0.1f, 1, 17, 0};
     assert(det_train(model, &dataset, &config, &report) == DET_OK);
-    assert(report.samples_seen == 1U && report.updates == 4U &&
+    assert(report.samples_seen == 1U && report.updates == 3U &&
            det_model_precision(model) == DET_PRECISION_INT4);
     storage.sample.box_count = 0;
     assert(det_train(model, &dataset, &config, &report) == DET_OK);

@@ -320,6 +320,7 @@ Your research job is to move a row from No → Yes with evidence, without breaki
 |---|---|
 | 2026-08-02 | Initial critique after real Kaggle multi-epoch work + center-sampling/HNM/focal/quality² landing |
 | 2026-08-03 | Tier-1: soft quality score `q(0.5+0.5q)c`, mild sqrt-IF CE (warm-up 64), light IoU box scale; F32 5ep TP 12 / R 0.026 / IoU 0.63; INT8 5ep TP 6 (was 0) |
+| 2026-08-03 | **Accepted experiment:** linear score, IoU-detached objectness target, adaptive positive radius, epoch-staged negatives. F32 5ep TP **18** / pred **890** / P **0.020** / R **0.040** / IoU **0.62** / F1 **0.027** (beats control TP 12 / F1 0.014) |
 
 When you close a flaw or invent a mechanism, append a row here and update §3/§7.
 

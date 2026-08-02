@@ -1471,10 +1471,8 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
                     }
                 }
                 {
-                    /* Mild quality emphasis: q * (0.5 + 0.5 q) * class.
-                     * Softer than pure q² (which killed 1-ep recall) while still
-                     * ranking high-objectness peaks above mid clutter. */
-                    float score = quality * (0.5f + 0.5f * quality) * best_class;
+                    /* Experiment B: linear calibrated score (no quality²). */
+                    float score = quality * best_class;
                     float cx;
                     float cy;
                     float left = fmaxf(0.0f, output[0]) * stride;
@@ -1571,18 +1569,30 @@ static kshira_status rad_train_positive_at_cell(
             center_y + pred_bottom * (float)RAD_STRIDE,
             target->class_id
         };
+        /* Detached IoU quality: treat as fixed target for objectness (no cyclic
+         * grad through the IoU expression itself). */
         float iou = rad_box_iou(&pred_box, target);
         float class_weight = 1.0f;
-        float obj_desired = 1.0f;
+        float obj_desired;
+        float map_cx = ((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE;
+        float map_cy = ((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE;
+        float centre_weight = 1.0f;
+        if (!isfinite(iou) || iou < 0.0f) iou = 0.0f;
+        if (iou > 1.0f) iou = 1.0f;
+        /* Experiment D: objectness target = clamp(IoU, 0.20, 1). */
+        obj_desired = iou < 0.20f ? 0.20f : iou;
         if (train_scope != 0) {
-            /* Soft Gaussian objectness for neighbor cells (center≈1). */
-            float map_cx = ((target->x1 + target->x2) * 0.5f) / (float)RAD_STRIDE;
-            float map_cy = ((target->y1 + target->y2) * 0.5f) / (float)RAD_STRIDE;
             float dx = (float)cell_x - map_cx;
             float dy = (float)cell_y - map_cy;
-            float sigma2 = 2.0f;
-            obj_desired = expf(-(dx * dx + dy * dy) / (2.0f * sigma2));
-            if (obj_desired < 0.25f) obj_desired = 0.25f;
+            float rx = fmaxf(1.0f, (target->x2 - target->x1) / (float)RAD_STRIDE * 0.25f);
+            float ry = fmaxf(1.0f, (target->y2 - target->y1) / (float)RAD_STRIDE * 0.25f);
+            if (rx > 3.0f) rx = 3.0f;
+            if (ry > 3.0f) ry = 3.0f;
+            centre_weight = expf(-(dx * dx) / (rx * rx) - (dy * dy) / (ry * ry));
+            if (centre_weight < 0.15f) centre_weight = 0.15f;
+            obj_desired *= centre_weight;
+            if (obj_desired < 0.15f) obj_desired = 0.15f;
+            if (obj_desired > 1.0f) obj_desired = 1.0f;
         }
         if (train_scope == 0 && target->class_id >= 0 &&
             target->class_id < model->spec.classes) {
@@ -1600,8 +1610,7 @@ static kshira_status rad_train_positive_at_cell(
                 if (class_weight > 2.0f) class_weight = 2.0f;
             }
         }
-        if (!isfinite(iou)) iou = 0.0f;
-        /* Light IoU term so it regularizes without drowning CE/objectness. */
+        /* Light IoU box regularizer (separate from detached objectness target). */
         loss_sum += 0.5f * (1.0f - iou);
         for (int o = 0; o < model->outputs; ++o) {
             float gradient;
@@ -1833,12 +1842,19 @@ kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_
                                    1.0f, 0, &primary_loss) != KSHIRA_OK) {
         return KSHIRA_ERR_RANGE;
     }
-    /* FCOS/ATSS-style center sampling: head-only positives on in-box neighbor
-     * cells. Expands the positive objectness map without full encoder cost.
-     * Class is trained only at the center cell to avoid multi-cell confusion. */
+    /* Experiment E: box-adaptive positive region (not fixed 3×3).
+     * radius = clamp(box_cells * 0.25, 1, 3); cells must stay inside GT. */
     if (config->update_mode != KSHIRA_UPDATE_FREEZE) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
+        float box_w_cells = (target->x2 - target->x1) / (float)RAD_STRIDE;
+        float box_h_cells = (target->y2 - target->y1) / (float)RAD_STRIDE;
+        int radius_x = (int)(box_w_cells * 0.25f + 0.5f);
+        int radius_y = (int)(box_h_cells * 0.25f + 0.5f);
+        if (radius_x < 1) radius_x = 1;
+        if (radius_y < 1) radius_y = 1;
+        if (radius_x > 3) radius_x = 3;
+        if (radius_y > 3) radius_y = 3;
+        for (int dy = -radius_y; dy <= radius_y; ++dy) {
+            for (int dx = -radius_x; dx <= radius_x; ++dx) {
                 int nx;
                 int ny;
                 float cell_cx;

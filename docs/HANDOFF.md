@@ -115,7 +115,8 @@ runs when `--eval-manifest` is set (F1-max threshold).
 | F32 pre-innovation | 5 | 0.003 | 1292 | 14 | 0.0108 | 0.0308 | 0.632 | prior multi-epoch best |
 | F32 post HNM/q² | 1 | 0.01 | 516 | 0 | 0.0000 | 0.0000 | 0.000 | quality² too harsh |
 | F32 post HNM/q² | 5 | 0.005 | 770 | 8 | 0.0104 | 0.0176 | 0.553 | mid |
-| **F32 Tier-1 (soft score + mild CE + IoU)** | **5** | **0.005** | **1220** | **12** | **0.0098** | **0.0264** | **0.6335** | **best F1 0.0143; thr@0.25 P=0.033** |
+| F32 Tier-1 (soft score + mild CE + IoU) | 5 | 0.005 | 1220 | 12 | 0.0098 | 0.0264 | 0.6335 | prior control F1 0.0143 |
+| **F32 proposed (linear score + IoU-obj + adaptive + +neg warm-up)** | **5** | **0.005** | **890** | **18** | **0.0202** | **0.0396** | **0.6209** | **accepted: TP≥16, F1 0.0268, IoU ok** |
 | INT8 Tier-1 | 5 | 0.003 | 1198 | 6 | 0.0050 | 0.0132 | 0.546 | first nonzero multi-ep INT8 TPs |
 | F32 | 10 | 0.01 | 330 | 2 | 0.0061 | 0.0044 | 0.529 | collapsed (LR too high) |
 
