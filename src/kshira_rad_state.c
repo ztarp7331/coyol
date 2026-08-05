@@ -37,12 +37,15 @@ static int rad_parameter_float_count(const kshira_rad_model *model,
                                      size_t *out) {
     size_t channels;
     size_t outputs;
+    size_t head_in;
     size_t total = 0U;
     size_t head_count;
     if (model == NULL || out == NULL) return 0;
     channels = (size_t)model->spec.feature_channels;
     outputs = (size_t)model->outputs;
-    head_count = outputs * channels + outputs;
+    head_in = (size_t)model->head_in;
+    if (head_in == 0U) head_in = channels + (size_t)RAD_CONTRAST_CHANNELS;
+    head_count = outputs * head_in + outputs;
     if (!add_count(&total, channels * (size_t)model->spec.channels * 9U) ||
         !add_count(&total, channels) ||
         !add_count(&total, (size_t)RAD_BRANCHES * (channels * 9U + channels)) ||
@@ -65,7 +68,10 @@ static int finite_buffer(const float *values, size_t count) {
 static int rad_parameters_finite(const kshira_rad_model *model) {
     size_t channels = (size_t)model->spec.feature_channels;
     size_t outputs = (size_t)model->outputs;
-    size_t head_weights = outputs * channels;
+    size_t head_in = (size_t)model->head_in;
+    size_t head_weights;
+    if (head_in == 0U) head_in = channels + (size_t)RAD_CONTRAST_CHANNELS;
+    head_weights = outputs * head_in;
     if (!finite_buffer(model->stem_weights,
                        channels * (size_t)model->spec.channels * 9U) ||
         !finite_buffer(model->stem_bias, channels)) return 0;
@@ -141,7 +147,8 @@ kshira_status kshira_rad_export_state(const kshira_rad_model *model, void *buffe
     }
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "KRAD", 4U);
-    header.version = 1U;
+    /* v2: head input = feature_channels + contrast channel. */
+    header.version = 2U;
     header.width = (uint32_t)model->spec.width;
     header.height = (uint32_t)model->spec.height;
     header.channels = (uint32_t)model->spec.channels;
@@ -164,21 +171,26 @@ kshira_status kshira_rad_export_state(const kshira_rad_model *model, void *buffe
     cursor = (uint8_t *)buffer + sizeof(header);
     channels = (size_t)model->spec.feature_channels;
     outputs = (size_t)model->outputs;
-    export_floats(&cursor, model->stem_weights,
-                  channels * (size_t)model->spec.channels * 9U);
-    export_floats(&cursor, model->stem_bias, channels);
-    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-        export_floats(&cursor, model->branch_weights[branch], channels * 9U);
-        export_floats(&cursor, model->branch_bias[branch], channels);
-    }
-    export_floats(&cursor, model->project_weights, channels * channels);
-    export_floats(&cursor, model->project_bias, channels);
-    export_floats(&cursor, model->head_weights, outputs * channels);
-    export_floats(&cursor, model->head_bias, outputs);
-    if (model->scale_heads_ready) {
-        for (int level = 1; level < RAD_SCALES; ++level) {
-            export_floats(&cursor, model->scale_head_weights[level], outputs * channels);
-            export_floats(&cursor, model->scale_head_bias[level], outputs);
+    {
+        size_t head_in = (size_t)model->head_in;
+        if (head_in == 0U) head_in = channels + (size_t)RAD_CONTRAST_CHANNELS;
+        export_floats(&cursor, model->stem_weights,
+                      channels * (size_t)model->spec.channels * 9U);
+        export_floats(&cursor, model->stem_bias, channels);
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            export_floats(&cursor, model->branch_weights[branch], channels * 9U);
+            export_floats(&cursor, model->branch_bias[branch], channels);
+        }
+        export_floats(&cursor, model->project_weights, channels * channels);
+        export_floats(&cursor, model->project_bias, channels);
+        export_floats(&cursor, model->head_weights, outputs * head_in);
+        export_floats(&cursor, model->head_bias, outputs);
+        if (model->scale_heads_ready) {
+            for (int level = 1; level < RAD_SCALES; ++level) {
+                export_floats(&cursor, model->scale_head_weights[level],
+                              outputs * head_in);
+                export_floats(&cursor, model->scale_head_bias[level], outputs);
+            }
         }
     }
     *written = (size_t)(cursor - (uint8_t *)buffer);
@@ -198,7 +210,8 @@ kshira_status kshira_rad_import_state(kshira_rad_model *model, const void *buffe
     memcpy(&header, buffer, sizeof(header));
     required = kshira_rad_state_bytes(model);
     if (required == 0U || bytes != required || memcmp(header.magic, "KRAD", 4U) != 0 ||
-        header.version != 1U || header.width != (uint32_t)model->spec.width ||
+        (header.version != 2U && header.version != 1U) ||
+        header.width != (uint32_t)model->spec.width ||
         header.height != (uint32_t)model->spec.height ||
         header.channels != (uint32_t)model->spec.channels ||
         header.classes != (uint32_t)model->spec.classes ||
@@ -217,6 +230,8 @@ kshira_status kshira_rad_import_state(kshira_rad_model *model, const void *buffe
         !isfinite(header.calibration_stem_scale) ||
         header.calibration_input_scale <= 0.0f ||
         header.calibration_stem_scale <= 0.0f) return KSHIRA_ERR_RANGE;
+    /* v1 checkpoints predate hybrid head; reject so callers retrain cleanly. */
+    if (header.version == 1U) return KSHIRA_ERR_RANGE;
     for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
         if (!isfinite(header.calibration_branch_scale[branch]) ||
             header.calibration_branch_scale[branch] <= 0.0f) return KSHIRA_ERR_RANGE;
@@ -225,21 +240,26 @@ kshira_status kshira_rad_import_state(kshira_rad_model *model, const void *buffe
     if (!encoded_floats_finite(cursor, count)) return KSHIRA_ERR_RANGE;
     channels = (size_t)model->spec.feature_channels;
     outputs = (size_t)model->outputs;
-    import_floats(&cursor, model->stem_weights,
-                  channels * (size_t)model->spec.channels * 9U);
-    import_floats(&cursor, model->stem_bias, channels);
-    for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
-        import_floats(&cursor, model->branch_weights[branch], channels * 9U);
-        import_floats(&cursor, model->branch_bias[branch], channels);
-    }
-    import_floats(&cursor, model->project_weights, channels * channels);
-    import_floats(&cursor, model->project_bias, channels);
-    import_floats(&cursor, model->head_weights, outputs * channels);
-    import_floats(&cursor, model->head_bias, outputs);
-    if (model->scale_heads_ready) {
-        for (int level = 1; level < RAD_SCALES; ++level) {
-            import_floats(&cursor, model->scale_head_weights[level], outputs * channels);
-            import_floats(&cursor, model->scale_head_bias[level], outputs);
+    {
+        size_t head_in = (size_t)model->head_in;
+        if (head_in == 0U) head_in = channels + (size_t)RAD_CONTRAST_CHANNELS;
+        import_floats(&cursor, model->stem_weights,
+                      channels * (size_t)model->spec.channels * 9U);
+        import_floats(&cursor, model->stem_bias, channels);
+        for (int branch = 0; branch < RAD_BRANCHES; ++branch) {
+            import_floats(&cursor, model->branch_weights[branch], channels * 9U);
+            import_floats(&cursor, model->branch_bias[branch], channels);
+        }
+        import_floats(&cursor, model->project_weights, channels * channels);
+        import_floats(&cursor, model->project_bias, channels);
+        import_floats(&cursor, model->head_weights, outputs * head_in);
+        import_floats(&cursor, model->head_bias, outputs);
+        if (model->scale_heads_ready) {
+            for (int level = 1; level < RAD_SCALES; ++level) {
+                import_floats(&cursor, model->scale_head_weights[level],
+                              outputs * head_in);
+                import_floats(&cursor, model->scale_head_bias[level], outputs);
+            }
         }
     }
     model->bits = (kshira_bit_mode)header.bits;

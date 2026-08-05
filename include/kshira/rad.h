@@ -69,14 +69,19 @@ kshira_status kshira_rad_predict(kshira_rad_model *model,
 kshira_status kshira_rad_train_step(kshira_rad_model *model, const kshira_image_f32 *image,
                                      const kshira_rad_box *target,
                                      const kshira_rad_train_config *config, float *loss);
-/* Peek objectness sigmoid at one map cell (for hard-negative mining). */
+/* Peek max class-quality sigmoid at one map cell (for hard-negative mining). */
 kshira_status kshira_rad_objectness_at(kshira_rad_model *model, const kshira_image_f32 *image,
                                         int cell_y, int cell_x, float *probability);
-/* Updates objectness only at one known-background P3 cell. FULL intentionally
- * leaves the encoder unchanged because an empty sample has no localization or
- * class target. */
+/* Surgical FP background: score-gate easy BG; update only argmax quality head
+ * row (mid-band LR boost). FULL = 13×13 encoder tile from winning-class grad. */
 kshira_status kshira_rad_train_background_step(
     kshira_rad_model *model, const kshira_image_f32 *image, int cell_y, int cell_x,
+    const kshira_rad_train_config *config, float *loss);
+/* Head-only ranking hinge: s_pos(class) ≥ s_neg_max + margin; surgical neg
+ * updates only the winning class head row on the FP cell. */
+kshira_status kshira_rad_train_rank_pair(
+    kshira_rad_model *model, const kshira_image_f32 *image,
+    int pos_y, int pos_x, int class_id, int neg_y, int neg_x, float margin,
     const kshira_rad_train_config *config, float *loss);
 kshira_status kshira_rad_train_multiscale_step(kshira_rad_model *model,
                                                 const kshira_image_f32 *image,

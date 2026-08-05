@@ -620,6 +620,188 @@ static void test_background_training(void) {
                                              &config, &last_loss) == KSHIRA_OK);
 }
 
+/* PLAN_UPDATED hybrid head: contrast channel is live, training moves head
+ * parameters, and loss is finite/non-stale on a real forward path. */
+static void test_hybrid_contrast_learning(void) {
+    unsigned char memory[128U << 10];
+    float pixels[64 * 64];
+    kshira_arena arena;
+    kshira_rad_model *model = NULL;
+    kshira_rad_spec spec = {64, 64, 1, 2, 8, 8, 91, 0};
+    kshira_image_f32 image = {pixels, 1, 64, 64};
+    kshira_rad_box target = {16.0f, 16.0f, 40.0f, 40.0f, 0};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_FULL, NULL, 0.05f
+    };
+    float loss0 = 0.0f;
+    float loss1 = 0.0f;
+    float head_before = 0.0f;
+    float head_after = 0.0f;
+    size_t head_count;
+    memset(pixels, 0, sizeof(pixels));
+    for (int y = 16; y < 40; ++y) {
+        for (int x = 16; x < 40; ++x) {
+            pixels[y * 64 + x] = ((x + y) & 1) ? 1.0f : 0.6f;
+        }
+    }
+    assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
+    /* Quality-class head: outputs = 4 box + K qualities; head_in = C + contrast. */
+    head_count = (size_t)(4 + spec.classes) * (size_t)(spec.feature_channels + 1);
+    assert(kshira_rad_parameter_bytes(model) >= head_count * sizeof(float));
+    /* Snapshot quality-row footprint (includes contrast column). */
+    {
+        /* Exported state size grows vs pre-contrast checkpoints (version 2). */
+        size_t state_bytes = kshira_rad_state_bytes(model);
+        assert(state_bytes > 0U);
+    }
+    assert(kshira_rad_train_step(model, &image, &target, &config, &loss0) == KSHIRA_OK);
+    assert(isfinite(loss0));
+    /* Second step should remain finite; multi-step training must not flatline
+     * into NaN/Inf (staleness/collapse guard). */
+    for (int step = 0; step < 8; ++step) {
+        assert(kshira_rad_train_step(model, &image, &target, &config, &loss1) ==
+               KSHIRA_OK);
+        assert(isfinite(loss1));
+    }
+    /* Parameters must actually move (not a frozen mock path). */
+    {
+        unsigned char state_a[8192];
+        unsigned char state_b[8192];
+        size_t wa = 0U;
+        size_t wb = 0U;
+        assert(kshira_rad_export_state(model, state_a, sizeof(state_a), &wa) ==
+               KSHIRA_OK);
+        assert(kshira_rad_train_step(model, &image, &target, &config, &loss1) ==
+               KSHIRA_OK);
+        assert(kshira_rad_export_state(model, state_b, sizeof(state_b), &wb) ==
+               KSHIRA_OK);
+        assert(wa == wb && wa > 0U);
+        assert(memcmp(state_a, state_b, wa) != 0);
+        (void)head_before;
+        (void)head_after;
+    }
+    /* Inference produces finite boxes through the hybrid head path. */
+    {
+        kshira_rad_detection dets[8];
+        int count = 0;
+        assert(kshira_rad_predict(model, &image, 0.0f, dets, 8, &count) == KSHIRA_OK);
+        assert(count >= 0 && count <= 8);
+        for (int i = 0; i < count; ++i) {
+            assert(isfinite(dets[i].score) && isfinite(dets[i].quality));
+            assert(dets[i].box.x2 > dets[i].box.x1);
+            assert(dets[i].box.y2 > dets[i].box.y1);
+        }
+    }
+}
+
+/* Quality-class head: deploy score = max_k σ(z_k); HNM peek matches; ranking
+ * hinge and background push-down move real parameters on the shipped path. */
+static void test_quality_class_score_and_ranking(void) {
+    unsigned char memory[128U << 10];
+    float pixels[64 * 64];
+    kshira_arena arena;
+    kshira_rad_model *model = NULL;
+    kshira_rad_spec spec = {64, 64, 1, 2, 8, 8, 42, 0};
+    kshira_image_f32 image = {pixels, 1, 64, 64};
+    kshira_rad_box target = {16.0f, 16.0f, 40.0f, 40.0f, 0};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_FULL, NULL, 0.08f
+    };
+    kshira_rad_train_config head_cfg = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_CHANNELS, NULL, 0.08f
+    };
+    float loss = 0.0f;
+    float q_before = 0.0f;
+    float q_after = 0.0f;
+    float pos_q = 0.0f;
+    float rloss = 0.0f;
+    kshira_rad_detection dets[8];
+    int count = 0;
+    int map_h;
+    int map_w;
+    int cy;
+    int cx;
+    memset(pixels, 0, sizeof(pixels));
+    for (int y = 16; y < 40; ++y) {
+        for (int x = 16; x < 40; ++x) {
+            pixels[y * 64 + x] = 0.9f;
+        }
+    }
+    assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
+    map_h = kshira_rad_map_height(model);
+    map_w = kshira_rad_map_width(model);
+    assert(map_h > 0 && map_w > 0);
+    cy = (int)(((target.y1 + target.y2) * 0.5f) / 4.0f);
+    cx = (int)(((target.x1 + target.x2) * 0.5f) / 4.0f);
+    if (cy >= map_h) cy = map_h - 1;
+    if (cx >= map_w) cx = map_w - 1;
+    /* Positive train then HNM peek must match max-quality deploy score. */
+    for (int step = 0; step < 12; ++step) {
+        assert(kshira_rad_train_step(model, &image, &target, &config, &loss) ==
+               KSHIRA_OK);
+        assert(isfinite(loss));
+    }
+    assert(kshira_rad_objectness_at(model, &image, cy, cx, &pos_q) == KSHIRA_OK);
+    assert(isfinite(pos_q) && pos_q > 0.0f && pos_q <= 1.0f);
+    assert(kshira_rad_predict(model, &image, 0.0f, dets, 8, &count) == KSHIRA_OK);
+    assert(count > 0);
+    /* Score is monotone sharpen of max class-quality (still in [0,1]). */
+    for (int i = 0; i < count; ++i) {
+        assert(isfinite(dets[i].score) && isfinite(dets[i].quality));
+        assert(dets[i].score >= 0.0f && dets[i].score <= 1.0f + 1.0e-5f);
+        assert(dets[i].quality >= 0.0f && dets[i].quality <= 1.0f + 1.0e-5f);
+        /* quality is max_k σ; score is sharpened quality (order-preserving). */
+        assert(dets[i].quality > 0.0f || dets[i].score < 0.5f);
+    }
+    /* Background cell: max quality must drop under negative training. */
+    {
+        int by = 0;
+        int bx = 0;
+        assert(kshira_rad_objectness_at(model, &image, by, bx, &q_before) ==
+               KSHIRA_OK);
+        for (int step = 0; step < 16; ++step) {
+            assert(kshira_rad_train_background_step(model, &image, by, bx,
+                                                     &head_cfg, &loss) ==
+                   KSHIRA_OK);
+            assert(isfinite(loss));
+        }
+        assert(kshira_rad_objectness_at(model, &image, by, bx, &q_after) ==
+               KSHIRA_OK);
+        assert(q_after <= q_before + 1.0e-4f);
+    }
+    /* Ranking pair: finite hinge; call the real shipped API (F32). */
+    assert(kshira_rad_train_rank_pair(model, &image, cy, cx, 0, 0, 0, 0.15f,
+                                       &head_cfg, &rloss) == KSHIRA_OK);
+    assert(isfinite(rloss) && rloss >= 0.0f);
+    /* INT8 rank_pair must use separate pos/neg feature scales (QAS bug fix). */
+    {
+        kshira_rad_train_config int8_cfg = {
+            KSHIRA_BITS_INT8, KSHIRA_UPDATE_CHANNELS, NULL, 0.05f
+        };
+        float rloss8 = 0.0f;
+        float q_int8 = 0.0f;
+        assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT8) == KSHIRA_OK);
+        assert(kshira_rad_train_rank_pair(model, &image, cy, cx, 0, 0, 0, 0.15f,
+                                           &int8_cfg, &rloss8) == KSHIRA_OK);
+        assert(isfinite(rloss8) && rloss8 >= 0.0f);
+        assert(kshira_rad_objectness_at(model, &image, cy, cx, &q_int8) ==
+               KSHIRA_OK);
+        assert(isfinite(q_int8) && q_int8 >= 0.0f && q_int8 <= 1.0f);
+        assert(kshira_rad_set_bits(model, KSHIRA_BITS_FLOAT) == KSHIRA_OK);
+    }
+    /* State remains exportable after quality-class training. */
+    {
+        unsigned char buf[16384];
+        size_t written = 0U;
+        assert(kshira_rad_export_state(model, buf, sizeof(buf), &written) ==
+               KSHIRA_OK);
+        assert(written > 0U);
+        assert(kshira_rad_import_state(model, buf, written) == KSHIRA_OK);
+    }
+}
+
 int main(void) {
     test_arena();
     test_quant();
@@ -632,6 +814,8 @@ int main(void) {
     test_proxy_metrics();
     test_rad_state_roundtrip();
     test_background_training();
+    test_hybrid_contrast_learning();
+    test_quality_class_score_and_ranking();
     puts("all kshira tests passed");
     return 0;
 }

@@ -248,8 +248,10 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
     start = now_ms();
     for (int epoch = 0; epoch < config->epochs; ++epoch) {
         size_t seen = 0U;
-        /* Inverse-time LR decay: keeps multi-epoch from collapsing objectness. */
-        float epoch_lr = config->learning_rate / (1.0f + 0.35f * (float)epoch);
+        /* Milder inverse-time decay: late epochs still move mid-band ranking
+         * weights. Surgical FP updates keep per-epoch cost close to the old
+         * 0.35 schedule, so more epochs fit similar wall-clock. */
+        float epoch_lr = config->learning_rate / (1.0f + 0.20f * (float)epoch);
         if (!(epoch_lr > 0.0f) || !isfinite(epoch_lr)) return DET_ERR_ARGUMENT;
         if (dataset->reset != NULL) dataset->reset(dataset->user);
         while (config->max_samples <= 0 || seen < (size_t)config->max_samples) {
@@ -301,103 +303,169 @@ static det_status det_kshira_train(det_model *model, const det_dataset *dataset,
                 ++sample_terms;
             }
             if (sample.box_count > 0) {
-                /* Experiment C: staged negatives.
-                 * ep0-1: 1 ordinary negative (no HNM)
-                 * ep2:   at most 1 hard negative
-                 * ep3+:  at most 2 hard negatives */
+                /* Two-level HNM + surgical FP ranking:
+                 * Level A: head-only on mid/high score BG (score-gated).
+                 * Level B: top-1 FULL encoder tile (late epochs only).
+                 * Ranking pairs: GT centres vs hardest negs (early + late).
+                 * Surgical path only tweaks winning-class head weights, so
+                 * more epochs cost ~same wall-clock as denser all-class BG. */
                 kshira_image_f32 image = {
                     sample.image.data, sample.image.channels,
                     sample.image.height, sample.image.width
                 };
-                int hard_budget = 0;
-                int ordinary = 1;
-                if (epoch >= 3) hard_budget = 2;
-                else if (epoch >= 2) hard_budget = 1;
-                if (hard_budget == 0) {
+                enum { DET_KSHIRA_HNM_HEAD = 6, DET_KSHIRA_HNM_ENC = 1,
+                       DET_KSHIRA_HNM_PROBE = 20, DET_KSHIRA_RANK_PAIRS = 4 };
+                size_t hard_cells[DET_KSHIRA_HNM_HEAD];
+                float hard_scores[DET_KSHIRA_HNM_HEAD];
+                int hard_xy[DET_KSHIRA_HNM_HEAD][2];
+                int hard_count = 0;
+                size_t probe_base = model->train_updates + updates;
+                int map_width = kshira_rad_map_width(model->kshira.rad);
+                int map_height = kshira_rad_map_height(model->kshira.rad);
+                /* Staged head HNM (1→2→3) + late encoder hard-neg. */
+                int head_budget = (epoch < 1) ? 1 : ((epoch < 2) ? 2 : 3);
+                int enc_budget = (epoch < 3) ? 0 : DET_KSHIRA_HNM_ENC;
+                for (int probe = 0; probe < DET_KSHIRA_HNM_PROBE; ++probe) {
                     size_t cell_index;
-                    if (det_kshira_background_cell(
-                            model, &sample, model->train_updates + updates,
+                    float quality = 0.0f;
+                    int cell_x;
+                    int cell_y;
+                    int already = 0;
+                    int too_close = 0;
+                    if (map_width <= 0 || map_height <= 0) break;
+                    if (!det_kshira_background_cell(
+                            model, &sample,
+                            probe_base + (size_t)probe * 97U +
+                                (size_t)probe * 13U + (size_t)epoch * 31U,
                             &cell_index)) {
-                        float loss = 0.0f;
-                        kshira_status step_status;
-                        if (model->train_updates > SIZE_MAX - updates) {
-                            return DET_ERR_SHAPE;
-                        }
-                        step_status = kshira_session_background_step(
-                            &model->kshira, &image, cell_index, epoch_lr, &loss);
-                        if (step_status != KSHIRA_OK) {
-                            return det_status_from_kshira(step_status);
-                        }
-                        sample_loss += loss;
-                        ++updates;
-                        ++sample_terms;
+                        break;
                     }
-                    (void)ordinary;
-                } else {
-                    size_t hard_cells[2];
-                    float hard_scores[2];
-                    int hard_count = 0;
-                    size_t probe_base = model->train_updates + updates;
-                    int map_width = kshira_rad_map_width(model->kshira.rad);
-                    int map_height = kshira_rad_map_height(model->kshira.rad);
-                    for (int probe = 0; probe < 8; ++probe) {
-                        size_t cell_index;
-                        float objectness = 0.0f;
-                        int cell_x;
-                        int cell_y;
-                        int already = 0;
-                        if (map_width <= 0 || map_height <= 0) break;
-                        if (!det_kshira_background_cell(
-                                model, &sample,
-                                probe_base + (size_t)probe * 97U +
-                                    (size_t)probe * 13U,
-                                &cell_index)) {
+                    for (int i = 0; i < hard_count; ++i) {
+                        if (hard_cells[i] == cell_index) {
+                            already = 1;
                             break;
                         }
-                        for (int i = 0; i < hard_count; ++i) {
-                            if (hard_cells[i] == cell_index) {
-                                already = 1;
-                                break;
-                            }
-                        }
-                        if (already) continue;
-                        cell_x = (int)(cell_index % (size_t)map_width);
-                        cell_y = (int)(cell_index / (size_t)map_width);
-                        if (kshira_rad_objectness_at(model->kshira.rad, &image,
-                                                     cell_y, cell_x,
-                                                     &objectness) != KSHIRA_OK) {
-                            return DET_ERR_SHAPE;
-                        }
-                        if (hard_count < hard_budget) {
-                            hard_cells[hard_count] = cell_index;
-                            hard_scores[hard_count] = objectness;
-                            ++hard_count;
-                        } else {
-                            int worst = 0;
-                            for (int i = 1; i < hard_count; ++i) {
-                                if (hard_scores[i] < hard_scores[worst]) worst = i;
-                            }
-                            if (objectness > hard_scores[worst]) {
-                                hard_cells[worst] = cell_index;
-                                hard_scores[worst] = objectness;
-                            }
+                    }
+                    if (already) continue;
+                    cell_x = (int)(cell_index % (size_t)map_width);
+                    cell_y = (int)(cell_index / (size_t)map_width);
+                    /* Spatial diversity: skip cells within radius 2 of a kept hard. */
+                    for (int i = 0; i < hard_count; ++i) {
+                        int dx = cell_x - hard_xy[i][0];
+                        int dy = cell_y - hard_xy[i][1];
+                        if (dx * dx + dy * dy <= 4) {
+                            too_close = 1;
+                            break;
                         }
                     }
-                    for (int background = 0; background < hard_count; ++background) {
-                        float loss = 0.0f;
-                        kshira_status step_status;
-                        if (model->train_updates > SIZE_MAX - updates) {
-                            return DET_ERR_SHAPE;
+                    if (too_close) continue;
+                    if (kshira_rad_objectness_at(model->kshira.rad, &image,
+                                                 cell_y, cell_x,
+                                                 &quality) != KSHIRA_OK) {
+                        return DET_ERR_SHAPE;
+                    }
+                    /* Prefer mid/high band FPs (≥0.15); easy BG is free skip. */
+                    if (quality < 0.15f) continue;
+                    if (hard_count < head_budget) {
+                        hard_cells[hard_count] = cell_index;
+                        hard_scores[hard_count] = quality;
+                        hard_xy[hard_count][0] = cell_x;
+                        hard_xy[hard_count][1] = cell_y;
+                        ++hard_count;
+                    } else {
+                        int worst = 0;
+                        for (int i = 1; i < hard_count; ++i) {
+                            if (hard_scores[i] < hard_scores[worst]) worst = i;
                         }
-                        step_status = kshira_session_background_step(
-                            &model->kshira, &image, hard_cells[background],
-                            epoch_lr, &loss);
-                        if (step_status != KSHIRA_OK) {
-                            return det_status_from_kshira(step_status);
+                        if (quality > hard_scores[worst]) {
+                            hard_cells[worst] = cell_index;
+                            hard_scores[worst] = quality;
+                            hard_xy[worst][0] = cell_x;
+                            hard_xy[worst][1] = cell_y;
                         }
-                        sample_loss += loss;
-                        ++updates;
-                        ++sample_terms;
+                    }
+                }
+                /* Sort hard set descending by score (selection sort, small N). */
+                for (int i = 0; i < hard_count; ++i) {
+                    int best = i;
+                    for (int j = i + 1; j < hard_count; ++j) {
+                        if (hard_scores[j] > hard_scores[best]) best = j;
+                    }
+                    if (best != i) {
+                        size_t tc = hard_cells[i];
+                        float ts = hard_scores[i];
+                        int tx = hard_xy[i][0];
+                        int ty = hard_xy[i][1];
+                        hard_cells[i] = hard_cells[best];
+                        hard_scores[i] = hard_scores[best];
+                        hard_xy[i][0] = hard_xy[best][0];
+                        hard_xy[i][1] = hard_xy[best][1];
+                        hard_cells[best] = tc;
+                        hard_scores[best] = ts;
+                        hard_xy[best][0] = tx;
+                        hard_xy[best][1] = ty;
+                    }
+                }
+                for (int background = 0; background < hard_count; ++background) {
+                    float loss = 0.0f;
+                    kshira_status step_status;
+                    kshira_rad_train_config bg_cfg;
+                    kshira_bit_mode bits = kshira_rad_bits(model->kshira.rad);
+                    if (model->train_updates > SIZE_MAX - updates) {
+                        return DET_ERR_SHAPE;
+                    }
+                    bg_cfg.bits = bits;
+                    /* Level B: top enc_budget use FULL (encoder tile); rest head. */
+                    bg_cfg.update_mode = (background < enc_budget) ?
+                                         KSHIRA_UPDATE_FULL : KSHIRA_UPDATE_CHANNELS;
+                    bg_cfg.channel_mask = &model->kshira.channel_mask;
+                    bg_cfg.learning_rate = epoch_lr;
+                    step_status = kshira_rad_train_background_step(
+                        model->kshira.rad, &image, hard_xy[background][1],
+                        hard_xy[background][0], &bg_cfg, &loss);
+                    if (step_status != KSHIRA_OK) {
+                        return det_status_from_kshira(step_status);
+                    }
+                    sample_loss += loss;
+                    ++updates;
+                    ++sample_terms;
+                }
+                /* Ranking after warm-up (epoch≥2). Head-only surgical pairs
+                 * stay cheap; INT8 ep5 still ranks on epochs 2..4. */
+                if (hard_count > 0 && epoch >= 2) {
+                    kshira_rad_train_config rank_cfg;
+                    int rank_done = 0;
+                    int neg_slots = hard_count < 2 ? hard_count : 2;
+                    rank_cfg.bits = kshira_rad_bits(model->kshira.rad);
+                    rank_cfg.update_mode = KSHIRA_UPDATE_CHANNELS;
+                    rank_cfg.channel_mask = &model->kshira.channel_mask;
+                    rank_cfg.learning_rate = epoch_lr * 0.30f;
+                    for (int box_index = 0;
+                         box_index < sample.box_count &&
+                         rank_done < DET_KSHIRA_RANK_PAIRS;
+                         ++box_index) {
+                        const det_box *box = &sample.boxes[box_index];
+                        int pos_x = (int)(((box->x1 + box->x2) * 0.5f) / 4.0f);
+                        int pos_y = (int)(((box->y1 + box->y2) * 0.5f) / 4.0f);
+                        if (map_width <= 0 || map_height <= 0) break;
+                        if (pos_x < 0) pos_x = 0;
+                        if (pos_y < 0) pos_y = 0;
+                        if (pos_x >= map_width) pos_x = map_width - 1;
+                        if (pos_y >= map_height) pos_y = map_height - 1;
+                        for (int ni = 0; ni < neg_slots &&
+                             rank_done < DET_KSHIRA_RANK_PAIRS; ++ni) {
+                            float rloss = 0.0f;
+                            kshira_status rs = kshira_rad_train_rank_pair(
+                                model->kshira.rad, &image, pos_y, pos_x,
+                                box->class_id, hard_xy[ni][1], hard_xy[ni][0],
+                                0.12f, &rank_cfg, &rloss);
+                            if (rs != KSHIRA_OK) {
+                                return det_status_from_kshira(rs);
+                            }
+                            sample_loss += rloss;
+                            ++sample_terms;
+                            ++rank_done;
+                        }
                     }
                 }
             }

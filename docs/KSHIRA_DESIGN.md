@@ -1,215 +1,244 @@
-# KSHIRA implementation contract
+# KSHIRA implementation contract (reviewer edition)
 
-KSHIRA (Kernel-Sparse Hierarchical Inference & Runtime Adaptation) is an
-architecture profile in the C detector family. Its RAD/SMRE implementation
-remains split into focused internal modules, but callers select it through the
-same `det_model` lifecycle and dataset contract as the compatibility graph.
-Measurements remain profile-specific so integration does not blur accuracy or
-timing claims.
+**Date:** 2026-08-05  
+**Authority:** `PLAN_UPDATED.md` for design intent; this file for what the tree actually implements.  
+**Pair with:** `docs/HANDOFF.md` (metrics), `docs/RESEARCH_CRITIQUE.md` (gaps), `docs/reviewer_response.md` (next ranking path).
 
-## Contracts already implemented
+KSHIRA is an **architecture profile** of `det_model`. Callers use the same public
+lifecycle as CDET; they select KSHIRA via `det_model_spec.architecture`.
 
-- `kshira_arena`: caller-owned bump allocation, reset, and high-water tracking.
-- `kshira_quant`: symmetric INT4 (`[-7, 7]`) and INT8 (`[-127, 127]`) quantizers,
-  packed nibbles, explicit INT4-to-INT8 toggle storage, and QAS gradient
-  scaling.
-- `kshira_sparse`: channel masks and conservative peak-memory estimates for
-  freeze, bias-only, channel-sparse, and full updates, plus arena-cap plan
-  admission.
-- `kshira_phase`: validation and ordered driver transitions for PRE, TRAIN, and
-  ODT bit/update/QAS contracts.
-- `kshira_session`: caller-owned composition of the arena, RAD model, phase
-  driver, and channel mask; the session test runs FP32 PRE, INT8 TRAIN, and
-  INT4 ODT without reallocating.
-- `kshira_rad_build` now treats model construction as a transaction: direct
-  callers get the original arena offset/high-water and a null model on any
-  allocation or initialization failure, matching the session rollback
-  contract.
-- Full-update training now uses a straight-through single-target gradient path
-  through projection, depthwise dilated branches, and the stem. Encoder updates
-  honor the sparse channel mask and validate aggregate finite deltas before
-  committing them, including INT8/INT4 modes.
-- `kshira_domain` provides ten deterministic, balanced curriculum domains
-  (textures, edges, rings, gradients, sparse points, and noise) with one target
-  box per sample. The local training path computes only the nine-by-nine map
-  tile needed by the largest dilation. On the development WSL host, the
-  160 x 160 / 5,000-sample Release harness measured 315--359 ms across the
-  latest three WSL runs with all encoder channels enabled and 258,365 bytes
-  high-water before the arena-backed delta scratch; host load and ASAN affect
-  timing.
-  The image buffer is caller-owned outside that arena (102,400 bytes for this
-  harness), and the timer is a host diagnostic rather than an energy meter.
-- `kshira_rad_calibrate` runs a full-map representative pass after quantized
-  training and persists input, stem, and per-branch activation scales in the
-  caller-owned model. Local target training and full-map inference then share
-  those deployment scales; changing bit mode or resetting the model clears the
-  calibration state. Head feature quantization remains per-cell so the bounded
-  top-K head does not lose small activation signals.
-- `kshira_eval` supplies allocation-free IoU/class-hit metrics. The M9 harness
-  runs FP32, INT8, and INT4 over the same 5,000-sample curriculum, calibrates
-  quantized models on one sample from each domain, and evaluates held-out
-  samples using the highest-score detection at a 0.25 threshold. The latest
-  release run reports FP32 IoU 0.311, INT8 IoU 0.475, and INT4 IoU 0.435, with
-  quantized loss ratios 0.426 and 0.509; the plain ASAN harness also completes.
-  These are synthetic proxy results, not COCO accuracy or board-power claims.
-- M13 adds an inference-only three-scale view: P4 and P5 are formed by
-  pooling the existing stride-4 fused map one cell at a time, then merged with
-  P3 through the bounded top-K path without allocating additional feature maps.
-  This keeps the 256 KiB high-water unchanged and raises recent held-out
-  evaluation to about 0.89--1.05 s aggregate (8.9--10.5 ms per image). The
-  current training step still supervises only the P3 head, so P4/P5 outputs are
-  experimental and are not a qualified multi-scale accuracy result.
-- Reusing the per-step input and stem-tile scales removes duplicate full-image
-  scans from the scalar full-encoder path. M11 adds a transactional encoder
-  delta cache: projection, dilated-branch, and stem deltas are preflighted
-  against one frozen parameter snapshot, then committed only after the whole
-  update is finite. Three consecutive Release runs on the development WSL
-  host measured INT8 0.663--0.675 s and INT4 0.654--0.671 s for 5,000
-  quantized samples; every run reports `edge_train_gate=PASS`. Recent held-out
-  evaluation is about 0.76--0.86 s aggregate (7.6--8.6 ms per image).
-  Instrumented ASAN timing is diagnostic and remains above the strict gate;
-  the Release result is host-specific evidence, not a board or FPGA claim.
-- M12 moves the encoder delta cache into the caller-owned arena and sizes it
-  from the configured feature/input channels. The 160 x 160 / 8-feature
-  benchmark now reports 260,025 bytes high-water inside the 256 KiB arena,
-  including this scratch, with no per-step stack allocation. This removes the
-  fixed stack burden but leaves only about 2.1 KiB of headroom for this profile;
-  larger feature maps must be admitted by the sparse/arena planner before use.
-- M15 adds optional scale-head banks through `multiscale_heads=1`. P4/P5 ODT
-  updates use the pooled source region rather than stale cells, keep separate
-  trained-level readiness, and preflight all enabled bias/weight deltas before
-  committing them. `UPDATE_BIAS` leaves scale-head weights unchanged, while
-  `UPDATE_FULL` is rejected for this head-only phase. The optional banks and
-  their scratch raise the measured 160 x 160 profile to 261,729 bytes, leaving
-  415 bytes in the 256 KiB arena; the default `multiscale_heads=0` profile is
-  unchanged.
-- `kshira_domain_bench` now reports per-mode `train_gate`, aggregate INT8/INT4
-  `edge_train_gate`, and per-image evaluation latency as explicit diagnostics.
-- The balanced domain generator uses an exact zero-fill fast path for its
-  non-noise backgrounds; this does not change the samples or close the
-  network-bound INT8 timing gate.
+**Multi-objective goal (not arena-only):** accuracy, CPU time-to-accuracy, peak
+train memory, portable custom C kernels, quantized deploy/adapt — simultaneously.
+See `docs/reviewer_response.md` (Fast-Convergence Path).
 
-All KSHIRA modules use caller-owned buffers and return explicit failure statuses.
-The `kshira_tests` executable covers alignment, overflow/failure paths, pack /
-unpack round trips, QAS identities, sparse masks, and phase compatibility.
+**Three layers of truth in this document:**
 
-The RAD M3--M4 branch is also present behind `kshira_rad.h`: its 160 x 160
-8-feature configuration uses 260,025 bytes high-water inside a 256 KiB arena
-including the reusable training-delta scratch and emits at most 16 top-K
-candidates without NMS. M5 now dispatches real
-integer MACs for FP32/INT8/INT4 modes and applies QAS to a sparse head update;
-the Release harness measured approximately 1.35 ms F32, 9.52 ms INT8, and
-9.10 ms INT4 per image on the pinned development CPU. These measurements do
-not imply board power or detector accuracy yet. Qualified scale-aware accuracy
-and combined training timing remain open; optional quantized P4/P5 head updates
-are now available in M15.
+1. **Closed dual-run baseline** — F1 **0.0430** / TP **26** (pre quality-class).  
+2. **Surgical QC dual-run (locked)** — F1 **0.0355** / TP **20** (quality-class +
+   surgical FP / ranking); see `HANDOFF.md` §5.1c. Ranking mid-band still open.  
+3. **Phase 2+** — budgeted dense-to-sparse train, data, engine — not yet dual-run
+   as a new accuracy bar.
 
-## Architecture combination
+---
 
-The existing `det_*` implementation remains the compatibility baseline: it has
-real P3/P4/P5 features, learned neck stages, dual assignment banks, model I/O,
-evaluation, and FP32 training with INT8/W4A8 inference. Its source is now split
-into ordered implementation units instead of one monolithic translation file.
+## 1. Public lifecycle
 
-The KSHIRA RAD branch will use:
+```
+det_context_create(arena_bytes)
+  → det_model_build(spec with DET_ARCH_KSHIRA)
+  → det_train / det_predict / det_evaluate
+  → det_save / det_load
+  → det_model_destroy / det_context_destroy
+```
 
-1. a compact depthwise-separable encoder;
-2. parallel dilated depthwise branches (`d=1,2,4`) fused into one map;
-3. a bounded top-K set head with quality scores and greedy one-to-one matching;
-4. real quantized forward/backward arithmetic with QAS;
-5. sparse channel/bias updates under a measured arena cap.
+Dataset-neutral: adapters (`det_manifest_*`, callback datasets) supply
+`det_image` + `det_box[]`. No COCO/YOLO parsers inside kernels.
 
-The branch is accepted only when it reports small-object proxy IoU, quantized
-loss recovery, high-water bytes, toggle cost, and latency against the baseline.
-No 1 W or 256 KiB claim is made until measured on selected hardware.
+---
 
-## Next milestones
+## 2. Module map
 
-- M3: static explicit forward/backward interfaces for the KSHIRA operators. (forward path landed)
-- M4: RAD single-map detector and top-K head behind a separate API. (landed)
-- M5: detector-integrated real INT8/INT4 forward plus QAS-scaled sparse head
-  training. (landed; M7 adds the sparse full-encoder path)
-- M6: PRE/TRAIN/ODT driver with checkpoint contracts and hard arena failure.
-- M7: ten-domain generators, local receptive-field training, and the 5,000-image
-  edge harness (landed; accuracy and energy gates remain open).
-- M8: quantized multi-domain recovery and proxy detection qualification
-  (harness landed; recovery gate open).
-- M9: persistent full-map activation calibration, quantized class-balance
-  updates, and INT4/INT8 proxy recovery (landed on the synthetic gate).
-- M11: transactional full-encoder delta cache and a strict Release INT8/INT4
-  sub-second training gate (landed on the synthetic 5,000-sample harness).
-- M12: arena-backed, spec-sized delta scratch (landed); multi-scale RAD
-  feature integration and end-to-end dataset-scale qualification remain open.
-- M13: inference-only pooled P3/P4/P5 candidate integration (landed); scale-
-  aware assignment and head training remain open.
-- M14: direct RAD arena transaction/rollback hardening (landed); scale-aware
-  training with separately qualified head/encoder gradients remains open.
-- M15: optional `multiscale_heads=1` allocation and ODT-only P4/P5 head
-  training (landed). `kshira_rad_train_multiscale_step` and the session wrapper
-  train level 1/2 heads in caller-owned transactional scratch. The RAD API
-  supports FREEZE, BIAS, or channel-sparse updates; the session contract
-  selects channel-sparse ODT, and FULL is intentionally rejected because the
-  validated encoder/P3 path remains the separate reference. Pooled ODT forward
-  now computes the complete bounded source region, and inference falls back to
-  the base head for any scale that has not completed an update. The Release
-  multiscale harness processes 5,000 base plus 5,000 ODT samples and reports
-  separate base, ODT, combined, and inference gates. Recent runs are roughly
-  0.78--1.03 s base, 0.97--1.21 s ODT, and 9.8--11.9 ms per eval image, with
-  261,729/262,144 bytes high-water (415 bytes free). The combined 10,000-step
-  training gate remains open; these are synthetic host measurements, not COCO,
-  FPGA, or 1 W qualification. ASAN timing is diagnostic only.
-- M16a precomputes packed branch and projection weights for each quantized ODT
-  sample, reusing their scales across all pooled cells. This reduces inner-loop
-  requantization without changing arena layout or the validated P3/encoder
-  path. Repeated Release runs put INT8 ODT near 0.94--0.98 s and INT4 near
-  1.01--1.04 s; INT4 and the combined 10,000-step gate remain open.
-- M16b1 reuses one 32-channel branch quantization cache while materializing all
-  pooled branch outputs before projection. This removes 576 bytes from the
-  multiscale step's automatic cache footprint without changing arena usage or
-  quantized results. Latest repeated Release runs put INT8 ODT near 0.94--0.96
-  s and INT4 near 0.90--0.94 s; both per-phase gates passed in those runs.
-- M16b2 overlays the transactional encoder and optional multi-scale head delta
-  descriptors on one caller-owned float workspace because those update paths
-  are mutually exclusive. The optional profile high-water fell from 261,729 to
-  261,181 bytes (963 bytes free in the 256 KiB harness), while the default
-  profile remains covered by the same tests. The multiscale harness now reports
-  P4/P5 sample counts, per-level proxy IoU/class accuracy, and per-level ODT
-  loss; a current Release run measured INT8 P4/P5 IoU 0.451/0.562 and INT4
-  0.427/0.497 on the synthetic held-out stream. These are scale-aware proxy
-  diagnostics, not COCO accuracy; raw-input training, FPGA lowering, and
-  measured hardware energy remain open.
-- M17 adds `DET_ARCH_KSHIRA` to the main `det_model_spec`. Each selected model
-  owns an independent bounded KSHIRA arena, so original and peer models can
-  coexist under one context. The public `det_train` path now sequences F32 PRE,
-  INT8 TRAIN, and INT4 multi-scale ODT, while `det_predict` and `det_evaluate`
-  dispatch through the same model handle. The shared raw-manifest adapter can
-  therefore feed either architecture without a KSHIRA-specific dataset API.
-  The current integration explicitly rejects CDET W4A8, nonzero momentum,
-  GLOBAL_BP semantics, and zero-box negative training on KSHIRA rather than
-  silently approximating those contracts.
-- M18 adds the integrated version-9 checkpoint. Its pointer-free CRC32 payload
-  preserves phase/update counters, sparse-channel mask, calibration, base and
-  optional P4/P5 heads, and all persistent RAD parameters. Tests cover exact
-  prediction round trips, deterministic continuation, invalid checksums, and
-  CRC-valid truncation; the existing version-8 CDET loader remains available.
-  The unified `det_bench --architecture kshira` path also accepts the shared raw
-  manifest and executable F32/INT8/INT4 modes. Two 5,000-sample 160 x 160
-  in-memory Release checks measured 240.244--337.097/639.539--802.958/
-  610.714--777.428 ms through serialization, with 0.671--0.840/6.869--8.726/
-  7.994--9.916 ms mean inference respectively. They pass the 5,000-sample
-  generated-data timing gate only; the 5,000-image raw-input accuracy gate,
-  COCO qualification, FPGA lowering, and measured power remain open.
-- M19 adds architecture-neutral `det_model_memory` reporting and shared
-  benchmark controls for class count, KSHIRA feature width, and arena size.
-  Reported fields separate parameters, optimizer state, persistent quantization
-  caches, activation/workspace, arena high-water/capacity, and checkpoint size;
-  compiler stack temporaries and allocator metadata are not included. At 80
-  classes, the 8-feature profile needs 270,233 bytes, fails closed at 256 KiB,
-  and fits at 272 KiB. Its single F32/INT8/INT4 Release measurements were
-  258.049/681.717/706.914 ms through serialization and
-  1.052/17.587/18.234 ms inference. The 4-feature edge profile uses 135,945
-  bytes inside 256 KiB and measured 194.601/472.574/478.287 ms through
-  serialization with 0.765/8.098/9.038 ms inference. The resumable files retain
-  FP32 master parameters, so packed device export remains open. F32 emitted no
-  box above 0.25 while quantized modes filled top-K; these results qualify only
-  class-scale timing/memory, not detector quality or COCO accuracy.
+| Module | Responsibility |
+|---|---|
+| `kshira/core.h` + arena | Caller-owned bump allocation, high-water |
+| `kshira/quant.h` | Symmetric INT4/INT8, pack, QAS gradient scale |
+| `kshira/sparse.h` | Channel masks, update-mode memory plans |
+| `kshira/phase.h` | PRE → TRAIN → ODT contracts |
+| `kshira/session.h` | Arena + RAD + mask + phase composition |
+| `kshira/rad.h` + `kshira_rad.c` | Stem, branches, mixer, contrast, head, train/infer |
+| `kshira_rad_state.c` | Pointer-free export/import (**format version 2**) |
+| `det_kshira.inc` | Adapter: train schedule, HNM, LR decay, multi-scale ODT |
+
+---
+
+## 3. RAD encoder (compact reference)
+
+**Input:** 160×160, 1–4 channels (bench uses 1-channel PGM).  
+**Map:** 40×40 at stride 4.  
+**Features:** 8 default (12 fits 256 KiB after sequential branches; 16 needs ~384 KiB).
+
+### 3.1 Forward graph (measured baseline)
+
+1. **Stem** — 3×3, stride 4, ReLU.  
+2. **Parallel depthwise dilations** — d ∈ {1,2,4}, same C (executed with **one**
+   sequential branch workspace).  
+3. **Mean fuse** — (B1+B2+B3)/3.  
+4. **Pointwise mixer** — W∈ℝ^{C×C}, b∈ℝ^C, ReLU (**project_weights**).  
+5. **Contrast** — neighbourhood r=2; κ=Σ_c (M−mean)²; C=0.10·log1p(κ).  
+6. **Quality-class head** — input dim **C+1**; outputs = **4 box + K class-quality logits** (no separate objectness).
+
+### 3.2 Memory-efficient branch schedule
+
+- **One** full branch activation map is allocated; dilations run sequentially and
+  accumulate into `fused` (PLAN_UPDATED memory-efficient schedule).  
+- Local training recomputes branch cells on the stack for correct multi-dilation
+  gradients (`depthwise_branch_cell`).  
+- Measured: f8 profile high-water **~159 KiB** inside 256 KiB (was ~261 KiB).
+
+### 3.3 Dependency tile
+
+- Contrast radius 2 + max dilation 4 → **r_dep = 6** → **13×13** stem support.  
+- Primary positive: FULL encoder update through the tile.  
+- Neighbour positives: head-only (box + objectness / quality).
+
+---
+
+## 4. Training objectives (measured baseline)
+
+### 4.1 Assignment
+
+- Primary cell: ground-truth box centre on the P3 map.  
+- Neighbours: box-adaptive radius (clamp 1–3), **in-box** cells only, LR scaled by
+  polynomial centre prior.  
+- Full PLAN_UPDATED staged contrast×IoU **top-k drop** was ablated (early TP collapse).  
+- Soft IoU-aware targets remain on objectness (VFL).
+
+### 4.2 Losses (current quality-class path)
+
+| Head | Loss |
+|---|---|
+| Box | Smooth-L1 on (l,t,r,b) + (1−IoU) regularizer |
+| Class-quality k* | **Varifocal** with IoU-aware target q (centre floor ≥0.80 after warm-up) |
+| Other qualities / background | VFL negative (q=0); HNM on hard cells |
+| Ranking | Bounded hinge via `kshira_rad_train_rank_pair` (train loop, epoch≥1) |
+
+Historical closed peak (F1 0.043) used objectness VFL + softmax CE; see HANDOFF §5.1.
+
+### 4.3 Hard-negative mining (`det_kshira.inc`) — baseline
+
+- Outside-box cells only.  
+- Epoch-staged budget (1→2→3); probe up to 16 cells; train hardest objectness.  
+- Focal-style negative strength on background steps.
+
+### 4.4 LR
+
+- Inverse-time: `lr / (1 + 0.35 · epoch)` (aggressive decay; milder decay ablated).
+
+### 4.5 Multi-scale
+
+- Optional scale heads (P4/P5) for **ODT** (`multiscale_heads=1`).  
+- PRE co-supervision of scale heads **ablated** (regressed real-car F1).  
+- Inference skips untrained scale heads.
+
+---
+
+## 5. Inference / deploy scoring
+
+### 5.1 Deploy scoring (quality-class — current)
+
+```
+Q_{x,k} = σ(z_{x,k})                    # independent class-quality logits
+quality = max_k Q_{x,k}
+score   = σ(logit(quality) / 0.55)      # mild monotone sharpen for top-K
+```
+
+No objectness × softmax product. Head width **4+K** (box + K qualities).
+
+Post-process:
+
+- insert fixed top-K by score;  
+- class-aware IoU suppress **0.40**;  
+- cross-class near-duplicate kill at higher IoU.
+
+Positive targets: y_{k*} = IoU-aware quality; y_{k≠k*} = 0.  
+Background: all y_k = 0.
+
+### 5.2 Closed peak scoring (historical, §5.1 HANDOFF)
+
+Previous dual-run peak used `sharpen(objectness) × max_class` (4+1+K head).
+
+---
+
+## 6. Phase 1 ranking path (shipped; surgical FP dual-run locked)
+
+From `docs/reviewer_response.md` Fast-Convergence Phase 1 + surgical FP work.
+
+| Item | Intent | Status |
+|---|---|---|
+| Quality-class head | 4+K outputs; VFL on class qualities | **shipped** (train/infer/background) |
+| Score = max σ + T=0.42 sharpen | Deploy ranking | **shipped** |
+| Surgical FP background | only winning-class head row; mid-band LR×1.35; easy-BG gate | **shipped** dual F1 0.0355 |
+| Bounded ranking loss | hinge via `kshira_rad_train_rank_pair` (epoch≥2; surgical neg class; separate pos/neg QAS) | **shipped** |
+| Two-level HNM | diverse head-only + top-1 encoder FULL late | **shipped** |
+| Quality bias ~−2.0 | init prior | **shipped** |
+| Identity mixer W=I+ε | preserve fused features early | **shipped** |
+| Neighbour class-quality | soft IoU×centre on neighbours | **shipped** |
+| LR decay 0.20 | more useful late epochs | **shipped** |
+| Contrast gate | learnable / calibrated scale | **not started** |
+| Gradient budgets / aux dense | Phase 2 novelty | partial (surgical = first sparse step) |
+
+**Do not** claim accuracy beats F1 0.043 / TP 26 until dual-run exceeds it.
+Surgical QC is **below** that bar; ranking thr-separation is still open.
+
+---
+
+## 7. Quantization
+
+- Modes: F32, INT8, INT4 (W4A8 not on KSHIRA path).  
+- Symmetric weight quant; activation scales via calibration / dynamic fallback.  
+- QAS gradient scaling on quantized train.  
+- Contrast remains non-negative feature; head sees float contrast in current path.  
+- **State format v2** required (hybrid head width); v1 import rejected.  
+- Ranking-path head width change (4+K vs 4+1+K) may require a **new state version**
+  or a compatibility check on `outputs` before load — track in state work.
+
+---
+
+## 8. Persistence
+
+- `kshira_rad_export_state` / `import_state` via `det_save` / `det_load`.  
+- Magic `KRAD`, **version 2**.  
+- Round-trip tested; predict outputs must match after import (padding-safe zero-init candidates).  
+- After quality-class lands: verify v2 import rejects mismatched head width, or bump
+  version with an explicit migration policy.
+
+---
+
+## 9. Phases
+
+| Phase | Typical use |
+|---|---|
+| PRE | F32 full updates from random init |
+| TRAIN | Quantized full / sparse after transition |
+| ODT | Channel-masked head (and scale-head) adaptation |
+
+`kshira_session` validates phase contracts before steps.
+
+---
+
+## 10. Resource profiles (measured)
+
+| Profile | Arena | Result (approx HWM) |
+|---|---|---|
+| 5-class, f8, max_det 6 | 256 KiB | **~159 KiB** admitted |
+| 5-class, f12, max_det 6 | 256 KiB | **~238 KiB** admitted |
+| 5-class, f16, max_det 6 | 256 KiB | **reject** (needs ~384 KiB) |
+| 80-class, f8, max_det 64 | 256 KiB | admitted after sequential branches |
+
+**Policy:** extra free arena after sequential branches should prefer diagnostics,
+hard-negative pools, and higher research `max_detections` — **not** immediate f12
+(f12 collapsed TP on 878 unique images).
+
+---
+
+## 11. Contracts (hot path)
+
+- **No** `malloc` inside train step / conv / assign / predict / NMS-like suppress.  
+- Temporaries: arena-planned or fixed stack (e.g. feature vectors ≤ RAD_MAX_HEAD_IN).  
+- Arena high-water reported on every `det_model_memory` / bench line.
+
+---
+
+## 12. What is intentionally incomplete vs PLAN_UPDATED
+
+| Spec item | Implementation status |
+|---|---|
+| Full staged assignment schedule (a_t, b_t top-k) | Softened to centre-prior coverage |
+| Piecewise-linear integer log1p for contrast deploy | F32 log1p reference; int approx optional later |
+| Persistent full contrast map | On-demand per cell (saves arena) |
+| Shared multi-scale affine g_s, b_s | Optional independent scale heads instead |
+| Official 5k unique one-pass | Data not available; not claimed |
+| Quality-class + ranking stack | Accepted next path; see §6 |
+
+See `docs/RESEARCH_CRITIQUE.md` and `docs/reviewer_response.md` for scientific
+priority of these gaps.
