@@ -1,2359 +1,2564 @@
 # KSHIRA Updated
 PLEASE FOLLOW THIS , YOU HAVE DONE SOME NEW IMPLEMENTATION TRY TO FIT THIS ALL IN WITHIN THAT AS WELL U SHOULD UPDATE THE CODE WHICH NEEDS TO BE CHANGED WHEREVER. WE NEED TO ACHIEVE VERY FAST TRAINING SPEED WITH AS CLOSE TO YOLO ACCURACY POSSIBLE
-## Contrast-Modulated Object Detection Under Extreme Memory Constraints
+KSHIRA Fast-Convergence Implementation Plan
 
-### A Dataset-Neutral Object Detection Framework for Arena-Bounded Training and Deployment in ISO C
+Accuracy-First, Time-Budgeted Object Detection in ISO C
 
----
+Status: Proposed implementation specificationDate: 2026-08-05Repository basis: Current C-OLOY / KSHIRA tree described by docs/HANDOFF.md, docs/KSHIRA_DESIGN.md, docs/RESEARCH_CRITIQUE.md, PLAN_UPDATED.md, and the public det_model lifecycle.Product name: KSHIRAPurpose: Implement an accuracy-first path that approaches nano-YOLO accuracy under a measured approximately 30-second CPU time-to-accuracy budget, while retaining a compact, quantized ISO-C deployment graph.
 
-## Executive Summary
+0. Document Authority and Scope
 
-KSHIRA is a compact object-detection architecture and training framework designed for environments where conventional deep-learning systems are impractical.
+This document defines the next implementation path on top of the current repository. It does not erase the existing RAD implementation, closed F32 result, quality-class experiment, quantized paths, or 256 KiB compact profile.
 
-The framework targets:
+The current repository remains the source of truth for what is already implemented. This document is the source of truth for the proposed fast-convergence work after the current snapshot.
 
-* implementation in ISO C;
-* training from randomly initialized weights;
-* dataset-neutral image and bounding-box input;
-* caller-owned, statically bounded memory;
-* FP32, INT8 and INT4 execution;
-* low-clock CPU operation;
-* future FPGA lowering;
-* deterministic training and inference;
-* no dynamic allocation inside training or inference loops;
-* direct bounding-box and class prediction;
-* fixed-size top-K deployment;
-* sub-second training as a falsifiable research target.
+This plan deliberately separates:
 
-KSHIRA does not attempt to reproduce a conventional YOLO network at a smaller scale. Its purpose is to explore a different detector design that is co-developed with its training algorithm, memory system, quantization method and deployment hardware constraints.
+the graph used to learn quickly;
 
-The updated KSHIRA architecture is built around five core mechanisms:
+the graph used for final deployment;
 
-1. **Receptive-Field Aggregation**
-2. **Pointwise Channel Mixing**
-3. **Contrast-Modulated Objectness**
-4. **Task-Aligned Assignment**
-5. **Block-Local Sparse Training**
+the compact 256 KiB research profile;
 
-The central hypothesis is that a very small detector can improve its spatial decision-making when it combines:
+the accuracy-oriented 30-second research profile.
 
-* learned semantic features;
-* explicit local feature contrast;
-* localization-aware target assignment;
-* carefully balanced objectness supervision;
-* spatially bounded backward computation.
+No code should be removed merely because a new path is proposed. Every major mechanism must be independently toggleable, benchmarked and reversible.
 
-KSHIRA retains a learned objectness pathway. Contrast is not treated as a complete replacement for semantic objectness. Instead, contrast becomes an explicit feature that the learned detection head may use, suppress or ignore depending on the data.
+1. Current Repository Position
 
-The framework is therefore neither a fixed-feature detector nor a handcrafted saliency system. All backbone, channel-mixing and detection-head parameters remain trainable from random initialization.
+1.1 Existing public lifecycle
 
----
+KSHIRA is an architecture profile of det_model and must remain inside the existing lifecycle:
 
-# Part I — Design Objective
+det_context_create
+  -> det_model_build
+  -> det_train
+  -> det_predict / det_evaluate
+  -> det_save / det_load
+  -> det_model_destroy / det_context_destroy
 
-## 1. Primary Goal
+The detector must remain dataset-neutral. Dataset adapters provide images and boxes; kernels must not contain dataset-specific parsing or class assumptions.
 
-KSHIRA shall provide a complete object-detection lifecycle in C:
+1.2 Current shipped KSHIRA mechanisms
 
-1. define a detector architecture;
-2. initialize it without pretrained weights;
-3. stream arbitrary images, classes and bounding boxes;
-4. train the model;
-5. validate the model;
-6. perform inference;
-7. save and reload training state;
-8. export deployment-oriented INT8 and INT4 representations;
-9. report timing, memory and accuracy;
-10. support future lowering to FPGA-compatible operators.
+The current tree already contains or has locked implementations for:
 
-The framework must remain dataset-neutral. The detector must not depend internally on:
+3x3 stride-4 stem producing a 40x40 map at 160 input;
 
-* a particular dataset directory structure;
-* COCO JSON;
-* YOLO text files;
-* a fixed number of classes;
-* one particular image format;
-* hard-coded vehicle classes;
-* synthetic training patterns.
+depthwise dilated branches with dilation 1, 2 and 4;
 
-Dataset adapters are responsible for supplying normalized image tensors, boxes and class identifiers.
+sequential branch execution and fusion;
 
-## 2. Reference Workload
+pointwise channel mixer;
 
-The primary research workload is:
+learned-feature contrast channel;
 
-* 5,000 unique labelled images;
-* 160 × 160 input resolution;
-* one to four input channels;
-* up to 80 object classes;
-* configurable numbers of boxes per image;
-* one streaming pass from random initialization;
-* axis-aligned bounding boxes;
-* Release compilation;
-* deterministic seeds;
-* bounded memory;
-* no hidden pretrained features.
+quality-class head path with 4 + K outputs;
 
-Multi-epoch experiments may be used for architecture discovery and convergence analysis, but they do not replace the official one-pass qualification.
+historical objectness-times-class head path;
 
-## 3. Memory Contract
+Varifocal-style quality supervision;
 
-KSHIRA operates inside a caller-provided arena.
+bounded pairwise ranking;
 
-The arena contains the memory required for:
+two-level hard-negative mining;
 
-* trainable parameters;
-* persistent quantization information;
-* activation buffers;
-* contrast buffers;
-* local backward workspace;
-* temporary parameter deltas;
-* phase state;
-* calibration information;
-* fixed-size detection candidates.
+identity mixer initialization;
 
-The target compact profile shall fit within:
+neighbour class-quality supervision;
 
-[
-256\ \text{KiB}=262,144\ \text{bytes}.
-]
+13x13 dependency-tile backward propagation;
 
-Every build must report:
+transactional updates;
 
-* arena capacity;
-* arena high-water mark;
-* parameter bytes;
-* activation bytes;
-* workspace bytes;
-* calibration bytes;
-* checkpoint bytes;
-* unused headroom.
+F32, INT8 and INT4 runtime paths;
 
-An architecture is not admitted when its conservative memory plan exceeds the supplied arena.
+checkpoint import/export;
 
-## 4. Execution Contract
+fixed top-K and duplicate suppression;
 
-KSHIRA shall not allocate memory inside:
+optional P4/P5 ODT heads;
 
-* the per-image training loop;
-* convolution kernels;
-* box assignment;
-* contrast computation;
-* prediction;
-* top-K selection;
-* quantization;
-* evaluation.
+arena high-water reporting;
 
-Temporary memory must be:
+current compact f8 high-water around 159 KiB.
 
-* statically planned;
-* drawn from the caller-owned arena;
-* stack-local only when its size is small and fixed;
-* reusable between mutually exclusive operations.
+1.3 Locked measured accuracy bars
 
-## 5. Claim Boundaries
+The implementation must preserve two distinct baselines:
 
-KSHIRA is a YOLO replacement by workflow capability, not by source compatibility or checkpoint compatibility.
+Closed historical F32 accuracy bar
 
-It aims to provide the same broad lifecycle:
+F1: 0.0430
 
-* architecture definition;
-* from-scratch training;
-* bounding-box detection;
-* class prediction;
-* validation;
-* quantized deployment;
-* model persistence.
+TP: 26
 
-It does not initially claim:
+FP: 730
 
-* COCO-scale YOLO accuracy;
-* segmentation;
-* pose estimation;
-* tracking;
-* open-vocabulary detection;
-* oriented boxes;
-* automatic mixed-precision GPU training;
-* one-watt operation before board-level measurement;
-* sub-second training before the complete timing and accuracy gates pass.
+precision: 0.0344
 
----
+recall: 0.0573
 
-# Part II — Architectural Motivation
+matched-box mean IoU: approximately 0.618
 
-## 6. Current Learning Behaviour
+AP50: approximately 0.0012
 
-The compact KSHIRA detector has demonstrated that its box-regression pathway can sometimes produce meaningful localization. In the strongest measured five-class real-image experiment, matched predictions reached mean IoU of approximately 0.62.
+training time: approximately 35 seconds for eight epochs on the current host
 
-However, the same run produced:
+arena: approximately 159 KiB
 
-* 18 true positives;
-* 890 predictions;
-* precision of approximately 0.020;
-* recall of approximately 0.040;
-* poorly separated confidence scores.
+Surgical quality-class F32 path
 
-The measured real-data training-plus-decode time was approximately 14.57 seconds for the five-epoch experiment, while the bounded arena and inference-latency checks passed.
+F1: 0.0355
 
-These results indicate that the primary failure is not exclusively box geometry. The detector has difficulty answering:
+TP: 20
 
-> Which spatial locations contain meaningful objects?
+FP: 654
 
-Two architectural causes are central.
+precision: approximately 0.0297
 
-## 7. Depthwise Representation Bottleneck
+recall: approximately 0.0441
 
-The original RAD encoder uses depthwise spatial convolutions.
+training time: approximately 62 seconds
 
-Depthwise convolutions are efficient because they process each channel independently. However, depthwise operations alone cannot learn combinations between channels.
+ranking band remains glued across thresholds
 
-For example, the detector cannot directly learn that:
+The historical F32 path remains the primary accuracy bar until a new path beats it in repeated runs.
 
-* one channel responds to a vertical boundary;
-* another responds to a horizontal transition;
-* a third responds to texture;
-* their combination is characteristic of a vehicle.
+1.4 Current scientific diagnosis
 
-Without learned channel interaction, the fused feature vector remains weak even when individual channels respond to useful image patterns.
+The existing evidence indicates:
 
-## 8. Objectness Sparsity
+localization is not the dominant failure;
 
-Dense detection produces a severe positive-to-negative imbalance.
+true and false candidates occupy a similar score range;
 
-For a 40 × 40 feature map:
+sparse SGD supervision has not learned strong ranking;
 
-[
-40\times40=1,600\text{ cells}.
-]
+adding channels to the same weak training formulation did not improve accuracy;
 
-With only a few objects in an image, fewer than one percent of cells are usually positive. A naïve binary loss may therefore be dominated by background cells.
+adding P4/P5 supervision before improving representation and assignment regressed accuracy;
 
-The detector may reduce its average loss by producing low objectness almost everywhere. This creates:
+more ordinary epochs did not consistently help;
 
-* flat confidence maps;
-* weak threshold separation;
-* low recall;
-* unstable hard-negative training;
-* objectness collapse during longer training.
+the compact memory problem has been substantially improved;
 
-KSHIRA Updated addresses this through representation improvement, balanced supervision and bounded hard-negative selection.
+the next bottleneck is time-to-useful-representation and time-to-score-separation.
 
----
+2. Revised Product and Research Objective
 
-# Part III — Complete Architecture
+2.1 Primary objective
 
-## 9. Architectural Overview
+The primary objective is now:
 
-The primary KSHIRA path is:
+Train or adapt KSHIRA to approach the accuracy of a nano-YOLO baseline under an approximately 30-second measured CPU wall-clock budget, then deploy a folded and quantized ISO-C graph with substantially lower runtime and infrastructure cost.
 
-```text
-Input image
-    ↓
-Spatial stem
-    ↓
-Parallel dilated depthwise branches
-    ↓
-Branch accumulation and average fusion
-    ↓
-Pointwise channel mixer
-    ↓
-Mixed semantic feature map
-    ↓
-Local contrast extraction
-    ↓
-Semantic channels + contrast channel
-    ↓
-Detection head
-    ↓
-Box distances + objectness + classes
-    ↓
-Fixed-size top-K predictions
-```
+2.2 Variables that are no longer fixed constraints
 
-For the reference profile:
+The following are tunable research variables:
 
-* input size: 160 × 160;
-* base feature resolution: 40 × 40;
-* semantic channels: 8;
-* contrast channels: 1;
-* head input channels: 9.
+parameter count;
 
-## 10. Input Representation
+feature-channel width;
 
-The dataset adapter provides an input tensor with:
+number of unique images;
 
-* width;
-* height;
-* number of channels;
-* numeric precision;
-* row stride;
-* caller-owned memory.
+RGB versus grayscale input;
 
-The compact reference input is transformed to the configured 160 × 160 model layout.
+training resolution;
 
-Permitted input channel counts are:
+training arena size;
 
-* one channel;
-* three channels;
-* four channels.
+number of feature scales;
 
-No image decoder is embedded into the mathematical detector graph. Decoding and resizing belong to the input adapter but are included in end-to-end timing.
+training-only auxiliary branches;
 
----
+pretrained initialization;
 
-## 11. Spatial Stem
+cached teacher supervision;
 
-The stem converts the input image into the base feature map.
+number of CPU threads.
 
-Reference behaviour:
+The following remain important engineering properties:
 
-* convolution: 3 × 3;
-* output stride: 4;
-* output resolution: 40 × 40;
-* output channels: 8;
-* activation: clipped ReLU or another quantization-safe bounded activation.
+ISO C runtime;
 
-The stem is learned from random weights.
+no dynamic allocation in hot loops;
 
-Its purpose is to:
+deterministic execution modes;
 
-* reduce spatial resolution;
-* extract low-level edges and gradients;
-* map different input channel counts into the fixed internal feature width;
-* provide the input to all dilated branches.
+explicit memory planning;
 
----
+F32/INT8/INT4 deployment;
 
-## 12. Receptive-Field Aggregation
+CPU-first implementation;
 
-The stem output is processed by three parallel depthwise branches:
+future FPGA lowering;
 
-[
-d\in{1,2,4}.
-]
+honest reporting of preparation time, training time and inference time.
 
-Each branch uses:
+2.3 Three operating modes
 
-* depthwise 3 × 3 convolution;
-* identical channel count;
-* fixed feature resolution;
-* independent trainable weights.
+KSHIRA shall support three explicit operating modes.
 
-The branches provide three receptive-field scales:
+KSHIRA Scratch
 
-* local detail;
-* medium-range spatial context;
-* broader context.
+all learned weights start from random or mathematical initialization;
 
-The branch outputs are fused by accumulation:
+no teacher targets;
 
-\frac{F_{d=1}+F_{d=2}+F_{d=4}}{3}.
-]
+no external pretrained backbone;
 
-The implementation need not materialize all three complete branch maps simultaneously.
+evaluated against nano-YOLO trained from scratch under the same data, resolution, hardware and time budget.
 
-A memory-efficient execution schedule is:
+KSHIRA Adapt
 
-1. clear the fused map;
-2. compute one branch;
-3. accumulate it into the fused map;
-4. reuse the branch workspace;
-5. repeat for the remaining branches;
-6. apply the final scale factor.
+starts from reusable KSHIRA foundation weights;
 
-This keeps the architecture logically parallel while avoiding three persistent full-resolution maps.
+may use cached teacher targets;
 
----
+trains dataset-specific adapters, fusion and heads within the 30-second budget;
 
-## 13. Pointwise Channel Mixer
+evaluated against pretrained nano-YOLO fine-tuned under the same wall-clock budget.
 
-The fused RAD map is passed through an 8-to-8 pointwise convolution:
+KSHIRA Full Research
 
-[
-M_x=W_{\text{mix}}F_{\text{fused},x}+b_{\text{mix}}.
-]
+unrestricted time for architecture and compression studies;
 
-Where:
+used to establish the attainable accuracy ceiling;
 
-[
-W_{\text{mix}}\in\mathbb{R}^{8\times8},
-\qquad
-b_{\text{mix}}\in\mathbb{R}^{8}.
-]
+not described as a 30-second result.
 
-Parameter cost:
+The selected mode must be persisted in checkpoints and printed in every benchmark result.
 
-[
-8\times8+8=72\text{ parameters}.
-]
+3. Central Innovation Direction
 
-FP32 parameter memory:
+The new KSHIRA path is based on five coordinated mechanisms.
 
-[
-72\times4=288\text{ bytes}.
-]
+3.1 Train-deploy graph separation
 
-Compute per spatial cell:
+The learning graph may contain:
 
-[
-8\times8=64\text{ multiply-accumulate operations}.
-]
+reparameterizable branches;
 
-Across the complete 40 × 40 map:
+dense auxiliary heads;
 
-[
-1,600\times64=102,400\text{ MACs}.
-]
+additional feature scales;
 
-The pointwise mixer provides the channel interaction missing from a purely depthwise encoder.
+normalization;
 
-It allows the detector to learn:
+teacher-distillation projections;
 
-* combinations of edge directions;
-* texture and boundary conjunctions;
-* channel suppression;
-* channel amplification;
-* class-relevant feature mixtures;
-* features that are useful for localization but not classification;
-* features that are useful for objectness but not localization.
+larger temporary candidate pools.
 
-### 13.1 Memory-Safe Mixer Execution
+The deployment graph contains only:
 
-The mixer may operate cell by cell.
+fused backbone blocks;
 
-For each cell:
+selected P3/P4/P5 feature path;
 
-1. load the eight fused input values;
-2. compute eight mixed output values into a temporary vector;
-3. write the eight results back to the feature map.
+shared detection head;
 
-The temporary vector requires eight values and prevents in-place overwrite from corrupting later output channels.
+required contrast path if validated;
 
-No second 40 × 40 × 8 map is required.
+fixed top-K and duplicate control;
 
----
+quantized weights and scales.
 
-# Part IV — Contrast-Modulated Objectness
+Training-only components must be removable or foldable without changing the final detection interface.
 
-## 14. Purpose of Contrast Modulation
+3.2 Dense-to-residual learning curriculum
 
-The mixed semantic feature map contains learned information, but the detector may still have difficulty learning spatial objectness from extremely sparse positives.
+Early training uses dense box-derived supervision to make the representation spatially meaningful. Later training uses only high-residual locations for expensive encoder updates.
 
-KSHIRA therefore computes an explicit local contrast feature.
+The curriculum is:
 
-The contrast feature does not directly decide whether a cell contains an object.
+box-derived dense fields
+  -> dense quality learning
+  -> analytic head refresh
+  -> residual map
+  -> budgeted tile-local backward
+  -> final sparse deployment-head refinement
 
-Instead, it answers:
+3.3 Streaming analytic readout
 
-> How different is this cell’s learned feature vector from its immediate spatial context?
+The final class-quality head is low dimensional relative to the backbone. KSHIRA will periodically solve a regularized linear readout from streaming sufficient statistics instead of relying entirely on short-horizon SGD.
 
-The detection head receives this value as an additional input and learns whether it is useful for the current dataset.
+The analytic readout is used to:
 
-## 15. Local Feature Mean
+initialize or refresh class-quality rows;
 
-Let:
+test whether the representation is linearly useful;
 
-[
-M_x\in\mathbb{R}^{C}
-]
+calculate residuals for gradient-budget allocation;
 
-be the mixed feature vector at cell (x), with (C=8).
+reduce the time spent fitting a small linear head.
 
-Let (\mathcal N_r(x)) be the local spatial neighbourhood around (x), with radius:
+3.4 Residual-guided gradient budgeting
 
-[
-r=2.
-]
+After the best available readout is fitted, the remaining errors identify where the representation itself is inadequate.
 
-The nominal neighbourhood is therefore 5 × 5.
+Full encoder backward work is allocated to cells with high combined residual:
 
-The local mean is:
+missed positive residual;
 
-\frac{1}{N_x}
-\sum_{j\in\mathcal N_r(x)}M_j,
-]
+false-positive residual;
 
-where:
+box residual;
 
-[
-N_x=|\mathcal N_r(x)|.
-]
+assignment instability;
 
-At boundaries, (N_x) is reduced to the number of valid cells. No implicit zero-padding is used in the default contrast definition.
+underrepresented class or object size.
 
-## 16. Raw Spatial Contrast
+This replaces score-only hard-negative selection with representation-aware update selection.
 
-The raw contrast is:
+3.5 Time-budget controller
 
-\sum_{c=1}^{C}
-\left(M_{x,c}-\bar M_{x,c}\right)^2.
-]
+A runtime controller observes:
 
-Properties:
+elapsed wall time;
 
-* (\kappa_x\ge0);
-* uniform regions produce low values;
-* feature discontinuities produce larger values;
-* the signal depends on learned features rather than raw pixels;
-* the signal remains class-agnostic until interpreted by the head.
+remaining wall time;
 
-## 17. Robust Contrast Transform
+images processed;
 
-Raw contrast may have a long-tailed distribution because of:
+milliseconds per forward sample;
 
-* sharp illumination boundaries;
-* image noise;
-* highly textured background;
-* saturated feature channels;
-* quantization artifacts.
+milliseconds per full tile;
 
-KSHIRA applies:
+milliseconds per head-only update;
 
-[
-C_x=\log(1+\kappa_x).
-]
+recent validation proxy movement;
 
-This provides:
+current resolution;
 
-* non-negative output;
-* strong resolution near zero;
-* compression of large outliers;
-* stable percentile calibration;
-* reduced domination by extreme background texture.
+current trainable stage set.
 
-## 18. Deployment-Compatible Contrast Transform
+It adjusts:
 
-The deployment path must not depend on a general-purpose floating-point logarithm.
+resolution;
 
-KSHIRA therefore defines two representations of the same monotonic transform.
+number of images;
 
-### 18.1 FP32 Reference Transform
+number of dense targets;
 
-During FP32 reference training and operator validation:
+number of encoder tiles;
 
-[
-C_x^{F32}=\log(1+\kappa_x).
-]
+number of head-only negatives;
 
-### 18.2 Integer Deployment Transform
+trainable stages;
 
-The deployment profile uses a monotonic piecewise-linear approximation:
+teacher-loss weight;
 
-a_s\kappa_x+b_s,
-]
+auxiliary-loss weight;
 
-where segment (s) is selected from a small fixed set of contrast intervals.
+finalization reserve.
 
-The default design uses a bounded number of segments, such as:
+The 30-second schedule is therefore a measured controller, not a fixed epoch count.
 
-* 8 segments for the smallest profile;
-* 16 segments for the reference profile.
+4. Proposed Architecture
 
-Each segment stores:
+4.1 Architecture profiles
 
-* lower boundary;
-* integer slope;
-* integer intercept;
-* output shift.
+KSHIRA remains one architecture with multiple admitted profiles.
 
-The approximation must satisfy:
+Profile
 
-1. monotonicity;
-2. non-negative output;
-3. bounded maximum output;
-4. deterministic rounding;
-5. no dynamic allocation;
-6. bit-exact scalar and accelerated behaviour.
+Intended use
 
-Quantization-aware training simulates the same piecewise transform so that the detection head sees deployment-representative contrast values.
+Estimated parameter range
 
-A lookup-table implementation may also be admitted when its memory and latency are explicitly reported.
+Training arena target
 
----
+Deployment target
 
-## 19. Head Input
+Compact
 
-The detection head receives:
+extreme deployment
 
-[
-H_x=
-[M_{x,1},M_{x,2},\ldots,M_{x,8},C_x].
-]
+50k-150k
 
-Thus:
+1-4 MiB
 
-[
-H_x\in\mathbb{R}^{9}.
-]
+256 KiB-1 MiB
 
-The contrast value is a feature, not a score.
+Balanced
 
-The head is free to learn:
+primary 30-second research
 
-* positive contrast weight;
-* negative contrast weight;
-* near-zero contrast weight;
-* class-dependent use of contrast through the semantic channels;
-* interaction between contrast and learned channel combinations.
+200k-600k
 
----
+4-24 MiB
 
-# Part V — Detection Head
+1-4 MiB INT8
 
-## 20. Head Outputs
+Accuracy
 
-For (K) classes, the head predicts:
+ceiling and distillation teacher-student study
 
-1. four non-negative box distances;
-2. one objectness logit;
-3. (K) class logits.
+700k-1.5M
 
-For the five-class reference experiment:
+16-64 MiB
 
-[
-4+1+5=10\text{ outputs}.
-]
+2-8 MiB INT8
 
-The head parameter count is:
+Exact parameter and memory values must come from the model builder. The ranges above are planning targets, not claims.
 
-[
-9\times10+10=100.
-]
+4.2 RGB-capable input
 
-The previous eight-input head required:
+The new primary accuracy profile shall accept RGB.
 
-[
-8\times10+10=90.
-]
+Supported input transforms:
 
-The contrast feature therefore adds only:
+direct RGB;
 
-[
-10\text{ parameters}=40\text{ FP32 bytes}.
-]
+luminance plus two compressed chroma channels;
 
-## 21. Bounding-Box Representation
+grayscale compatibility mode.
 
-At each cell (x), the head predicts:
+The input transform must be declared in the model spec and persisted in the checkpoint.
 
-[
-(l_x,t_x,r_x,b_x).
-]
+4.3 Information-preserving two-stage stem
 
-These are distances from the cell location to the corresponding box boundaries.
+The current single stride-4 stem remains available for the compact legacy path.
 
-The decoded box is:
+The accuracy path uses:
 
-[
-B_x=
-(x-l_x,\ y-t_x,\ x+r_x,\ y+b_x).
-]
+input
+  -> 3x3 stride 2 spatial stem
+  -> normalization / calibrated scale
+  -> reparameterizable stride 2 block
+  -> P2 or P3 base feature
 
-Distances must be constrained to non-negative values through:
+An alternative space-to-depth stem should also be implemented behind an ablation flag:
 
-* bounded activation;
-* positive parameterization;
-* clamping;
-* or another quantization-safe monotonic mapping.
+2x2 or 4x4 space-to-depth
+  -> 1x1 learned projection
+  -> spatial refinement block
 
-No distribution focal loss is required in the compact profile.
+The objective is to avoid discarding fine information before the network learns useful filters.
 
-## 22. Learned Objectness
+4.4 Reparameterizable spatial block
 
-The head produces an objectness logit (z_x^{obj}).
+During training, each block may contain:
 
-The probability is:
+3x3 depthwise or grouped branch;
 
-[
-O_x=\sigma(z_x^{obj}).
-]
+1x1 channel branch;
 
-Objectness represents the detector’s learned estimate that the location contains a valid object prediction.
+identity branch when dimensions permit;
 
-Contrast is not multiplied directly into objectness during deployment. It influences objectness through the learned head weights.
+optional dilated branch;
 
-## 23. Class Prediction
+learned branch scales;
 
-For mutually exclusive classes, the default class probability is:
+batch-independent normalization or fixed calibrated scale.
 
-\frac{\exp(z_{x,k})}
-{\sum_j\exp(z_{x,j})}.
-]
+At deployment, compatible branches are fused into one convolution and bias.
 
-The quantized implementation may use:
+Every block must provide:
 
-* bounded exponential lookup;
-* integer softmax approximation;
-* logit subtraction from the maximum;
-* fixed-point reciprocal approximation.
+training forward;
 
-The same approximation must be validated against the FP32 reference.
+training backward;
 
-## 24. Deployment Score
+fold operation;
 
-For class (k):
+folded forward;
 
-[
-S_{x,k}=O_xP_{x,k}.
-]
+fold-parity test;
 
-The predicted class is:
+quantized folded export.
 
-[
-\hat k_x=\arg\max_kP_{x,k}.
-]
+4.5 Backbone stages
 
-The location score is:
+The first balanced prototype should use three or four stages.
 
-[
-S_x=O_x\max_kP_{x,k}.
-]
+Example starting point at 224 input:
 
-This scoring function avoids the previous squared-objectness suppression:
+Stage
 
-[
-O_x^2P_{x,k}.
-]
+Approximate resolution
 
-The deployed score uses one final multiplication after objectness and class confidence are available.
+Starting channels
 
----
+Block count
 
-# Part VI — Multi-Scale Detection
+S1
 
-## 25. Single Stored Map, Multiple Logical Scales
+112x112
 
-To preserve the arena, KSHIRA stores one mixed semantic map at 40 × 40.
+16-24
 
-Additional logical scales are produced from that map without allocating complete additional feature pyramids.
+1
 
-The reference logical levels are:
+S2 / P2
 
-* level 0: 40 × 40;
-* level 1: 20 × 20;
-* level 2: 10 × 10.
+56x56
 
-Pooled views are generated on demand.
+24-32
 
-## 26. Pooled Feature Views
+1-2
 
-For level 1:
+S3 / P3
 
-\operatorname{pool}_{2\times2}
-M^{(0)}.
-]
+28x28
 
-For level 2:
+40-56
 
-\operatorname{pool}_{2\times2}
-M^{(1)}.
-]
+2
 
-The pooling operation may be:
+S4 / P4
 
-* average pooling;
-* maximum pooling;
-* an integer-friendly weighted average.
+14x14
 
-The selected operation must be fixed in the model specification.
+72-96
 
-## 27. Contrast at Each Scale
+2
 
-Contrast should be computed after scale pooling:
+S5 / P5
 
-\bar M_x^{(s)}
-\right|_2^2
-\right).
-]
+7x7
 
-This ensures that contrast is measured relative to the semantic resolution of each detection scale.
+112-160
 
-The scale views and their contrast values may be generated cell by cell during inference.
+1-2
 
-No complete 20 × 20 × 8 or 10 × 10 × 8 persistent map is required.
+Channel widths must be generated from a profile table rather than hard-coded throughout kernels.
 
-## 28. Shared Head
+4.6 Lightweight feature fusion
 
-The compact profile uses one shared nine-input head across scales.
+Use a small bidirectional feature path:
 
-Scale-specific adaptation is provided through small affine parameters:
+lateral 1x1 projections to a shared feature width;
 
-[
-z^{(s)}=g_s\odot z+b_s.
-]
+P5 upsample and add into P4;
 
-This avoids three complete independent heads while allowing:
+fused P4 upsample and add into P3;
 
-* scale-specific confidence calibration;
-* scale-specific distance magnitudes;
-* different response distributions.
+one optional bottom-up refinement from P3 to P4;
 
-## 29. Scale Assignment
+one optional bottom-up refinement from P4 to P5.
 
-Ground-truth objects are assigned to scales according to their dimensions in input pixels.
+Avoid large concatenations in the default path. Addition and virtual concatenation remain preferred because they reduce memory traffic.
 
-A configurable rule maps:
+The previous independent P4/P5 ODT heads remain available but are not the canonical accuracy path.
 
-* small objects to the high-resolution level;
-* medium objects to the middle level;
-* large objects to the low-resolution level.
+4.7 Shared detection head
 
-Near scale boundaries, an object may temporarily supervise two adjacent levels during training.
+The primary deployment head shall be shared across scales.
 
-Tiny objects must always retain at least one positive candidate on the highest-resolution level.
+Outputs per location:
 
----
+four box distances;
 
-# Part VII — Task-Aligned Assignment
+K class-quality logits;
 
-## 30. Assignment Objective
+optional one scalar proposal quality if candidate generation is separated from class ranking.
 
-Assignment determines which feature cells supervise a ground-truth object.
+Scale-specific adaptation is limited to:
 
-KSHIRA avoids:
+learned bias;
 
-* one fixed centre cell;
-* unrestricted all-inside-box assignment;
-* contrast-only assignment;
-* prediction-IoU-only assignment.
+learned gain;
 
-The assignment combines:
+distance normalization;
 
-1. spatial centrality;
-2. learned feature contrast;
-3. predicted localization quality.
+optional small scale embedding.
 
-## 31. Candidate Pool
+The default final score is the maximum class-quality score. A separate proposal signal may limit candidate evaluation but must not recreate the old weak-score multiplication pathology.
 
-For each ground-truth box (G), define candidate cells whose centres satisfy:
+4.8 Contrast path
 
-* the cell centre lies inside (G);
-* the cell belongs to an eligible detection scale;
-* the cell lies within a bounded centre radius.
+Contrast remains an ablation, not a mandatory identity of KSHIRA.
 
-For a box with centre ((c_x,c_y)), candidate distance is:
+The new path uses:
 
-[
-d_x^2=(x-c_x)^2+(y-c_y)^2.
-]
+normalized learned features;
 
-The radius may be derived from box dimensions and bounded by configured minimum and maximum values.
+local feature contrast;
 
-## 32. Centre Prior
+learnable non-negative gate;
 
-To avoid exponential computation, KSHIRA uses a bounded polynomial prior:
+gate initialized near zero or a small value;
 
-\max
-\left(
-0,
-1-\frac{d_x^2}{R_G^2+\epsilon}
-\right).
-]
+explicit pruning when the learned gate remains negligible.
 
-Properties:
+The contrast feature must be tested as:
 
-* maximum at the ground-truth centre;
-* monotonic decrease with distance;
-* zero outside the configured radius;
-* no transcendental functions;
-* deterministic scalar implementation.
+disabled;
 
-## 33. Contrast Normalization
+fixed scale;
 
-Contrast is normalized inside the candidate pool:
+calibrated scale;
 
-\frac{C_x}
-{\max_{j\in\mathcal P_G}C_j+\epsilon}.
-]
+learnable gate;
 
-Candidate-local normalization avoids allowing one unrelated high-contrast background region to suppress all candidates.
+assignment input only;
 
-## 34. Localization Quality
+head input only;
 
-For each candidate:
+both.
 
-[
-Q_x=\operatorname{IoU}(B_x,G).
-]
+No final claim may assume contrast is useful without this evidence.
 
-The IoU used for assignment is treated as a detached selection signal. Assignment does not backpropagate through the discrete top-k decision.
+5. Training-Only Supervision
 
-## 35. Staged Assignment Score
+5.1 Dense auxiliary fields
 
-Assignment changes progressively during the training stream.
+Ground-truth boxes generate low-cost dense fields for each admitted scale.
 
-The general score is:
+Centre field
 
-P_{\text{center}}(x,G)
-\left[
-a_t+(1-a_t)\widetilde C_x
-\right]
-\left[
-b_t+(1-b_t)Q_x
-\right].
-]
+A polynomial centre prior over cells inside or near the object.
 
-### 35.1 Bootstrap Stage
+Inside-object field
 
-During the first portion of training:
+A binary or soft field indicating box interior.
 
-[
-a_t=1,\qquad b_t=1.
-]
+Distance field
 
-Therefore:
+Normalized left, top, right and bottom distances.
 
-[
-A_t=P_{\text{center}}.
-]
+Size field
 
-The detector begins with deterministic centre-prior assignment while its features and boxes are still random.
+Log width and log height or scale-bin target.
 
-### 35.2 Contrast Introduction Stage
+Boundary field
 
-After initial feature formation:
+Distance to nearest box boundary, normalized by object size.
 
-[
-0<a_t<1,\qquad b_t=1.
-]
+These fields provide early dense supervision even when final one-to-one assignment is unstable.
 
-Contrast begins influencing assignment, while unreliable predicted IoU is ignored.
+5.2 Training-only auxiliary heads
 
-### 35.3 Localization-Aligned Stage
+Each selected scale may have a small auxiliary projection predicting:
 
-Once the box head produces non-degenerate predictions:
+centre field;
 
-[
-0<a_t<1,\qquad0<b_t<1.
-]
+inside field;
 
-Assignment is influenced by:
+size field;
 
-* centre proximity;
-* feature distinctiveness;
-* predicted localization quality.
+optional boundary field.
 
-### 35.4 Mature Stage
+Auxiliary heads:
 
-Near the later part of the stream:
+are active only during training;
 
-[
-a_t\rightarrow0,\qquad b_t\rightarrow0.
-]
+are not serialized into compact deployment unless requested for ODT;
 
-The full task-aligned product is used:
+may share weights across scales;
 
-[
-A_t
-\approx
-P_{\text{center}}\widetilde C_xQ_x.
-]
+must use bounded output dimensions;
 
-## 36. One-Pass Scheduling
+must have separately reported compute and memory.
 
-The schedule is based on sample progress, not epoch count.
+5.3 One-to-many and one-to-one paths
 
-For 5,000 samples, a possible default is:
+The learning graph uses two assignment roles.
 
-| Stream range | Assignment behaviour               |
-| ------------ | ---------------------------------- |
-| 0–10%        | Centre prior only                  |
-| 10–35%       | Centre prior + increasing contrast |
-| 35–65%       | Introduce predicted IoU            |
-| 65–100%      | Full task-aligned assignment       |
+Dense auxiliary path
 
-This schedule remains configurable and must be ablated.
+multiple candidates per object;
 
-## 37. Positive Count
+broad spatial supervision;
 
-For each ground-truth box:
+high weight early;
 
-\operatorname{clamp}
-\left(
-K_{\min}
-+
-f(\text{box area}),
-K_{\min},
-K_{\max}
-\right).
-]
+weight decays over time.
 
-Reference bounds may be:
+Deployment path
 
-* minimum: one positive;
-* maximum: nine positives.
+bounded one-to-one or small top-k assignment;
 
-Small objects receive fewer, carefully protected positives. Larger objects may receive more spatial supervision.
+directly trains final class-quality and box outputs;
 
-## 38. Deterministic Tie-Breaking
+weight grows over time.
 
-When two candidates have equal assignment scores, priority is determined by:
+The inference graph contains only the deployment path.
 
-1. smaller squared distance to GT centre;
-2. higher predicted IoU;
-3. higher contrast;
-4. lower row-major cell index.
+5.4 Matchability weighting
 
-## 39. Multi-Ground-Truth Conflict
+Dense candidates vary in quality. Their training weight should depend on:
 
-When one cell is selected by multiple objects:
+centre prior;
 
-1. retain the object with highest assignment score;
-2. if tied, retain the object with smaller centre distance;
-3. if still tied, retain the smaller ground-truth area;
-4. if still tied, retain the lower annotation index.
+current IoU;
 
-Every ground-truth object must receive at least one positive. A centre-cell fallback is used when conflict resolution removes all candidates.
+object-size compatibility with scale;
 
-## 40. Assignment Weights
+teacher confidence when available;
 
-Positive losses may be weighted using normalized assignment quality:
+assignment stability across refreshes.
 
-w_{\min}
-+
-(1-w_{\min})
-\frac{A_t(x,G)}
-{\max_{j\in P_G}A_t(j,G)+\epsilon}.
-]
+Low-quality dense matches should contribute feature supervision without dominating final class-quality calibration.
 
-The positive floor (w_{\min}) prevents low-ranked assigned cells from receiving negligible gradients.
+6. Streaming Analytic Head Refresh
 
----
+6.1 Purpose
 
-# Part VIII — Training Objectives
+The analytic readout determines whether the current features contain linearly separable object/class information and rapidly fits the low-dimensional class-quality head.
 
-## 41. Total Detection Loss
+It is not a replacement for backbone learning. It is a fast readout and diagnostic.
 
-The total loss is:
+6.2 Feature vector
 
-\lambda_{\text{box}}\mathcal L_{\text{box}}
-+
-\lambda_{\text{obj}}\mathcal L_{\text{obj}}
-+
-\lambda_{\text{cls}}\mathcal L_{\text{cls}}.
-]
+For candidate i:
 
-The loss weights may change over the training stream, but no epoch-dependent behaviour appears in the deployed graph.
+x_i = [shared-head feature vector, optional contrast, bias 1]
 
----
+The feature dimension should normally remain below 128 so the solve remains small.
 
-## 42. Box Loss
+6.3 Target transform
 
-The box loss combines distance regression and decoded IoU:
+For class k:
 
-\frac{1}{|P|}
-\sum_{x\in P}
-w_x
-\left[
-\lambda_d
-\operatorname{SmoothL1}
-(\hat d_x,d_x)
-+
-\lambda_i
-(1-\operatorname{IoU}(B_x,G_x))
-\right].
-]
+positive target is IoU-aware quality;
 
-Where:
+non-target classes are zero;
 
-* (\hat d_x) is the predicted distance vector;
-* (d_x) is the target distance vector;
-* (B_x) is the decoded predicted box;
-* (G_x) is the assigned ground-truth box.
+background is zero.
 
-Distance targets should be normalized by the scale stride or configured distance range.
+For the analytic solve, targets may be converted to clipped logits:
 
-## 43. Classification Loss
+t = clamp(log((q + eps) / (1 - q + eps)), t_min, t_max)
 
-For one class per object:
+Background receives a configured negative target logit.
 
--\frac{1}{|P|}
-\sum_{x\in P}
-w_x,
-\omega_{k_x}
-\log P_{x,k_x}.
-]
+The target transform must be an ablation. Direct ridge fitting to quality values is the simpler reference.
 
-The class weight is based on streamed class frequency.
+6.4 Streaming sufficient statistics
 
-A stable reference weighting is:
+Accumulate:
 
-\operatorname{clamp}
-\left(
-\sqrt{
-\frac{\bar f+\epsilon}
-{f_k+\epsilon}
-},
-\omega_{\min},
-\omega_{\max}
-\right).
-]
+A = lambda * I + sum_i w_i x_i x_i^T
+B = sum_i w_i x_i y_i^T
 
-The square root prevents extreme rare-class amplification.
+Solve:
 
-Class-frequency estimates are:
+W = solve(A, B)
 
-* supplied by the adapter when known;
-* or maintained as deterministic streaming counts.
+Recommended solver:
 
----
+Cholesky factorization for positive-definite A;
 
-## 44. Objectness Targets
+diagonal regularization;
 
-For an assigned positive cell:
+finite checks;
 
-\operatorname{stopgrad}
-\left[
-\operatorname{clamp}
-(\operatorname{IoU}(B_x,G_x),q_{\min},1)
-\right].
-]
+fallback to previous head when solve fails;
 
-This creates localization-aware objectness.
+deterministic accumulation order for reproducibility mode.
 
-A well-localized prediction receives a larger target than a poor box at the same location.
+6.5 Sample composition
 
-During early bootstrap, when predicted IoU is unreliable, the target may be blended with one:
+The statistics must contain a balanced mixture of:
 
-\eta_t
-+
-(1-\eta_t)
-\operatorname{IoU}(B_x,G_x).
-]
+primary positives;
 
-The coefficient (\eta_t) decreases during training.
+neighbour positives;
 
-For negative cells:
+small-object positives;
 
-[
-y_x^{obj}=0.
-]
+rare-class positives;
 
----
+near-object negatives;
 
-## 45. Balanced Focal Objectness
+diverse far-background negatives;
 
-The objectness loss is:
+current false positives;
 
-\mathcal L_{\text{pos}}
-+
-\lambda_n\mathcal L_{\text{neg}}.
-]
+teacher-selected hard locations when available.
 
-Positive term:
+Per-group weights must be explicit and reported.
 
-*
+6.6 Refresh schedule
 
-\frac{1}{|P|}
-\sum_{x\in P}
-w_x
-|y_x^{obj}-O_x|^\gamma
-\left[
-y_x^{obj}\log O_x+
-(1-y_x^{obj})\log(1-O_x)
-\right].
-]
+Candidate schedules:
 
-Negative term:
+after bootstrap;
 
-*
+after each resolution transition;
 
-\frac{1}{|N_s|}
-\sum_{x\in N_s}
-O_x^\gamma\log(1-O_x).
-]
+after a configured number of images;
 
-Where:
+when validation proxy stagnates;
 
-* (P) is the positive set;
-* (N_s) is the bounded sampled-negative set;
-* (\gamma) is the focal exponent;
-* (\lambda_n) controls total negative strength.
+before final calibration.
 
-Positive and negative terms are normalized independently. This prevents the number of background cells from automatically determining the gradient magnitude.
+The default 30-second controller should reserve time for at least two readout refreshes.
 
-## 46. Hard-Negative Mining
+6.7 Post-solve fine-tuning
 
-Negative candidates must:
+After analytic refresh:
 
-* lie outside all ground-truth boxes;
-* not overlap an ignored region;
-* not be selected positives;
-* have valid feature support.
+copy solved weights into the class-quality head;
 
-A bounded number of negatives are selected according to learned objectness:
+retain the previous head if validation proxy worsens;
 
-[
-N_s=\operatorname{topM}_{x\in N}O_x.
-]
+run bounded VFL/ranking fine-tuning;
 
-A reference ratio is:
+do not reset optimizer state blindly;
 
-\operatorname{clamp}
-(r_n|P|,N_{\min},N_{\max}).
-]
+optionally interpolate old and solved rows.
 
-Possible starting values:
+6.8 Diagnostic value
 
-* (r_n=3) or (5);
-* fixed minimum for empty images;
-* bounded maximum to protect training time.
+If the analytic head substantially improves ranking with a frozen encoder, the primary limitation was readout optimization.
 
-Hard-negative mining begins gradually. Early training uses a mixture of deterministic spatial negatives and predicted hard negatives so that random initial outputs do not dominate selection.
+If it does not improve ranking, the representation remains the primary limitation and more head-loss changes should stop.
 
----
+7. Residual-Guided Gradient Budgeting
 
-# Part IX — Exact Contrast Gradient
+7.1 Residual definition
 
-## 47. Contrast Dependency
+For candidate i, compute a composite priority:
 
-Each mixed feature value participates in:
+R_i = a * class_quality_residual
+    + b * box_residual
+    + c * false_positive_cost
+    + d * assignment_instability
+    + e * rarity_weight
+    + f * small_object_weight
 
-* its own contrast calculation;
-* the local mean of neighbouring contrast calculations.
+Possible terms:
 
-Therefore, contrast backpropagation must accumulate all contributions.
+absolute target minus prediction;
 
-Define:
+VFL residual;
 
-\frac{\partial\mathcal L}{\partial C_y}.
-]
+1 minus IoU;
 
-Because:
+current score for background;
 
-[
-C_y=\log(1+\kappa_y),
-]
+disagreement between teacher and student;
 
-then:
+class-frequency inverse square root;
 
-\frac{1}{1+\kappa_y}.
-]
+repeated failure across refreshes.
 
-For:
+7.2 Update tiers
 
-\sum_c(M_{y,c}-\bar M_{y,c})^2,
-]
+Tier 0: no update
 
-the complete feature derivative is:
+Low-residual candidates receive no backward work.
 
-\sum_{y:,x\in\mathcal N(y)}
-g_y^C
-\frac{2(M_{y,c}-\bar M_{y,c})}
-{1+\kappa_y}
-\left[
-\mathbf 1(x=y)-\frac{1}{N_y}
-\right]
-}
-]
+Tier 1: head-only
 
-where:
+Moderate residuals update only:
 
-* (\mathbf 1(x=y)=1) when (x=y);
-* otherwise it is zero;
-* (N_y) is the valid neighbourhood size for cell (y).
+class-quality head;
 
-This formulation handles:
+box head;
 
-* interior cells;
-* image boundaries;
-* direct contributions;
-* indirect mean contributions;
-* multiple overlapping contrast windows.
+scale bias/gain.
 
-## 48. Gradient Through Deployment Approximation
+Tier 2: late-stage tile
 
-During quantization-aware training, the forward contrast transform uses the deployment approximation.
+High residuals update:
 
-The backward path may use:
+shared head;
 
-* the exact segment slope;
-* a straight-through derivative;
-* or the derivative of the FP32 `log1p` reference.
+neck/fusion;
 
-The chosen method must be explicitly recorded in the model’s training configuration and tested through ablation.
+final one or two backbone stages.
 
-The default should use the actual piecewise-linear segment slope so the training gradient matches deployment behaviour.
+Tier 3: full dependency tile
 
----
+Highest residuals update:
 
-# Part X — Block-Local Sparse Training
+stem or early backbone when required;
 
-## 49. Objective
+all relevant feature stages;
 
-KSHIRA avoids full-image backward propagation.
+fusion;
 
-The forward pass may produce the complete base feature map because inference and hard-negative ranking require spatial predictions.
+head.
 
-The backward pass is restricted to regions that can affect:
+Tier 3 must be rare under the 30-second controller.
 
-* assigned positive cells;
-* selected hard-negative cells;
-* optional local calibration cells.
+7.3 Tile construction
 
-This reduces backward convolution work and activation retention.
+The existing 13x13 RAD dependency tile remains for the legacy path.
 
-## 50. Dependency Radius
+The multistage path requires graph-derived dependency rectangles.
 
-For one supervised base-map cell:
+The compiler/planner must calculate:
 
-* contrast radius: two cells;
-* maximum RAD dilation radius: four cells.
+source support per output location;
 
-Therefore, the required base dependency radius is:
+scale transitions;
 
-[
-r_{\text{dep}}=2+4=6.
-]
+upsample/add dependencies;
 
-The minimum dependency region is:
+halo required by every active branch;
 
-13\times13.
-]
+overlap between selected residual tiles.
 
-Thus, the updated KSHIRA local training unit is not a 9 × 9 tile.
+Tiles are merged when doing so reduces recomputation without exceeding workspace or time budget.
 
-It is a **13 × 13 dependency tile** for one central supervised output cell.
+7.4 Gradient budget
 
-## 51. Tile Union
+The controller sets a budget in measured milliseconds, not only number of tiles.
 
-Multiple assigned cells may have overlapping dependency tiles.
+For example:
 
-KSHIRA merges overlapping tiles deterministically.
+remaining_update_ms = remaining_ms - finalization_reserve_ms
+max_tier3 = floor(remaining_update_ms * tier3_share / measured_tier3_ms)
+max_tier2 = floor(...)
+max_head = floor(...)
 
-The process is:
+A fixed-budget reference must be implemented before adaptive budgeting.
 
-1. generate one dependency rectangle per supervised cell;
-2. clip each rectangle to map boundaries;
-3. sort rectangles by row-major origin;
-4. merge rectangles whose overlap exceeds a configured threshold;
-5. reject merges that exceed the maximum tile workspace;
-6. process the resulting tile list in deterministic order.
+7.5 Stagnation response
 
-This prevents repeated computation when positives are spatially close.
+When the validation proxy does not improve:
 
-## 52. Large Tile Handling
+first increase data diversity;
 
-If merged tiles exceed the available workspace:
+then increase head statistics;
 
-* split them into bounded strips;
-* preserve overlap halos;
-* accumulate parameter deltas transactionally;
-* commit only after all strips complete with finite values.
+then increase late-stage tiles;
 
-## 53. Tile Backward Sequence
+only then unfreeze earlier stages;
 
-For each tile:
+do not automatically widen the model during a run.
 
-1. reconstruct or load the required stem features;
-2. compute required dilated branch values;
-3. accumulate the fused RAD output;
-4. apply pointwise mixing;
-5. compute contrast dependencies;
-6. compute local head gradients;
-7. backpropagate through the contrast channel;
-8. backpropagate through the mixer;
-9. backpropagate through fused branches;
-10. backpropagate through the stem;
-11. accumulate parameter deltas;
-12. verify finite deltas;
-13. commit transactionally.
+8. Target-Domain Bootstrap
 
-The implementation need not retain a global reverse-mode activation tape.
+8.1 Box-crop stream
 
-## 54. Head and Encoder Update Frequency
+Before full-image detection, construct object-centric samples from existing boxes:
 
-The head receives updates for every supervised positive and sampled negative.
+tight object crop;
 
-The encoder receives updates through the dependency tiles.
+object plus context;
 
-A deterministic coverage scheduler ensures that:
+translated crop;
 
-* all stem channels receive updates;
-* all branch channels receive updates;
-* all pointwise mixer outputs receive updates;
-* no channel remains permanently inactive because of sparse selection.
+scaled crop;
 
-## 55. Sparse Channel Scheduling
+horizontal flip when valid;
 
-Spatial tile sparsity may be combined with a rotating channel mask.
+same-size background crop;
 
-The channel mask must be:
+object-boundary crop.
 
-* deterministic;
-* independent of instantaneous gradient magnitude;
-* guaranteed to cover every trainable channel during the reference stream;
-* explicitly included in the training report.
+The crop stage trains:
 
-The official full-update experiment must also be retained as a correctness and convergence reference.
+class discrimination;
 
-## 56. Transactional Updates
+foreground/background;
 
-Parameter updates are committed only when:
+centre offset;
 
-* all tile calculations complete;
-* every gradient is finite;
-* every proposed parameter delta is finite;
-* quantized scales are valid;
-* the arena remains within bounds.
+object size;
 
-On failure:
+feature consistency across crop variants.
 
-* no partial parameter update is committed;
-* the caller receives an explicit failure status;
-* the model remains in its previous valid state.
+8.2 Use in scratch mode
 
----
+In scratch mode, the crop stream gives the random backbone a high positive-signal density before dense detection begins.
 
-# Part XI — Training Phases
+8.3 Use in adaptation mode
 
-## 57. PRE Phase
+In adaptation mode, crop samples rapidly align the reusable backbone to the target classes and visual domain.
 
-The PRE phase establishes stable initial representations.
+8.4 Cache policy
 
-Typical behaviour:
+Crops may be:
 
-* FP32 arithmetic;
-*
-* centre-prior assignment;
-* no predicted-IoU assignment;
-* limited contrast influence;
-* broad channel coverage;
-* conservative hard-negative sampling;
-* full or high-density local updates.
+generated ahead of time and cached;
 
-## 58. TRAIN Phase
+generated deterministically from decoded images;
 
-The TRAIN phase performs the main learning process.
+generated from compact resize caches.
 
-Behaviour includes:
+Preparation time must be reported separately from the 30-second adaptation time.
 
-* contrast-modulated head input;
-* staged task-aligned assignment;
-* localization-aware objectness targets;
-* bounded hard-negative mining;
-* class balancing;
-* block-local backward;
-* optional quantization-aware arithmetic;
-* learning-rate decay;
-* measured tile statistics.
+9. Cached Teacher Supervision
 
-## 59. ODT Phase
+9.1 Optional, mode-specific mechanism
 
-The On-Device Training phase performs limited adaptation after deployment.
+Teacher supervision is allowed only in KSHIRA Adapt or explicitly teacher-assisted research runs.
 
-ODT may permit:
+Scratch results must not use teacher targets.
 
-* bias-only updates;
-* mixer updates;
-* head updates;
-* selected channel updates;
-* bounded scale-head adaptation;
-* calibration refresh.
+9.2 Teacher cache contents
 
-ODT may reject:
+The initial compact cache should store per image:
 
-* unrestricted full-image global backpropagation;
-* architecture changes;
-* arena resizing;
-* unsupported precision transitions.
+image identifier and dataset hash;
 
----
+teacher model identifier and checksum;
 
-# Part XII — Quantization
+top teacher boxes;
 
-## 60. Precision Modes
+class IDs;
 
-KSHIRA supports:
+class-quality scores;
 
-* FP32 reference;
-* INT8;
-* INT4.
+optional box uncertainty;
 
-Quantized modes must use real integer arithmetic in the forward path rather than merely storing quantized values and converting everything back to FP32.
+selected hard-background locations;
 
-## 61. Weight Quantization
+per-object preferred feature scale;
 
-Weights use symmetric quantization.
+optional low-dimensional projected feature vectors at object locations.
 
-For INT8:
+Avoid storing full teacher feature maps in the first implementation.
 
-\operatorname{clamp}
-\left(
-\operatorname{round}(w/s_w),
--127,
-127
-\right).
-]
+9.3 Teacher losses
 
-For signed INT4:
+Box loss
 
-\operatorname{clamp}
-\left(
-\operatorname{round}(w/s_w),
--7,
-7
-\right).
-]
+Student box output matches teacher boxes, subject to ground-truth trust policy.
 
-Per-output-channel scales are preferred for:
+Quality loss
 
-* stem convolution;
-* depthwise branches;
-* pointwise mixer;
-* detection head.
+Student class-quality logits match teacher quality at consistent candidate locations.
 
-## 62. Activation Quantization
+Assignment loss
 
-Semantic activations use signed quantization because learned activations may include values on both sides of zero, depending on the selected activation function and folding strategy.
+Teacher-selected cells provide stable early assignments.
 
-Activation scales are established through representative calibration and updated only through controlled phase transitions.
+Feature loss
 
-## 63. Contrast Quantization
+Optional projected student features match compact teacher projections only at object-aware locations.
 
-Contrast is non-negative.
+9.4 Trust policy
 
-When stored in the existing signed formats, the compact profile uses:
+Teacher outputs must not override ground truth blindly.
 
-* INT8 non-negative code range: (0\ldots127);
-* INT4 non-negative code range: (0\ldots7).
+Priority order:
 
-These are non-negative values represented inside signed storage, not full unsigned 8-bit or unsigned 4-bit formats.
+ground-truth labels and boxes;
 
-## 64. Streaming Percentile Calibration
+teacher correction within bounded tolerance;
 
-KSHIRA must not store every contrast sample.
+teacher-only targets when confidence and consistency pass configured gates;
 
-Percentiles are estimated using a bounded streaming method.
+ignored otherwise.
 
-The default design uses a fixed-bin histogram.
-
-Calibration sequence:
-
-1. first pass determines a stable upper range;
-2. second pass fills a bounded histogram;
-3. cumulative counts identify the desired percentile;
-4. the resulting clipping value is persisted;
-5. histogram workspace is released or reused.
-
-The histogram must reuse phase-exclusive workspace whenever possible.
-
-## 65. Bit-Specific Contrast Ranges
-
-Reference defaults:
-
-* INT8 clipping percentile: (P_{99});
-* INT4 clipping percentile: (P_{95}).
-
-These are initial experimental values, not universal constants.
-
-The quantized code is:
-
-\operatorname{clamp}
-\left(
-\operatorname{round}
-\left(
-C\frac{Q_{\max}}{P}
-\right),
-0,
-Q_{\max}
-\right).
-]
-
-Where:
-
-* (P=P_{99}), (Q_{\max}=127) for INT8;
-* (P=P_{95}), (Q_{\max}=7) for signed-storage INT4.
-
-The calibration study must compare:
-
-* maximum-based scaling;
-* percentile scaling;
-* mean-plus-standard-deviation clipping;
-* learned clipping;
-* exact `log1p`;
-* piecewise-linear `log1p`;
-* clipped raw contrast.
-
-## 66. Quantization-Aware Training
-
-Quantization-aware training uses:
-
-* quantized forward simulation;
-* bit-specific activation clipping;
-* persisted calibration scales;
-* QAS or other bounded gradient scaling;
-* straight-through treatment of rounding where required;
-* transactional parameter updates.
-
-The contrast path must simulate:
-
-* the deployment contrast transform;
-* the deployment clipping range;
-* the deployment integer code range;
-* the deployment dequantization scale.
-
-## 67. Packed INT4 Deployment
-
-The deployment model must eventually be independent of FP32 master weights.
-
-A qualified packed INT4 model contains:
-
-* packed weight nibbles;
-* quantization scales;
-* contrast transform parameters;
-* head calibration information;
-* architecture dimensions;
-* class count;
-* checksum;
-* exact payload length;
-* version identifier.
-
-Training checkpoints may retain FP32 master state. Deployment blobs must be separately identifiable.
-
----
-
-# Part XIII — Memory Plan
-
-## 68. Parameter Count
-
-For the five-class reference profile:
-
-### Existing model
-
-[
-2,648\text{ parameters}.
-]
-
-### Pointwise mixer
-
-[
-72\text{ parameters}.
-]
-
-### Additional ninth-channel head weights
-
-[
-10\text{ parameters}.
-]
-
-### Updated total
-
-2,730\text{ parameters}.
-]
-
-FP32 parameter bytes:
-
-10,920\text{ bytes}.
-]
-
-## 69. Incremental Memory Estimate
-
-Approximate additional requirements:
-
-| Addition                              | Estimated bytes         |
-| ------------------------------------- | ----------------------- |
-| Pointwise mixer parameters            | 288                     |
-| Expanded head parameters              | 40                      |
-| Expanded parameter-delta workspace    | 328                     |
-| Contrast percentile/scales            | 8–16                    |
-| Piecewise contrast-transform metadata | Configuration-dependent |
-| Alignment and descriptors             | Configuration-dependent |
-
-The known minimum increase is approximately:
-
-[
-664\text{ to }672\text{ bytes},
-]
-
-before transform metadata and alignment.
-
-## 70. Memory Reuse Requirements
-
-To remain under 256 KiB:
-
-* the mixer must operate cell by cell;
-* no second semantic feature map may be retained;
-* the contrast map must reuse an existing scalar-map buffer;
-* calibration histograms must reuse phase-exclusive scratch;
-* parameter delta workspace must be sized for 2,730 parameters;
-* multi-scale maps must be virtual or cell-generated;
-* tile buffers must remain bounded;
-* model construction must reject insufficient arenas.
-
-## 71. Hard Memory Gate
-
-The final memory claim is not based on arithmetic estimates alone.
-
-The builder must report:
-
-[
-\text{high-water}\le262,144.
-]
-
-The qualification record must include:
-
-* FP32 profile;
-* INT8 profile;
-* INT4 profile;
-* single-scale profile;
-* multi-scale profile;
-* training profile;
-* inference-only deployment profile.
-
----
-
-# Part XIV — Inference Pipeline
-
-## 72. Inference Sequence
-
-For one image:
-
-1. validate input dimensions and channels;
-2. normalize or quantize input;
-3. compute stem map;
-4. compute and fuse RAD branches;
-5. apply pointwise channel mixing;
-6. generate logical scale views;
-7. compute local contrast;
-8. apply deployment contrast transform;
-9. concatenate semantic and contrast features logically;
-10. execute shared detection head;
-11. decode box distances;
-12. compute objectness and class confidence;
-13. apply per-class score;
-14. update fixed-size top-K candidates;
-15. apply configured duplicate-control policy;
-16. return caller-owned detections.
-
-## 73. Candidate Storage
-
-Candidate count is fixed at model build time.
-
-Each candidate stores:
-
-* box coordinates;
-* score;
-* class;
-* scale;
-* source cell index.
-
-No unbounded candidate list is created.
-
-## 74. Duplicate Control
-
-The desired deployment mode is learned one-to-one selection with bounded top-K output.
-
-During transition and validation, an optional class-aware overlap suppressor may remain available.
-
-Reports must clearly distinguish:
-
-* pure top-K mode;
-* learned one-to-one mode;
-* top-K plus duplicate suppression.
-
-The framework must not describe a suppressor-assisted result as fully NMS-free.
-
----
-
-# Part XV — Correctness and Validation
-
-## 75. Operator Correctness
-
-The following operators require independent reference tests:
-
-* stem convolution;
-* dilated depthwise convolution;
-* branch fusion;
-* pointwise mixer;
-* local mean;
-* raw contrast;
-* contrast transform;
-* contrast backward;
-* box decode;
-* IoU;
-* objectness loss;
-* class loss;
-* assignment;
-* top-K;
-* pooling;
-* quantization;
-* packed INT4 operations.
-
-## 76. Gradient Validation
-
-Finite-difference tests must cover:
-
-* mixer weights;
-* mixer biases;
-* head weights connected to contrast;
-* direct contrast gradient;
-* indirect neighbourhood gradient;
-* boundary cells;
-* overlapping contrast windows;
-* box regression;
-* objectness;
-* classification.
-
-## 77. Dense-versus-Tile Parity
-
-A small deterministic fixture must compare:
-
-* dense backward;
-* block-local backward.
-
-For an identical supervised-cell set, parameter deltas must agree within the configured numerical tolerance.
-
-Separate tests are required for:
-
-* one positive;
-* overlapping positive tiles;
-* positive plus hard negative;
-* boundary tile;
-* multiple boxes;
-* quantized path.
-
-## 78. Quantized Validation
-
-Tests must verify:
-
-* scalar and accelerated paths are bit-exact;
-* INT8 packing and unpacking;
-* INT4 nibble packing;
-* contrast clipping;
-* percentile calibration;
-* piecewise transform monotonicity;
-* saturation handling;
-* score stability;
-* decoded-box parity;
-* class agreement.
-
-## 79. Persistence
-
-Saving and loading must preserve:
-
-* architecture;
-* parameters;
-* mixer;
-* head;
-* precision;
-* calibration;
-* phase state;
-* sparse schedule;
-* update counters;
-* class count;
-* multiscale configuration.
-
-Reloaded inference must produce identical detections.
-
-Corrupt, truncated or length-inconsistent model files must fail closed.
-
----
-
-# Part XVI — Experimental Programme
-
-## 80. Principle
-
-Mechanisms must be introduced through controlled ablation.
-
-No full KSHIRA Updated claim is made until the effect of each major change can be isolated.
-
----
-
-## 81. Experiment A — Existing Control
-
-Configuration:
-
-* original RAD encoder;
-* depthwise branches;
-* no pointwise mixer;
-* learned objectness;
-* current assignment;
-* current scoring.
+9.5 Cache preparation boundary
 
 Report:
 
-* TP, FP and FN;
-* precision;
-* recall;
-* F1;
-* AP50;
-* mAP50:95;
-* mean IoU on matched boxes;
-* score histogram;
-* prediction count;
-* training time;
-* inference time;
-* memory high-water.
+teacher-cache generation time;
 
----
+cache size;
 
-## 82. Experiment B — Pointwise Mixer
+KSHIRA 30-second adaptation time;
 
-Change:
+combined first-use time;
 
-* add the 8-to-8 pointwise mixer;
-* keep all other training and scoring behaviour identical.
+repeated-use adaptation time.
 
-Measure:
+A cached result must never be described as 30-second end-to-end first-use training without this distinction.
 
-* matched-box IoU;
-* class-aware AP;
-* class-agnostic localization recall;
-* channel covariance;
-* effective feature covariance rank;
-* objectness separation;
-* stem gradient magnitude;
-* training-time increase;
-* inference-time increase;
-* arena increase.
+10. Progressive Resolution and Stage Unlocking
 
-Success means measurable improvement in useful detector metrics, not merely increased feature variance.
+10.1 Resolution curriculum
 
----
+The first implementation shall support:
 
-## 83. Experiment C — Contrast Diagnostic
+96 -> 160 -> 224
 
-Change:
+and:
 
-* compute contrast;
-* do not feed it into the head;
-* do not change losses or assignment.
+128 -> 192 -> 256
 
-Analyse contrast for:
+The exact schedule is selected by profile and measured throughput.
 
-* ground-truth centre cells;
-* ground-truth interior cells;
-* ground-truth boundary cells;
-* near-object background;
-* hard background;
-* random background.
+10.2 Shared weights
+
+Backbone and head weights are shared across resolutions. Scale calibration parameters may be resolution-specific only when justified by measurement.
+
+10.3 Unlock schedule
+
+Initial stage
+
+Train:
+
+auxiliary heads;
+
+class-quality head;
+
+box head;
+
+fusion adapters;
+
+final backbone stage.
+
+Middle stage
+
+Unfreeze:
+
+neck;
+
+middle backbone stage;
+
+selected reparameterization branches.
+
+Final stage
+
+Use residual budget to decide whether early stages need updates.
+
+In adaptation mode, the stem should normally remain frozen unless colour/domain residuals remain high.
+
+10.4 Resolution-transition refresh
+
+After changing resolution:
+
+refresh scale statistics;
+
+optionally refresh analytic readout;
+
+reset only resolution-dependent caches;
+
+retain learned weights;
+
+preserve deterministic seed state.
+
+11. Time-Budget Controller
+
+11.1 Controller configuration
+
+Add an optional time-budget structure to the KSHIRA training specification containing:
+
+total wall-clock budget;
+
+preparation included/excluded flag;
+
+finalization reserve;
+
+allowed resolutions;
+
+minimum samples per stage;
+
+maximum encoder-tile share;
+
+maximum teacher-loss share;
+
+allowed thread count;
+
+deterministic versus throughput mode.
+
+11.2 Throughput calibration
+
+At the beginning of training, measure a small bounded sample of:
+
+forward-only time;
+
+head-update time;
+
+late-stage tile time;
+
+full tile time;
+
+analytic accumulation time;
+
+analytic solve time;
+
+validation-proxy time;
+
+branch-fold time;
+
+serialization time.
+
+Use these measurements to calculate quotas.
+
+11.3 Default adaptation schedule
+
+An initial schedule, subject to controller adjustment:
+
+Budget window
+
+Main work
+
+0-2 s
+
+load model/cache, calibrate throughput
+
+2-6 s
+
+object-crop adaptation and first analytic readout
+
+6-14 s
+
+low/mid-resolution dense auxiliary learning
+
+14-23 s
+
+multiscale deployment-head and fusion training
+
+23-27 s
+
+residual-guided late-stage/full tiles
+
+27-29 s
+
+final analytic refresh and ranking refinement
+
+29-30 s
+
+fold, calibrate, serialize
+
+11.4 Default scratch schedule
+
+Budget window
+
+Main work
+
+0-5 s
+
+target-domain box-crop bootstrap
+
+5-12 s
+
+low-resolution dense geometry learning
+
+12-21 s
+
+multiscale dense-to-deploy transition
+
+21-27 s
+
+residual-guided representation updates
+
+27-29 s
+
+analytic head refresh
+
+29-30 s
+
+fold, calibrate, serialize
+
+11.5 Early stopping and reallocation
+
+When a phase reaches its metric gate early, remaining time is transferred to the next phase.
+
+When a phase fails to improve after its configured patience:
+
+stop repeating the same updates;
+
+refresh head or data selection;
+
+move to a new resolution;
+
+increase residual diversity;
+
+preserve finalization reserve.
+
+12. Repository Change Map
+
+12.1 Public API: include/det.h
+
+Add optional, backward-compatible fields at the end of relevant structures.
+
+Required concepts:
+
+KSHIRA profile: compact, balanced, accuracy;
+
+training mode: scratch, adapt, full research;
+
+time budget in milliseconds;
+
+resolution schedule identifier;
+
+input colour mode;
+
+teacher-cache enable flag;
+
+auxiliary-training enable flag;
+
+analytic-readout enable flag;
+
+residual-budget enable flag;
+
+training-arena bytes separate from deployment-arena bytes;
+
+requested thread count;
+
+deterministic mode.
+
+Older callers that zero-initialize structures must retain current behaviour.
+
+12.2 Adapter/orchestrator: src/det_kshira.inc
+
+Responsibilities to add:
+
+choose architecture profile;
+
+initialize training controller;
+
+run throughput calibration;
+
+select scratch/adapt schedule;
+
+transition resolutions;
+
+transition trainable stage masks;
+
+call analytic refresh;
+
+build residual candidate queues;
+
+apply tile budgets;
+
+trigger fold and quantization;
+
+print phase timing and metric movement;
+
+preserve legacy recipe selection.
+
+Do not place low-level convolution math in the adapter.
+
+12.3 Core detector: src/kshira_rad.c
+
+Retain legacy RAD functions.
+
+Add or route to:
+
+multi-stage RGB stem;
+
+reparameterizable blocks;
+
+shared pyramid;
+
+shared multiscale head;
+
+dense auxiliary forward/loss;
+
+residual extraction;
+
+trainable-stage masks;
+
+folded deployment forward;
+
+contrast gate.
+
+The file should not become a single monolith. New components should be separated as described below.
+
+12.4 Proposed new modules
+
+src/kshira_reparam.c
+
+branch forward/backward;
+
+branch-scale handling;
+
+exact folding;
+
+folded-kernel export;
+
+fold-parity checks.
+
+src/kshira_pyramid.c
+
+P3/P4/P5 production;
+
+top-down addition;
+
+optional bottom-up refinement;
+
+shared projection scheduling;
+
+scale-support queries.
+
+src/kshira_aux.c
+
+dense target generation;
+
+centre/interior/size/boundary losses;
+
+auxiliary head forward/backward;
+
+loss-weight schedule.
+
+src/kshira_solver.c
+
+sufficient-statistic accumulation;
+
+regularization;
+
+Cholesky solve;
+
+head interpolation;
+
+solve diagnostics;
+
+rollback on regression.
+
+src/kshira_budget.c
+
+elapsed-time tracking;
+
+throughput calibration;
+
+quota calculation;
+
+residual priority queue;
+
+update-tier selection;
+
+finalization reserve.
+
+src/kshira_bootstrap.c
+
+deterministic crop generation;
+
+object/background crop targets;
+
+bootstrap schedule;
+
+crop-level auxiliary losses.
+
+src/kshira_distill.c
+
+teacher-cache parsing;
+
+ground-truth/teacher trust policy;
+
+teacher assignment targets;
+
+prediction and optional feature distillation.
+
+src/kshira_cache.c
+
+predecoded tensor cache;
+
+multiresolution cache indexing;
+
+dataset fingerprint;
+
+target cache validation.
+
+12.5 Internal definitions
+
+Extend src/kshira_rad_internal.h or split it into internal headers containing:
+
+stage descriptors;
+
+reparameterization block descriptors;
+
+pyramid descriptors;
+
+auxiliary-head state;
+
+solver state;
+
+budget-controller state;
+
+training/deployment graph identifiers;
+
+fold state;
+
+profile dimensions;
+
+graph fingerprint.
+
+12.6 State persistence: src/kshira_rad_state.c
+
+Bump state format after the current v2 path.
+
+The new format must record:
+
+format version;
+
+graph/profile fingerprint;
+
+input colour transform;
+
+training mode;
+
+resolution schedule;
+
+unfolded training weights when saving resumable state;
+
+folded deployment weights when exporting deploy state;
+
+analytic-head metadata;
+
+normalization/calibration state;
+
+contrast gate;
+
+scale gains and biases;
+
+quantization scales;
+
+optional foundation-model identifier;
+
+optional teacher-cache identifier;
+
+CRC and exact payload length.
+
+Training checkpoints and deployment blobs should be distinguishable.
+
+12.7 Bench and tools
+
+tools/bench.c
+
+Add reporting for:
+
+mode and profile;
+
+preparation time;
+
+adaptation/training time;
+
+fold time;
+
+serialization time;
+
+time-to-first metric gate;
+
+time-to-best F1/AP50;
+
+resolution transitions;
+
+update-tier counts;
+
+solver refresh count;
+
+teacher-cache usage;
+
+training and deployment memory;
+
+folded and unfolded parameter counts.
+
+New cache tool
+
+Create a tool for:
+
+decoding source images once;
+
+generating multiresolution RGB tensors;
+
+writing dataset fingerprints;
+
+generating dense box fields;
+
+optionally importing teacher predictions.
+
+A Python preparation tool is acceptable, but the product runtime must not require Python.
+
+Teacher import tool
+
+Support common teacher output formats without copying external detector source code.
+
+The imported cache becomes a KSHIRA-owned versioned binary format.
+
+13. Memory Planning
+
+13.1 Separate training and deployment arenas
+
+The public model configuration must distinguish:
+
+training arena capacity;
+
+deployment arena capacity.
+
+The compact path may continue to use approximately 256 KiB. Balanced and accuracy training profiles may use larger caller-owned arenas.
+
+13.2 Liveness and reuse
+
+The graph planner should reuse buffers across:
+
+sequential reparameterization branches;
+
+scale production;
+
+auxiliary heads;
+
+analytic accumulation;
+
+residual queues;
+
+tile backward;
+
+quantization calibration.
+
+Training-only buffers must not remain live during folded inference.
+
+13.3 Memory report
+
+Every result must report:
+
+parameter bytes;
+
+optimizer bytes;
+
+activation bytes;
+
+auxiliary bytes;
+
+solver bytes;
+
+residual-queue bytes;
+
+teacher-cache resident bytes;
+
+fold workspace;
+
+training high-water;
+
+deployment high-water;
+
+checkpoint bytes;
+
+deployment blob bytes.
+
+13.4 No hidden allocation
+
+The no-hot-loop-allocation contract remains.
+
+All candidate queues, sufficient statistics, tile lists and cache pages must be preallocated or arena-planned.
+
+14. CPU Execution Plan
+
+14.1 Scalar reference first
+
+Every new operator requires a readable scalar FP32 reference.
+
+14.2 Kernel order
+
+Implementation sequence:
+
+direct scalar FP32;
+
+specialized 1x1 and depthwise kernels;
+
+fused add/activation;
+
+blocked RGB stem;
+
+AVX2 FP32;
+
+AVX2 INT8;
+
+thread-pool image or tile parallelism;
+
+double-buffered cache loading;
+
+packed INT4 deployment.
+
+14.3 Parallelism
+
+The 30-second benchmark must report:
+
+single-thread result;
+
+configured all-core result;
+
+thread count;
+
+CPU affinity policy.
+
+The deterministic reference may use a fixed accumulation order. Throughput mode may permit deterministic per-thread partial sums followed by ordered reduction.
+
+14.4 Fusion opportunities
+
+Prioritize:
+
+stem convolution + activation;
+
+depthwise + pointwise fusion where numerically valid;
+
+lateral projection + addition;
+
+head projection + top-K insertion;
+
+quantization + activation;
+
+teacher-target lookup + loss.
+
+15. Quantization and Compression
+
+15.1 Accuracy first
+
+Do not quantize an architecture that has not established useful F32 accuracy.
+
+15.2 Folding order
+
+Recommended order:
+
+finish training;
+
+fold reparameterization branches;
+
+fold frozen normalization/scales;
+
+prune disabled contrast or auxiliary paths;
+
+calibrate activations;
+
+run INT8 QAT or short adaptation;
+
+optionally run W4A8/INT4 adaptation;
+
+export packed deployment graph.
+
+15.3 Distillation to compact profile
+
+When the balanced profile reaches useful accuracy, train a compact profile using cached balanced-model targets.
+
+This creates a KSHIRA-to-KSHIRA compression path without requiring the external teacher at deployment.
+
+15.4 Required parity tests
+
+unfolded versus folded FP32 detections;
+
+folded FP32 versus INT8 decoded detections;
+
+INT8 versus INT4 class agreement;
+
+box IoU agreement;
+
+score-order agreement;
+
+deployment memory and latency.
+
+16. Benchmark Protocol
+
+16.1 Fair nano-YOLO comparison
+
+Create two nano-YOLO baselines on the exact same:
+
+train split;
+
+validation split;
+
+RGB preprocessing;
+
+class mapping;
+
+maximum detections;
+
+evaluator;
+
+IoU matching;
+
+CPU hardware;
+
+thread count;
+
+wall-clock budget.
+
+Baseline A: scratch
+
+Nano-YOLO starts from random weights.
+
+Baseline B: adaptation
+
+Nano-YOLO starts from its normal pretrained checkpoint.
+
+KSHIRA Scratch compares with Baseline A. KSHIRA Adapt compares with Baseline B.
+
+16.2 Time boundaries
 
 Report:
 
-* contrast histograms;
-* median and percentiles;
-* AUROC for object-region versus background-region discrimination;
-* precision-recall AUC;
-* object-size breakdown;
-* per-image normalization sensitivity;
-* before-training and after-training distributions.
+cache preparation;
 
-This determines whether contrast contains useful information before it is allowed to affect training.
+teacher preparation;
 
----
+model load;
 
-## 84. Experiment D — Hybrid Contrast Head
+training/adaptation;
 
-Change:
+folding;
 
-* append contrast as the ninth feature;
-* retain learned objectness;
-* use balanced objectness loss;
-* keep centre-based assignment initially.
+quantization;
 
-Report all detector metrics and compare with Experiment B.
+serialization;
 
-Required evidence:
+end-to-end first use;
 
-* improved score separation;
-* no uncontrolled FP increase;
-* stable objectness across thresholds;
-* no loss of box quality;
-* acceptable latency and memory cost.
+repeated adaptation using existing caches.
 
----
+16.3 Accuracy metrics
 
-## 85. Experiment E — Staged Task-Aligned Assignment
+Required:
 
-Change:
+precision;
 
-* introduce candidate-local contrast;
-* introduce centre prior;
-* gradually introduce predicted IoU;
-* apply deterministic conflict resolution.
+recall;
 
-Compare:
+F1-max;
 
-* centre-only assignment;
-* centre-plus-contrast;
-* centre-plus-IoU;
-* complete centre-plus-contrast-plus-IoU.
+AP50;
 
-Report:
+AP75;
 
-* positives per GT;
-* unassigned GT count;
-* per-size AP;
-* early-training stability;
-* assignment churn;
-* class imbalance;
-* convergence.
+mAP50:95;
 
----
+per-class AP;
 
-## 86. Experiment F — Block-Local Sparse Training
+small/medium/large AP;
 
-Change:
+TP/FP/FN;
 
-* preserve Experiment E architecture and losses;
-* replace dense encoder backward with dependency-tile backward.
+matched-box IoU;
 
-Measure:
+score histograms;
 
-* total tile count;
-* average tile area;
-* merged-tile ratio;
-* recomputed cells;
-* backward MACs;
-* parameter-update count;
-* train-core time;
-* end-to-end time;
-* memory;
-* AP;
-* precision and recall.
+calibration error;
 
-The success criterion is:
+predictions per image.
 
-* materially lower measured train-core time;
-* no unacceptable degradation in detector accuracy;
-* no hidden full-map backward fallback;
-* deterministic tile scheduling.
+16.4 Time-to-accuracy curves
 
-A nominal FLOP reduction is not sufficient. Wall-clock reduction must be measured.
+Record metrics at fixed times:
 
----
+2 s, 5 s, 10 s, 15 s, 20 s, 25 s, 30 s
 
-## 87. Experiment G — Quantization
+Primary comparisons:
 
-Run:
+time to AP50 threshold;
 
-* FP32;
-* INT8;
-* INT4.
+time to F1 threshold;
 
-Compare:
+AP50 at 30 seconds;
 
-* exact versus piecewise contrast transform;
-* max versus percentile clipping;
-* quantized objectness calibration;
-* box IoU;
-* class agreement;
-* mAP loss;
-* score saturation;
-* training stability;
-* inference latency;
-* model size.
+mAP50:95 at 30 seconds;
 
-Qualification follows the detector-level metrics rather than TP count alone.
+area under the time-to-accuracy curve.
 
----
+17. Implementation Phases
 
-# Part XVII — Official Qualification
+Phase 0: Baseline preservation and instrumentation
 
-## 88. Real-Image Workload
+Work
 
-The final model must run on:
+lock current closed F32 recipe;
 
-* 5,000 unique real images;
-* raw manifest input;
-* one streaming pass;
-* randomly initialized learned weights;
-* separate validation data.
+lock current surgical QC recipe;
 
-Repeated exposures of a smaller dataset do not count as 5,000 unique images.
+add score histograms;
 
-## 89. Timing
+add GT-count versus max-detections audit;
 
-Report:
+add time-to-metric logging;
 
-### Train core
+add graph/profile fingerprinting;
 
-Prepared model tensors through:
+add feature flags for every proposed mechanism.
 
-* training;
-* parameter updates;
-* final serialization.
+Gate
 
-### Train end to end
+existing repeated results remain reproducible;
 
-Raw files through:
+no default behaviour change;
 
-* image decode;
-* resizing;
-* label parsing;
-* training;
-* serialization.
+tests green.
 
-Both values remain visible.
+Phase 1: Analytic readout experiment
 
-The targets are:
+Work
 
-* stretch target: at most one second;
-* secondary target: at most ten seconds.
+implement kshira_solver.c;
 
-A prepared-tensor result does not replace the end-to-end result.
+freeze existing encoder;
 
-## 90. Accuracy
+accumulate positive and diverse negative statistics;
 
-Report:
+solve class-quality head;
 
-* precision;
-* recall;
-* F1;
-* AP50;
-* AP75;
-* mAP50:95;
-* per-class AP;
-* small-object AP;
-* medium-object AP;
-* large-object AP;
-* class-agnostic localization recall;
-* matched-box IoU;
-* objectness calibration;
-* prediction count.
+compare ranking with SGD head;
 
-## 91. Quantized Accuracy
+add rollback.
 
-Quantized validation must include decoded detections.
+Decision gate
 
-Targets include:
+Continue analytic refresh if it improves any of:
 
-* INT8 within two mAP points of FP32;
-* W4A8 within five mAP points of FP32;
-* explicit INT4 KSHIRA threshold defined before qualification;
-* class agreement;
-* decoded-box IoU;
-* no objectness collapse.
+F1 by at least 0.005;
 
-The official plan requires detector-level quantization validation rather than tensor similarity alone.
+TP at threshold 0.20;
 
-## 92. Reproducibility
+FP/TP ratio;
 
-The final result must report:
+AP50;
 
-* three deterministic random seeds;
-* median performance;
-* result range;
-* pinned CPU configuration;
-* compiler and flags;
-* thread count;
-* cycles where available;
-* peak memory;
-* model size;
-* dataset identity;
-* unique-image count;
-* exposure count;
-* precision mode.
+positive/negative score separation.
 
----
+If it does not improve, prioritize representation before further head work.
 
-# Part XVIII — Research Contribution
+Phase 2: Target-domain bootstrap
 
-## 93. Central Contribution
+Work
 
-KSHIRA investigates whether useful object detection can be trained from random initialization under a hard memory and execution budget by co-designing:
+deterministic object/background crops;
 
-* a compact receptive-field encoder;
-* learned pointwise channel mixing;
-* explicit local semantic contrast;
-* task-aligned positive assignment;
-* localization-aware objectness;
-* balanced hard-negative supervision;
-* dependency-tile backward propagation;
-* real low-bit arithmetic;
-* deterministic ISO-C execution.
+crop-level class and foreground losses;
 
-## 94. Distinctive System Hypothesis
+fixed wall-clock bootstrap window;
 
-The strongest research hypothesis is not that any individual operation is entirely new.
+compare full-image-only versus bootstrap.
 
-The hypothesis is that their constrained composition can produce a useful detector under conditions where conventional detector training is unsuitable:
+Gate
 
-> A contrast-modulated, task-aligned detector can be trained from random weights using bounded local backward tiles and real low-bit arithmetic while remaining inside a fixed caller-owned ISO-C arena.
+At equal total time, bootstrap must improve time-to-F1 or AP50.
 
-## 95. Required Evidence
+Phase 3: Information-preserving RGB backbone
 
-The framework may be described as a validated research contribution only after controlled experiments demonstrate that:
+Work
 
-1. pointwise mixing improves learned representation;
-2. contrast contains useful object-region information;
-3. the hybrid contrast channel improves detector calibration or accuracy;
-4. staged assignment improves training stability or positive quality;
-5. block-local training reduces actual wall-clock time;
-6. quantized training retains detector accuracy;
-7. the complete model fits the arena;
-8. results repeat across seeds;
-9. gains are not caused solely by changed threshold calibration.
+two-stage stem;
 
----
+RGB cache;
 
-# Part XIX — Implementation Order
+compact reparameterizable block;
 
-## 96. Stage 1 — Representation
+profile-based channels;
 
-Implement and validate:
+normalization/scaling;
 
-* pointwise mixer;
-* in-place cellwise execution;
-* mixer forward and backward;
-* updated serialization;
-* updated memory planner.
+legacy stem remains available.
 
-## 97. Stage 2 — Contrast Diagnostics
+Gate
 
-Implement and validate:
+A small balanced prototype must clearly exceed the current closed accuracy bar before multiscale expansion.
 
-* neighbourhood mean;
-* raw contrast;
-* FP32 `log1p`;
-* contrast statistics;
-* contrast maps;
-* object-region versus background diagnostics.
+Phase 4: Dense auxiliary supervision
 
-Do not yet change the head.
+Work
 
-## 98. Stage 3 — Hybrid Head
+target-field generation;
 
-Implement:
+centre/interior/size heads;
 
-* ninth input channel;
-* expanded head;
-* exact contrast backward;
-* balanced focal objectness;
-* bounded negatives.
+dense-to-deployment loss schedule;
 
-## 99. Stage 4 — Assignment
+auxiliary heads removed from deploy graph.
 
-Implement:
+Gate
 
-* candidate generation;
-* centre prior;
-* contrast normalization;
-* staged IoU introduction;
-* deterministic conflict resolution;
-* positive fallback.
+At equal 30-second budget, dense supervision must improve time-to-AP50 and not merely training loss.
 
-## 100. Stage 5 — Local Backward
+Phase 5: Shared multiscale pyramid
 
-Implement:
+Work
 
-* 13 × 13 dependency tiles;
-* tile merging;
-* tile splitting;
-* transactional delta accumulation;
-* dense-versus-local parity tests;
-* measured compute reporting.
+P3/P4/P5 shared projections;
 
-## 101. Stage 6 — Quantization
+top-down addition;
 
-Implement:
+shared head;
 
-* deployment-compatible contrast approximation;
-* streaming percentile calibration;
-* INT8 contrast path;
-* INT4 contrast path;
-* quantization-aware contrast training;
-* packed deployment representation.
+scale bias/gain;
 
-## 102. Stage 7 — Multi-Scale Qualification
+scale-aware dense and deploy assignment.
 
-Implement:
+Gate
 
-* virtual pooled views;
-* shared head;
-* scale calibration;
-* scale-aware assignment;
-* pooled-source local gradients;
-* per-size validation.
+small-object AP improves;
 
-## 103. Stage 8 — Product Qualification
+prediction flood remains controlled;
 
-Run:
+fold/deploy memory is reported;
 
-* 5,000 unique images;
-* one-pass training;
-* raw end-to-end timing;
-* HOG baseline;
-* three seeds;
-* F32/INT8/INT4 comparison;
-* complete memory report;
-* low-clock CPU profile;
-* FPGA preparation.
+no regression from untrained scale heads.
 
----
+Phase 6: Residual-guided gradient budget
 
-# Part XX — Final Framework Definition
+Work
 
-KSHIRA Updated is defined as:
+residual map;
 
-> A dataset-neutral object-detection architecture and runtime in ISO C that trains learned spatial, channel-mixing and detection parameters from random initialization inside a statically bounded caller-owned arena.
+update tiers;
 
-Its encoder combines:
+fixed budget;
 
-* a learned spatial stem;
-* parallel dilated depthwise receptive fields;
-* memory-efficient branch fusion;
-* learned pointwise channel interaction.
+adaptive budget;
 
-Its objectness system combines:
+graph-derived dependency tiles;
 
-* learned semantic features;
-* an explicit centre-surround contrast feature;
-* localization-aware objectness targets;
-* balanced focal supervision;
-* bounded hard-negative mining.
+measured milliseconds per tier.
 
-Its assignment system combines:
+Gate
 
-* deterministic centre priors;
-* candidate-local contrast;
-* predicted IoU;
-* staged one-pass scheduling;
-* conflict-safe top-k selection.
+At the same accuracy, measured training time decreases; or at the same 30 seconds, AP/F1 increases.
 
-Its training system combines:
+Phase 7: Time-budget controller
 
-* full forward spatial evaluation;
-* dependency-bounded local backward propagation;
-* deterministic tile merging;
-* transactional updates;
-* sparse channel coverage;
-* no hot-loop allocation.
+Work
 
-Its quantization system combines:
+throughput calibration;
 
-* real INT8 and INT4 arithmetic;
-* per-channel weight scales;
-* bounded activation calibration;
-* non-negative contrast codes;
-* deployment-matched contrast approximation;
-* packed deployment artifacts.
+resolution transitions;
 
-Its qualification system requires:
+unlock schedule;
 
-* real-image detection accuracy;
-* raw and core timing;
-* memory high-water;
-* three-seed reproducibility;
-* HOG-relative validation;
-* detector-level quantization parity;
-* explicit failure reporting.
+finalization reserve;
 
-KSHIRA does not define success by parameter count or synthetic speed alone.
+metric-based reallocation.
 
-Success requires one complete detector to demonstrate, on the same qualified configuration:
+Gate
 
-* training from random weights;
-* useful localization;
-* meaningful objectness separation;
-* class prediction;
-* bounded memory;
-* quantized operation;
-* deterministic persistence;
-* measured training latency;
-* measured inference latency.
+Repeated 30-second runs complete folding and serialization without overrunning the budget tolerance.
 
-Until these gates pass, sub-second training, stable INT4 learning, FPGA performance and low-power operation remain research objectives.
+Phase 8: Teacher-assisted adaptation
 
-The architecture is designed so that every such objective can be tested numerically, independently and reproducibly.
+Work
+
+teacher cache format;
+
+import tool;
+
+prediction/assignment distillation;
+
+optional projected feature targets;
+
+trust policy.
+
+Gate
+
+KSHIRA Adapt materially closes the gap to pretrained nano-YOLO at the same 30-second adaptation budget.
+
+Phase 9: Folding and deployment compression
+
+Work
+
+fold branches;
+
+prune auxiliary paths;
+
+INT8 calibration/QAT;
+
+compact-profile distillation;
+
+packed deploy export.
+
+Gate
+
+fold parity passes;
+
+quantized AP loss remains within declared limit;
+
+deployment latency and memory meet selected profile target.
+
+18. Tests
+
+18.1 Unit tests
+
+Add tests for:
+
+solver accumulation;
+
+Cholesky solve against known systems;
+
+singular-system fallback;
+
+residual priority ordering;
+
+fixed-budget determinism;
+
+time-controller quota calculation;
+
+reparameterization fold equality;
+
+RGB stem parity;
+
+space-to-depth ordering;
+
+dense target fields;
+
+scale assignment;
+
+teacher-cache validation;
+
+profile builder rejection;
+
+state-format mismatch;
+
+quantized folded blocks.
+
+18.2 Integration tests
+
+current legacy recipe unchanged;
+
+scratch schedule completes;
+
+adaptation schedule completes;
+
+resolution transition preserves model state;
+
+solver refresh can roll back;
+
+auxiliary heads absent from deployment blob;
+
+folded checkpoint reload matches prediction;
+
+deterministic run reproduces metrics and state checksum.
+
+18.3 Numerical tests
+
+dense versus tile gradient parity on small graph;
+
+unfolded versus folded output tolerance;
+
+scalar versus SIMD parity;
+
+F32 versus INT8 decoded output comparison;
+
+teacher-target coordinate alignment.
+
+19. Experiment Matrix
+
+19.1 Representation isolation
+
+ID
+
+Stem
+
+RGB
+
+Norm
+
+Reparam
+
+Solver
+
+R0
+
+current stride 4
+
+no
+
+no
+
+no
+
+no
+
+R1
+
+current stride 4
+
+no
+
+no
+
+no
+
+yes
+
+R2
+
+two-stage
+
+yes
+
+no
+
+no
+
+yes
+
+R3
+
+two-stage
+
+yes
+
+yes
+
+no
+
+yes
+
+R4
+
+two-stage
+
+yes
+
+yes
+
+yes
+
+yes
+
+Fit the same head/evaluator to isolate representation gains.
+
+19.2 Supervision isolation
+
+ID
+
+Crop bootstrap
+
+Dense fields
+
+Multiscale
+
+Residual budget
+
+S0
+
+no
+
+no
+
+no
+
+score HNM
+
+S1
+
+yes
+
+no
+
+no
+
+score HNM
+
+S2
+
+yes
+
+yes
+
+no
+
+score HNM
+
+S3
+
+yes
+
+yes
+
+yes
+
+score HNM
+
+S4
+
+yes
+
+yes
+
+yes
+
+residual
+
+19.3 Training-mode comparison
+
+random KSHIRA Scratch;
+
+foundation KSHIRA Adapt;
+
+foundation plus cached teacher;
+
+nano-YOLO random;
+
+nano-YOLO pretrained;
+
+balanced KSHIRA Full Research ceiling.
+
+19.4 Capacity sweep
+
+Measure at approximately:
+
+100k parameters;
+
+300k parameters;
+
+600k parameters;
+
+1.0M parameters.
+
+Report AP at 10, 20 and 30 seconds. Do not select by parameter count alone.
+
+19.5 Resolution sweep
+
+fixed 160;
+
+fixed 224;
+
+96 to 160 to 224;
+
+128 to 192 to 256.
+
+20. Acceptance Gates
+
+20.1 Stage gates
+
+No phase becomes canonical merely because it compiles.
+
+A phase must improve at least one primary axis without unacceptable regression on the others:
+
+AP50;
+
+mAP50:95;
+
+F1;
+
+time-to-accuracy;
+
+training memory;
+
+deployment memory;
+
+inference latency.
+
+20.2 Accuracy-development gates
+
+Initial progression:
+
+beat closed F1 0.043 and TP 26 in repeated F32 runs;
+
+obtain a non-trivial AP50 improvement over 0.0012;
+
+reduce FP/TP materially;
+
+establish useful score separation;
+
+reach F1 0.10;
+
+reach F1 0.20 with useful AP;
+
+begin nano-YOLO relative comparison only after the evaluator is shared.
+
+20.3 Nano-YOLO race gates
+
+After fair baselines exist:
+
+Scratch goal
+
+At 30 seconds, KSHIRA Scratch should exceed nano-YOLO Scratch on at least one of:
+
+AP50;
+
+mAP50:95;
+
+time to fixed AP;
+
+memory to fixed AP.
+
+Adapt goal
+
+Target:
+
+within approximately 10-15% relative AP50 of pretrained nano-YOLO at the same 30-second adaptation budget;
+
+or reach the same AP two to three times faster;
+
+with materially lower training memory or simpler deployment runtime.
+
+These percentages are research targets, not current claims.
+
+20.4 Reproducibility
+
+Every promoted result requires:
+
+at least three deterministic seeds;
+
+median and range;
+
+complete command/config;
+
+data fingerprint;
+
+CPU and thread count;
+
+compiler and flags;
+
+training/deployment memory;
+
+time boundary definition.
+
+21. Rollback and Branch Policy
+
+21.1 Preserve legacy implementation
+
+Keep the current RAD path selectable through a profile or compatibility flag.
+
+21.2 Feature flags
+
+Every major feature requires an independent toggle:
+
+RGB stem;
+
+two-stage stem;
+
+reparameterization;
+
+normalization;
+
+dense auxiliary fields;
+
+analytic readout;
+
+residual budget;
+
+progressive resolution;
+
+shared pyramid;
+
+contrast gate;
+
+teacher cache;
+
+adaptation mode.
+
+21.3 Promotion rule
+
+A new default is promoted only after:
+
+unit and integration tests pass;
+
+repeated metric gate passes;
+
+baseline command remains available;
+
+checkpoint compatibility policy is documented;
+
+memory and time are reported.
+
+21.4 Stop rule
+
+If three consecutive architecture ablations fail to improve AP50 or F1 meaningfully, stop architecture churn and investigate:
+
+data quality;
+
+evaluator correctness;
+
+target alignment;
+
+model capacity;
+
+teacher/domain mismatch;
+
+CPU bottleneck.
+
+22. Paper and Novelty Position
+
+The proposed paper contribution should not claim that each component is individually new.
+
+The potentially distinctive contribution is the integrated system:
+
+KSHIRA is a time-budgeted ISO-C object detector that uses a richer foldable training graph, dense box-derived supervision, streaming analytic readout refresh and residual-guided local backpropagation to maximize detection accuracy under a fixed CPU training budget before exporting a compact quantized deployment graph.
+
+The strongest proposed novelty is the combination of:
+
+train-deploy graph separation inside a custom C detector runtime;
+
+streaming analytic quality-head refresh;
+
+analytic-residual-driven gradient allocation;
+
+dense-to-residual detection curriculum;
+
+time-budget-controlled resolution and stage unlocking;
+
+optional cached assignment distillation with no teacher execution during adaptation;
+
+structural folding into a low-bit deployment graph.
+
+The contribution becomes valid only if controlled ablations show that these mechanisms improve time-to-accuracy over simpler alternatives.
+
+23. Immediate Next Actions
+
+The first implementation cycle should not attempt the complete architecture.
+
+Execute in this order:
+
+Action 1: instrumentation and fair baseline
+
+lock current recipes;
+
+add score histograms;
+
+add time-to-metric checkpoints;
+
+establish nano-YOLO scratch and adaptation commands on the same evaluator.
+
+Action 2: analytic readout
+
+implement solver on frozen current KSHIRA features;
+
+determine whether current representation can support stronger ranking.
+
+This is the highest-information experiment.
+
+Action 3: RGB target-domain bootstrap
+
+add predecoded RGB cache;
+
+add deterministic object/background crop stream;
+
+compare equal-time learning.
+
+Action 4: two-stage information-preserving stem
+
+implement the smallest balanced profile;
+
+retain current RAD neck/head initially;
+
+compare representation before building the full pyramid.
+
+Action 5: dense auxiliary fields
+
+add centre/interior/size supervision;
+
+measure time-to-AP50.
+
+Only after these five actions should the repository proceed to:
+
+shared multiscale pyramid;
+
+adaptive residual budgets;
+
+teacher-assisted adaptation;
+
+full train-deploy folding.
+
+24. Final Implementation Principle
+
+KSHIRA should no longer be optimized by asking:
+
+How can the smallest existing graph be trained a little better?
+
+The new engineering question is:
+
+Given a fixed wall-clock budget, which supervision, parameters, resolutions and gradient paths produce the largest increase in validated detection accuracy, and how can the resulting learned system be folded into a compact ISO-C deployment graph?
+
+The implementation must therefore optimize:
+
+validated accuracy gained per millisecond
+
+rather than only:
+
+milliseconds per epoch
+
+or:
+
+minimum parameter count
+
+This is the central direction for the next KSHIRA repository version.
+
+25. Research References Informing the Direction
+
+The implementation should cite and compare against the following research families without copying source code:
+
+deeply supervised detector training from scratch;
+
+stable normalization and information-preserving stems for scratch detection;
+
+dense matching for faster detector convergence;
+
+structural/online convolutional reparameterization;
+
+object-aware and assignment-aware detector distillation;
+
+sparse or local backward computation;
+
+quality-aware classification and ranking.
+
+The KSHIRA contribution is the measured integration of these principles into a time-budgeted, arena-planned ISO-C training and deployment system.
