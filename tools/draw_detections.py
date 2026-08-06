@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw GT (green) and PRED (red) boxes from viz_detect output onto PNGs."""
+"""Draw prediction boxes, optionally with ground truth, onto PNGs."""
 
 from __future__ import annotations
 
@@ -108,6 +108,11 @@ def main() -> int:
         help="Directory containing images/ relative to report paths",
     )
     parser.add_argument("--out-dir", default="results/viz")
+    parser.add_argument(
+        "--pred-only",
+        action="store_true",
+        help="draw only model predictions; omit ground-truth boxes",
+    )
     args = parser.parse_args()
 
     report = Path(args.report)
@@ -128,9 +133,10 @@ def main() -> int:
         draw = ImageDraw.Draw(image)
 
         # GT boxes in report are already in model input coords (after det resize).
-        for gt in sample["gt"]:
-            box = scale_box(gt["box"], model_w, model_h, src_w, src_h)
-            draw_box(draw, box, (0, 200, 0), f"GT {gt['name']}", width=3)
+        if not args.pred_only:
+            for gt in sample["gt"]:
+                box = scale_box(gt["box"], model_w, model_h, src_w, src_h)
+                draw_box(draw, box, (0, 200, 0), f"GT {gt['name']}", width=3)
 
         for pred in sample["pred"]:
             box = scale_box(pred["box"], model_w, model_h, src_w, src_h)
@@ -145,10 +151,15 @@ def main() -> int:
 
     # also write a simple index
     index = out_dir / "README.txt"
+    legend = ""
+    if not args.pred_only:
+        legend += "Green boxes = ground truth labels\n"
+    legend += "Red boxes   = model predictions (class + confidence)\n"
+    if args.pred_only:
+        legend += "This output omits ground-truth boxes.\n"
+    legend += "Model was trained one pass on cars train split, then evaluated on valid.\n"
     index.write_text(
-        "Green boxes = ground truth labels\n"
-        "Red boxes   = model predictions (class + confidence)\n"
-        "Model was trained one pass on cars train split, then evaluated on valid.\n",
+        legend,
         encoding="utf-8",
     )
     print(f"index: {index}")

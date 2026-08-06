@@ -60,10 +60,13 @@ static int next_sample(void *user, det_sample *sample) {
                          (size_t)dataset->classes);
     if (x0 + size >= dataset->width) size = dataset->width - x0 - 1;
     if (y0 + size >= dataset->height) size = dataset->height - y0 - 1;
-    for (int y = y0; y < y0 + size; ++y) {
-        for (int x = x0; x < x0 + size; ++x) {
-            dataset->pixels[(size_t)y * (size_t)dataset->width + (size_t)x] =
-                pattern_pixel(dataset, class_id, x, y, x0, y0, size);
+    for (int channel = 0; channel < dataset->channels; ++channel) {
+        for (int y = y0; y < y0 + size; ++y) {
+            for (int x = x0; x < x0 + size; ++x) {
+                dataset->pixels[((size_t)channel * (size_t)dataset->height +
+                                 (size_t)y) * (size_t)dataset->width + (size_t)x] =
+                    pattern_pixel(dataset, class_id, x, y, x0, y0, size);
+            }
         }
     }
     dataset->box.x1 = (float)x0;
@@ -126,12 +129,46 @@ static int parse_precision(const char *value, det_precision *out) {
     return 1;
 }
 
+static int parse_channels(const char *value, int *out) {
+    int parsed;
+    if (value == NULL || out == NULL || !parse_positive_int(value, &parsed) ||
+        (parsed != 1 && parsed != 3)) return 0;
+    *out = parsed;
+    return 1;
+}
+
 static int parse_architecture(const char *value, det_architecture *out) {
     if (value == NULL || out == NULL) return 0;
     if (strcmp(value, "cdet") == 0) *out = DET_ARCH_CDET;
     else if (strcmp(value, "kshira") == 0) *out = DET_ARCH_KSHIRA;
     else return 0;
     return 1;
+}
+
+static int parse_stem_mode(const char *value, det_stem_mode *out) {
+    if (value == NULL || out == NULL) return 0;
+    if (strcmp(value, "legacy") == 0) *out = DET_STEM_LEGACY;
+    else if (strcmp(value, "space-to-depth") == 0) *out = DET_STEM_SPACE_TO_DEPTH;
+    else if (strcmp(value, "two-stage") == 0) *out = DET_STEM_TWO_STAGE;
+    else return 0;
+    return 1;
+}
+
+static int parse_research_mode(const char *value, det_research_mode *out) {
+    if (value == NULL || out == NULL) return 0;
+    if (strcmp(value, "scratch") == 0) *out = DET_RESEARCH_SCRATCH;
+    else if (strcmp(value, "adapt") == 0) *out = DET_RESEARCH_ADAPT;
+    else if (strcmp(value, "full") == 0) *out = DET_RESEARCH_FULL;
+    else return 0;
+    return 1;
+}
+
+static const char *research_mode_name(det_research_mode mode) {
+    switch (mode) {
+        case DET_RESEARCH_ADAPT: return "adapt";
+        case DET_RESEARCH_FULL: return "full";
+        default: return "scratch";
+    }
 }
 
 static double wall_now_ms(void) {
@@ -190,26 +227,79 @@ static int file_size_bytes(const char *path, size_t *out) {
 
 int main(int argc, char **argv) {
     int sample_count = 5000;
+    int max_train_samples = 0;
+    int max_total_train_samples = 0;
+    int multiscale_aux = 0;
+    int adaptive_budget = 0;
+    int residual_budget = 1;
+    int quality_aligned_assignment = 0;
+    int one_to_one_head = 0;
+    int shared_multiscale_head = 0;
+    int context_fusion = 0;
+    int raw_input_features = 0;
+    int p3_only_deployment = 0;
+    int smooth_box_decode = 0;
     int width = 160;
     int height = 160;
+    int channels = 1;
     int classes = 4;
     int feature_channels = 8;
     int arena_kib = 0;
     int max_detections = 0;
     int features_set = 0;
     int global = 0;
+    int seed = 1;
     int epochs = 1;
     int calibrate = 0;
+    int no_calibrate = 0;
+    int time_budget_ms = 0;
+    int analytic_readout = 0;
+    int feature_readout = 0;
+    int candidate_head_adapt = 0;
+    int bootstrap_enabled = 0;
+    int freeze_encoder = 0;
+    int eval_only = 0;
+    int no_evaluate = 0;
+    int reset_schedule = 0;
+    int dense_aux_budget = 2;
+    int bootstrap_ms = 5000;
+    int predecode_cache = 0;
+    int shuffle_dataset = 1;
+    double preparation_ms = 0.0;
     const char *manifest_path = NULL;
     const char *eval_manifest_path = NULL;
+    const char *init_path = NULL;
+    const char *save_model_path = NULL;
+    const char *native_graph_dir = NULL;
     det_precision precision = DET_PRECISION_F32;
     det_architecture architecture = DET_ARCH_CDET;
+    det_stem_mode stem_mode = DET_STEM_LEGACY;
+    det_research_mode research_mode = DET_RESEARCH_SCRATCH;
     float learning_rate = 0.01f;
+    int learning_rate_set = 0;
     float threshold = 0.25f;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--samples") == 0) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &sample_count)) {
                 fprintf(stderr, "samples must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--max-train-samples") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &max_train_samples)) {
+                fprintf(stderr, "max-train-samples must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--max-total-train-samples") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &max_total_train_samples)) {
+                fprintf(stderr, "max-total-train-samples must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &seed)) {
+                fprintf(stderr, "seed must be a positive integer\n");
                 return EXIT_FAILURE;
             }
         }
@@ -223,6 +313,99 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--calibrate") == 0) {
             calibrate = 1;
         }
+        else if (strcmp(argv[i], "--no-calibrate") == 0) {
+            no_calibrate = 1;
+        }
+        else if (strcmp(argv[i], "--analytic-readout") == 0) {
+            analytic_readout = 1;
+        }
+        else if (strcmp(argv[i], "--feature-readout") == 0) {
+            feature_readout = 1;
+        }
+        else if (strcmp(argv[i], "--candidate-head-adapt") == 0) {
+            candidate_head_adapt = 1;
+        }
+        else if (strcmp(argv[i], "--bootstrap") == 0) {
+            bootstrap_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--bootstrap-ms") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &bootstrap_ms)) {
+                fprintf(stderr, "bootstrap-ms must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+            bootstrap_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--freeze-encoder") == 0) {
+            freeze_encoder = 1;
+        }
+        else if (strcmp(argv[i], "--eval-only") == 0) {
+            eval_only = 1;
+        }
+        else if (strcmp(argv[i], "--no-evaluate") == 0) {
+            no_evaluate = 1;
+        }
+        else if (strcmp(argv[i], "--reset-schedule") == 0) {
+            reset_schedule = 1;
+        }
+        else if (strcmp(argv[i], "--dense-aux") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &dense_aux_budget) ||
+                dense_aux_budget > 32) {
+                fprintf(stderr, "dense-aux must be an integer from 1 to 32\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--multiscale-aux") == 0) {
+            multiscale_aux = 1;
+        }
+        else if (strcmp(argv[i], "--adaptive-budget") == 0) {
+            adaptive_budget = 1;
+        }
+        else if (strcmp(argv[i], "--residual-budget") == 0) {
+            residual_budget = 1;
+        }
+        else if (strcmp(argv[i], "--no-residual-budget") == 0) {
+            residual_budget = 0;
+        }
+        else if (strcmp(argv[i], "--quality-align") == 0) {
+            quality_aligned_assignment = 1;
+        }
+        else if (strcmp(argv[i], "--one-to-one-head") == 0) {
+            one_to_one_head = 1;
+        }
+        else if (strcmp(argv[i], "--shared-multiscale") == 0) {
+            shared_multiscale_head = 1;
+            multiscale_aux = 1;
+        }
+        else if (strcmp(argv[i], "--context-fusion") == 0) {
+            context_fusion = 1;
+            shared_multiscale_head = 1;
+            multiscale_aux = 1;
+        }
+        else if (strcmp(argv[i], "--raw-features") == 0) {
+            raw_input_features = 1;
+        }
+        else if (strcmp(argv[i], "--p3-only-deploy") == 0) {
+            p3_only_deployment = 1;
+        }
+        else if (strcmp(argv[i], "--smooth-distances") == 0) {
+            smooth_box_decode = 1;
+        }
+        else if (strcmp(argv[i], "--predecode-cache") == 0) {
+            predecode_cache = 1;
+        }
+        else if (strcmp(argv[i], "--shuffle") == 0 ||
+                 strcmp(argv[i], "--shuffle-cache") == 0) {
+            shuffle_dataset = 1;
+        }
+        else if (strcmp(argv[i], "--no-shuffle") == 0) {
+            shuffle_dataset = 0;
+        }
+        else if (strcmp(argv[i], "--time-budget-ms") == 0) {
+            if (i + 1 >= argc || !parse_positive_int(argv[++i], &time_budget_ms)) {
+                fprintf(stderr, "time-budget-ms must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
         else if (strcmp(argv[i], "--width") == 0) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &width)) {
                 fprintf(stderr, "width must be a positive integer\n");
@@ -232,6 +415,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--height") == 0) {
             if (i + 1 >= argc || !parse_positive_int(argv[++i], &height)) {
                 fprintf(stderr, "height must be a positive integer\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--channels") == 0) {
+            if (i + 1 >= argc || !parse_channels(argv[++i], &channels)) {
+                fprintf(stderr, "channels must be 1 or 3\n");
                 return EXIT_FAILURE;
             }
         }
@@ -271,6 +460,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "learning-rate must be finite and in (0,10]\n");
                 return EXIT_FAILURE;
             }
+            learning_rate_set = 1;
         }
         else if (strcmp(argv[i], "--precision") == 0) {
             if (i + 1 >= argc || !parse_precision(argv[++i], &precision)) {
@@ -281,6 +471,18 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--architecture") == 0) {
             if (i + 1 >= argc || !parse_architecture(argv[++i], &architecture)) {
                 fprintf(stderr, "architecture must be cdet or kshira\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--stem") == 0) {
+            if (i + 1 >= argc || !parse_stem_mode(argv[++i], &stem_mode)) {
+                fprintf(stderr, "stem must be legacy or space-to-depth\n");
+                return EXIT_FAILURE;
+            }
+        }
+        else if (strcmp(argv[i], "--research-mode") == 0) {
+            if (i + 1 >= argc || !parse_research_mode(argv[++i], &research_mode)) {
+                fprintf(stderr, "research-mode must be scratch, adapt, or full\n");
                 return EXIT_FAILURE;
             }
         }
@@ -304,6 +506,27 @@ int main(int argc, char **argv) {
             }
             eval_manifest_path = argv[i];
         }
+        else if (strcmp(argv[i], "--init") == 0) {
+            if (i + 1 >= argc || argv[++i][0] == '\0') {
+                fprintf(stderr, "init checkpoint must be a non-empty path\n");
+                return EXIT_FAILURE;
+            }
+            init_path = argv[i];
+        }
+        else if (strcmp(argv[i], "--save-model") == 0) {
+            if (i + 1 >= argc || argv[++i][0] == '\0') {
+                fprintf(stderr, "save-model path must be non-empty\n");
+                return EXIT_FAILURE;
+            }
+            save_model_path = argv[i];
+        }
+        else if (strcmp(argv[i], "--native-graph-dir") == 0) {
+            if (i + 1 >= argc || argv[++i][0] == '\0') {
+                fprintf(stderr, "native-graph-dir must be a non-empty path\n");
+                return EXIT_FAILURE;
+            }
+            native_graph_dir = argv[i];
+        }
         else if (strcmp(argv[i], "--global") == 0) global = 1;
         else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
@@ -314,11 +537,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "width and height must be at least 33\n");
         return EXIT_FAILURE;
     }
+    if (native_graph_dir != NULL && research_mode == DET_RESEARCH_SCRATCH) {
+        research_mode = DET_RESEARCH_ADAPT;
+    }
+    if (native_graph_dir != NULL && !learning_rate_set) {
+        /* Native score/box adapters converge more reliably with a small step
+         * than the historical 0.10 default; callers can still override it. */
+        learning_rate = 0.02f;
+    }
+    if (eval_only && init_path == NULL) {
+        fprintf(stderr, "--eval-only requires --init PATH\n");
+        return EXIT_FAILURE;
+    }
     if ((architecture == DET_ARCH_CDET && precision == DET_PRECISION_INT4) ||
         (architecture == DET_ARCH_KSHIRA && precision == DET_PRECISION_W4A8) ||
         (architecture == DET_ARCH_KSHIRA && global) ||
         (architecture == DET_ARCH_CDET && features_set) ||
-        (architecture == DET_ARCH_KSHIRA && max_detections > 64)) {
+        (architecture == DET_ARCH_KSHIRA && native_graph_dir == NULL &&
+         max_detections > 64) ||
+        (native_graph_dir != NULL && architecture != DET_ARCH_KSHIRA)) {
         fprintf(stderr, "requested architecture/precision/training mode combination is unsupported\n");
         return EXIT_FAILURE;
     }
@@ -326,15 +563,28 @@ int main(int argc, char **argv) {
     det_context *ctx = NULL;
     det_model *model = NULL;
     if (max_detections == 0) {
-        max_detections = architecture == DET_ARCH_KSHIRA ? 64 : 100;
+        max_detections = architecture == DET_ARCH_KSHIRA ?
+                         (native_graph_dir != NULL ? 100 : 64) : 100;
     }
-    det_model_spec spec = {width, height, 1, classes, max_detections, 1,
+    det_model_spec spec = {width, height, channels, classes, max_detections, seed,
                            architecture,
-                           architecture == DET_ARCH_KSHIRA ? feature_channels : 0};
+                           architecture == DET_ARCH_KSHIRA ? feature_channels : 0,
+                           architecture == DET_ARCH_KSHIRA ? stem_mode : DET_STEM_LEGACY,
+                           architecture == DET_ARCH_KSHIRA ? one_to_one_head : 0,
+                           architecture == DET_ARCH_KSHIRA ? shared_multiscale_head : 0,
+                           research_mode,
+                           architecture == DET_ARCH_KSHIRA ? context_fusion : 0,
+                           architecture == DET_ARCH_KSHIRA ? raw_input_features : 0,
+                           architecture == DET_ARCH_KSHIRA ? p3_only_deployment : 0,
+                           architecture == DET_ARCH_KSHIRA ? smooth_box_decode : 0,
+                           native_graph_dir};
     if (arena_kib == 0) arena_kib = architecture == DET_ARCH_KSHIRA ? 256 : 8192;
     size_t arena_bytes = (size_t)arena_kib << 10;
     det_status status = det_context_create(arena_bytes, &ctx);
-    if (status == DET_OK) status = det_model_build(ctx, &spec, &model);
+    if (status == DET_OK) {
+        status = init_path == NULL ? det_model_build(ctx, &spec, &model) :
+                                     det_load(ctx, init_path, &model);
+    }
     if (status != DET_OK) {
         fprintf(stderr, "bench setup failed: %d\n", status);
         det_context_destroy(ctx);
@@ -345,7 +595,15 @@ int main(int argc, char **argv) {
     det_manifest_dataset *manifest_dataset = NULL;
     det_dataset dataset;
     if (manifest_path != NULL) {
-        status = det_manifest_open(manifest_path, width, height, 1, 100, &manifest_dataset);
+        double preparation_start = wall_now_ms();
+        status = det_manifest_open(manifest_path, width, height, channels, 100, &manifest_dataset);
+        if (status == DET_OK && predecode_cache) {
+            status = det_manifest_enable_cache(manifest_dataset);
+        }
+        if (status == DET_OK && shuffle_dataset) {
+            status = det_manifest_set_shuffle(manifest_dataset, 1, seed);
+        }
+        preparation_ms = wall_now_ms() - preparation_start;
         if (status == DET_OK) status = det_manifest_dataset_view(manifest_dataset, &dataset);
         if (status != DET_OK || dataset.sample_count == 0U) {
             fprintf(stderr, "manifest setup failed: %d\n", status);
@@ -355,7 +613,8 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
     } else {
-        pixels = (float *)calloc((size_t)width * (size_t)height, sizeof(float));
+        pixels = (float *)calloc((size_t)width * (size_t)height * (size_t)channels,
+                                 sizeof(float));
         if (pixels == NULL) {
             fprintf(stderr, "pixel allocation failed\n");
             det_model_destroy(model);
@@ -366,7 +625,7 @@ int main(int argc, char **argv) {
             .pixels = pixels,
             .width = width,
             .height = height,
-            .channels = 1,
+            .channels = channels,
             .classes = classes,
             .variant = 0,
             .total = (size_t)sample_count,
@@ -377,22 +636,33 @@ int main(int argc, char **argv) {
     }
     /* For raw manifests, max_samples=0 streams the full set each epoch.
      * Synthetic still uses --samples as the in-memory workload size. */
-    int train_max_samples = manifest_path != NULL ? 0 : sample_count;
+    int train_max_samples = max_train_samples > 0 ? max_train_samples :
+                            (manifest_path != NULL ? 0 : sample_count);
     det_train_config config = {global ? DET_TRAIN_GLOBAL_BP : DET_TRAIN_LOCAL_FAST,
                                architecture == DET_ARCH_KSHIRA ? precision : DET_PRECISION_F32,
                                epochs, learning_rate,
                                architecture == DET_ARCH_KSHIRA ? 0.0f : 0.8f, threshold,
-                               train_max_samples, 1, 1};
+                               train_max_samples, seed, init_path == NULL ? 1 : 0,
+                               (double)time_budget_ms, analytic_readout,
+                               (double)bootstrap_ms, bootstrap_enabled,
+                               freeze_encoder, reset_schedule, dense_aux_budget,
+                               max_total_train_samples, multiscale_aux,
+                                adaptive_budget, residual_budget,
+                                 quality_aligned_assignment, feature_readout,
+                                 candidate_head_adapt};
     det_train_report report;
     double core_start = wall_now_ms();
-    status = det_train(model, &dataset, &config, &report);
-    if (status != DET_OK) {
-        fprintf(stderr, "training failed: %d\n", status);
-        free(pixels);
-        det_manifest_close(manifest_dataset);
-        det_model_destroy(model);
-        det_context_destroy(ctx);
-        return EXIT_FAILURE;
+    memset(&report, 0, sizeof(report));
+    if (!eval_only) {
+        status = det_train(model, &dataset, &config, &report);
+        if (status != DET_OK) {
+            fprintf(stderr, "training failed: %d\n", status);
+            free(pixels);
+            det_manifest_close(manifest_dataset);
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
     }
     status = det_model_set_precision(model, precision);
     if (status != DET_OK) {
@@ -402,6 +672,28 @@ int main(int argc, char **argv) {
         det_model_destroy(model);
         det_context_destroy(ctx);
         return EXIT_FAILURE;
+    }
+    if (save_model_path != NULL) {
+        status = det_save(model, save_model_path);
+        if (status != DET_OK) {
+            fprintf(stderr, "could not save model: %d (%s)\n", status, save_model_path);
+            free(pixels);
+            det_manifest_close(manifest_dataset);
+            det_model_destroy(model);
+            det_context_destroy(ctx);
+            return EXIT_FAILURE;
+        }
+    }
+    if (no_evaluate) {
+        printf("training_only samples=%zu updates=%zu candidate_head_updates=%zu loss=%.6f elapsed_ms=%.3f saved=%s\n",
+               report.samples_seen, report.updates, report.candidate_head_updates,
+               report.mean_loss, report.elapsed_ms,
+               save_model_path != NULL ? save_model_path : "none");
+        free(pixels);
+        det_manifest_close(manifest_dataset);
+        det_model_destroy(model);
+        det_context_destroy(ctx);
+        return EXIT_SUCCESS;
     }
     det_memory_report memory;
     status = det_model_memory(model, &memory);
@@ -480,7 +772,7 @@ int main(int argc, char **argv) {
     det_manifest_dataset *eval_manifest_dataset = NULL;
     det_dataset eval_dataset = dataset;
     if (eval_manifest_path != NULL) {
-        status = det_manifest_open(eval_manifest_path, width, height, 1, 100,
+        status = det_manifest_open(eval_manifest_path, width, height, channels, 100,
                                    &eval_manifest_dataset);
         if (status == DET_OK) {
             status = det_manifest_dataset_view(eval_manifest_dataset, &eval_dataset);
@@ -504,7 +796,7 @@ int main(int argc, char **argv) {
     /* Deploy-time objectness/score calibration: grid-search threshold on the
      * eval stream and keep the F1-maximizing operating point. */
     float calibrated_threshold = threshold;
-    if (calibrate || eval_manifest_path != NULL) {
+    if (!no_calibrate && (calibrate || eval_manifest_path != NULL)) {
         static const float candidates[] = {
             0.05f, 0.08f, 0.10f, 0.12f, 0.15f, 0.18f, 0.20f, 0.25f, 0.30f, 0.40f, 0.50f
         };
@@ -564,15 +856,39 @@ int main(int argc, char **argv) {
                                  (precision == DET_PRECISION_W4A8 ? "W4A8" :
                                   (precision == DET_PRECISION_INT4 ? "INT4" : "F32"));
     const char *architecture_name = architecture == DET_ARCH_KSHIRA ? "KSHIRA" : "CDET";
-    printf("samples=%zu epochs=%d input=%dx%d classes=%d features=%d max_detections=%d architecture=%s source=%s mode=%s precision=%s learning_rate=%.6f threshold=%.3f %s=%.3f %s=%.3f "
+    int reported_one_to_one = det_model_one_to_one_head(model);
+    int reported_shared_multiscale = det_model_shared_multiscale(model);
+    int reported_context_fusion = det_model_context_fusion(model);
+    int reported_p3_only_deployment = det_model_p3_only_deployment(model);
+    det_research_mode reported_research_mode = det_model_research_mode(model);
+    const char *stem_name = stem_mode == DET_STEM_SPACE_TO_DEPTH ?
+                             "space-to-depth" :
+                             (stem_mode == DET_STEM_TWO_STAGE ? "two-stage" : "legacy");
+
+     printf("samples=%zu epochs=%d seed=%d research_mode=%s input=%dx%dx%d classes=%d features=%d max_detections=%d architecture=%s stem=%s one_to_one_head=%d shared_multiscale=%d context_fusion=%d raw_features=%d p3_only_deploy=%d smooth_box_decode=%d quality_align=%d source=%s mode=%s precision=%s learning_rate=%.6f threshold=%.3f budget_ms=%d budget_stop=%d max_total_train_samples=%d dense_aux=%d multiscale_aux=%d adaptive_budget=%d residual_budget=%d shuffle=%d predecode_cache=%d no_calibrate=%d preparation_ms=%.3f bootstrap=%d bootstrap_ms=%d bootstrap_samples=%zu bootstrap_ms_used=%.3f analytic_readout=%d readout_applied=%d feature_readout=%d feature_readout_applied=%d feature_readout_examples=%zu candidate_head_adapt=%d candidate_head_updates=%zu %s=%.3f %s=%.3f "
            "infer_ms=%.3f io_ms=%.3f "
            "updates=%zu loss=%.6f images_per_sec=%.2f detections=%d\n",
-           report.samples_seen, epochs, width, height, classes,
+           report.samples_seen, epochs, seed, research_mode_name(reported_research_mode),
+           width, height, channels, classes,
            architecture == DET_ARCH_KSHIRA ? feature_channels : 0,
-           max_detections, architecture_name,
+           max_detections, architecture_name, stem_name, reported_one_to_one,
+           reported_shared_multiscale,
+           reported_context_fusion,
+           raw_input_features,
+           reported_p3_only_deployment,
+           smooth_box_decode,
+           quality_aligned_assignment,
            manifest_path == NULL ? "synthetic" : "manifest",
            global ? "GLOBAL_BP" : "LOCAL_FAST", precision_name,
-           learning_rate, threshold,
+           learning_rate, threshold, time_budget_ms, report.stopped_by_budget,
+           max_total_train_samples, dense_aux_budget, multiscale_aux, adaptive_budget,
+           residual_budget, shuffle_dataset, predecode_cache, no_calibrate, preparation_ms,
+           bootstrap_enabled, bootstrap_ms,
+           report.bootstrap_samples,
+            report.bootstrap_elapsed_ms, analytic_readout, report.analytic_readout_applied,
+            feature_readout, report.feature_readout_applied,
+            report.feature_readout_examples,
+            candidate_head_adapt, report.candidate_head_updates,
            manifest_path == NULL ? "train_core_ms" : "train_plus_decode_ms",
            train_core_ms, manifest_path == NULL ? "synthetic_e2e_ms" : "train_e2e_ms",
            synthetic_e2e_ms, infer_ms, io_ms,
@@ -605,6 +921,26 @@ int main(int argc, char **argv) {
            evaluation.mean_iou, evaluation.ap50, evaluation.map50_95,
            evaluation.size_ground_truths[0], evaluation.size_ground_truths[1],
            evaluation.size_ground_truths[2]);
+    printf("score_hist_positive=");
+    for (int bin = 0; bin < 10; ++bin) {
+        if (bin != 0) putchar(',');
+        printf("%zu", evaluation.score_histogram[0][bin]);
+    }
+    printf(" score_hist_negative=");
+    for (int bin = 0; bin < 10; ++bin) {
+        if (bin != 0) putchar(',');
+        printf("%zu", evaluation.score_histogram[1][bin]);
+    }
+    printf(" readout_examples=%zu readout_positives=%zu readout_negatives=%zu "
+           "readout_pre=%.6f readout_post=%.6f\n",
+           report.readout_examples, report.readout_positives, report.readout_negatives,
+           report.readout_pre_objective, report.readout_post_objective);
+    printf("class_ap50=");
+    for (int class_id = 0; class_id < classes; ++class_id) {
+        if (class_id != 0) putchar(',');
+        printf("%.4f", evaluation.class_ap50[class_id]);
+    }
+    putchar('\n');
     free(pixels);
     det_manifest_close(eval_manifest_dataset);
     det_manifest_close(manifest_dataset);

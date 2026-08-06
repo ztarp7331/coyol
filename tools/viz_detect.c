@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum { VIZ_MAX_DETECTIONS = 100 };
+
+static char custom_class_names[DET_MAX_CLASSES][64];
+static int custom_class_name_count = 0;
+
 static const char *class_name(int id, int classes) {
     static const char *cars[] = {
         "Ambulance", "Bus", "Car", "Motorcycle", "Truck"
@@ -15,6 +20,35 @@ static const char *class_name(int id, int classes) {
     static char buf[32];
     snprintf(buf, sizeof(buf), "class_%d", id);
     return buf;
+}
+
+static const char *generic_class_name(int id) {
+    static char buf[32];
+    snprintf(buf, sizeof(buf), "class_%d", id);
+    return buf;
+}
+
+static const char *output_class_name(int id, int classes, int generic_labels) {
+    if (id >= 0 && id < custom_class_name_count) return custom_class_names[id];
+    return generic_labels ? generic_class_name(id) : class_name(id, classes);
+}
+
+static int load_class_names(const char *path) {
+    FILE *file = fopen(path, "rb");
+    char line[sizeof(custom_class_names[0])];
+    if (file == NULL) return 0;
+    custom_class_name_count = 0;
+    while (custom_class_name_count < DET_MAX_CLASSES &&
+           fgets(line, sizeof(line), file) != NULL) {
+        size_t length = strlen(line);
+        while (length > 0U && (line[length - 1U] == '\n' || line[length - 1U] == '\r'))
+            line[--length] = '\0';
+        if (length == 0U) continue;
+        memcpy(custom_class_names[custom_class_name_count], line, length + 1U);
+        ++custom_class_name_count;
+    }
+    fclose(file);
+    return custom_class_name_count > 0;
 }
 
 static void usage(const char *argv0) {
@@ -32,6 +66,8 @@ static void usage(const char *argv0) {
             "  --features N            feature channels (default 8)\n"
             "  --max-det N             max detections (default 8)\n"
             "  --precision f32|int8|int4\n"
+            "  --generic-labels       use class_N labels instead of vehicle names\n"
+            "  --labels PATH          class names, one per line\n"
             "  --arena-kib N           arena size KiB (default 256)\n",
             argv0);
 }
@@ -53,6 +89,8 @@ int main(int argc, char **argv) {
     float lr = 0.004f;
     float threshold = 0.25f; /* higher default to cut FP flood in viz */
     det_precision precision = DET_PRECISION_F32;
+    int generic_labels = 0;
+    const char *labels_path = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--train-manifest") == 0 && i + 1 < argc)
@@ -85,6 +123,10 @@ int main(int argc, char **argv) {
             if (strcmp(argv[++i], "int8") == 0) precision = DET_PRECISION_INT8;
             else if (strcmp(argv[i], "int4") == 0) precision = DET_PRECISION_INT4;
             else precision = DET_PRECISION_F32;
+        } else if (strcmp(argv[i], "--generic-labels") == 0) {
+            generic_labels = 1;
+        } else if (strcmp(argv[i], "--labels") == 0 && i + 1 < argc) {
+            labels_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -96,7 +138,11 @@ int main(int argc, char **argv) {
     }
     if (epochs < 1) epochs = 1;
     if (max_det < 1) max_det = 1;
-    if (max_det > 64) max_det = 64;
+    if (max_det > VIZ_MAX_DETECTIONS) max_det = VIZ_MAX_DETECTIONS;
+    if (labels_path != NULL && !load_class_names(labels_path)) {
+        fprintf(stderr, "could not load labels: %s\n", labels_path);
+        return 1;
+    }
 
     det_context *ctx = NULL;
     det_model *model = NULL;
@@ -189,7 +235,7 @@ int main(int argc, char **argv) {
     int total_pred = 0;
     for (;;) {
         det_sample sample;
-        det_detection detections[64];
+        det_detection detections[VIZ_MAX_DETECTIONS];
         int count = 0;
         char line[8192];
         char image_rel[4096];
@@ -225,14 +271,14 @@ int main(int argc, char **argv) {
             const det_box *box = &sample.boxes[b];
             fprintf(out, "GT %.2f %.2f %.2f %.2f %d %s\n",
                     box->x1, box->y1, box->x2, box->y2, box->class_id,
-                    class_name(box->class_id, classes));
+                    output_class_name(box->class_id, classes, generic_labels));
             ++total_gt;
         }
         for (int d = 0; d < count; ++d) {
             const det_detection *det = &detections[d];
             fprintf(out, "PRED %.2f %.2f %.2f %.2f %d %s %.4f\n",
                     det->box.x1, det->box.y1, det->box.x2, det->box.y2,
-                    det->box.class_id, class_name(det->box.class_id, classes),
+                    det->box.class_id, output_class_name(det->box.class_id, classes, generic_labels),
                     det->score);
             ++total_pred;
         }

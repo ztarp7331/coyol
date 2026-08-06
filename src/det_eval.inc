@@ -79,6 +79,13 @@ static int eval_box_size_group(const det_box *box) {
     return area < 1024.0f ? 0 : (area < 9216.0f ? 1 : 2);
 }
 
+static int eval_score_histogram_bin(float score) {
+    int bin = (int)(score * 10.0f);
+    if (bin < 0) bin = 0;
+    if (bin > 9) bin = 9;
+    return bin;
+}
+
 static float compute_ranked_ap(const det_eval_prediction *predictions, size_t prediction_count,
                                const size_t *prediction_indices, size_t prediction_index_count,
                                const det_eval_ground_truth *ground_truths,
@@ -401,6 +408,17 @@ det_status det_evaluate(const det_model *model, const det_dataset *dataset,
                                         &prediction_capacity, &item)) {
                 status = DET_ERR_MEMORY;
                 break;
+            }
+            {
+                float best_hist_iou = 0.0f;
+                for (int b = 0; b < sample.box_count; ++b) {
+                    if (sample.boxes[b].class_id == detections[d].box.class_id) {
+                        float iou = det_iou(&detections[d].box, &sample.boxes[b]);
+                        if (iou > best_hist_iou) best_hist_iou = iou;
+                    }
+                }
+                report->score_histogram[best_hist_iou >= 0.5f ? 0 : 1]
+                                     [eval_score_histogram_bin(detections[d].score)] += 1U;
             }
             if (detections[d].score < score_threshold) continue;
             ++report->predictions;

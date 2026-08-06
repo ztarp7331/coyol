@@ -1,4 +1,4 @@
-/* Version-9 CDET wrapper for integrated KSHIRA model/session state. */
+/* Version-22 CDET wrapper for integrated KSHIRA model/session state. */
 typedef struct {
     char magic[4];
     uint32_t version;
@@ -10,6 +10,14 @@ typedef struct {
     uint32_t max_detections;
     int32_t seed;
     uint32_t feature_channels;
+    uint32_t stem_mode;
+    uint32_t one_to_one_head;
+    uint32_t shared_multiscale_head;
+    uint32_t research_mode;
+    uint32_t context_fusion;
+    uint32_t raw_input_features;
+    uint32_t p3_only_deployment;
+    uint32_t smooth_box_decode;
     uint32_t precision;
     uint64_t train_updates;
     uint32_t phase;
@@ -43,7 +51,7 @@ static int det_kshira_header_valid(const det_kshira_file_header *header) {
     kshira_bit_mode precision_bits;
     size_t expected_mask;
     if (header == NULL || memcmp(header->magic, "CDET", 4U) != 0 ||
-        header->version != 9U || header->architecture != (uint32_t)DET_ARCH_KSHIRA ||
+        header->version != 22U || header->architecture != (uint32_t)DET_ARCH_KSHIRA ||
         header->width < 8U || header->width > 4096U ||
         header->height < 8U || header->height > 4096U ||
         header->channels == 0U || header->channels > 4U ||
@@ -51,6 +59,16 @@ static int det_kshira_header_valid(const det_kshira_file_header *header) {
         header->max_detections == 0U ||
         header->max_detections > DET_KSHIRA_MAX_DETECTIONS ||
         header->feature_channels == 0U || header->feature_channels > 32U ||
+        (header->stem_mode != (uint32_t)DET_STEM_LEGACY &&
+         header->stem_mode != (uint32_t)DET_STEM_SPACE_TO_DEPTH &&
+         header->stem_mode != (uint32_t)DET_STEM_TWO_STAGE) ||
+        header->one_to_one_head > 1U ||
+        header->shared_multiscale_head > 1U ||
+        header->context_fusion > 1U ||
+        header->raw_input_features > 1U ||
+        header->p3_only_deployment > 1U ||
+        header->smooth_box_decode > 1U ||
+        header->research_mode > (uint32_t)DET_RESEARCH_FULL ||
         !det_kshira_precision_bits((det_precision)header->precision,
                                     &precision_bits) ||
         header->phase > (uint32_t)KSHIRA_PHASE_ODT ||
@@ -88,7 +106,7 @@ static det_status det_kshira_save_file(const det_model *model, const char *path)
         kshira_rad_bits(model->kshira.rad) != precision_bits) return DET_ERR_FORMAT;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "CDET", 4U);
-    header.version = 9U;
+    header.version = 22U;
     header.architecture = (uint32_t)DET_ARCH_KSHIRA;
     header.width = (uint32_t)model->spec.width;
     header.height = (uint32_t)model->spec.height;
@@ -97,6 +115,14 @@ static det_status det_kshira_save_file(const det_model *model, const char *path)
     header.max_detections = (uint32_t)model->spec.max_detections;
     header.seed = (int32_t)model->spec.seed;
     header.feature_channels = (uint32_t)model->spec.feature_channels;
+    header.stem_mode = (uint32_t)model->spec.stem_mode;
+    header.one_to_one_head = (uint32_t)model->spec.one_to_one_head;
+    header.shared_multiscale_head = (uint32_t)model->spec.shared_multiscale_head;
+    header.research_mode = (uint32_t)model->spec.research_mode;
+    header.context_fusion = (uint32_t)model->spec.context_fusion;
+    header.raw_input_features = (uint32_t)model->spec.raw_input_features;
+    header.p3_only_deployment = (uint32_t)model->spec.p3_only_deployment;
+    header.smooth_box_decode = (uint32_t)model->spec.smooth_box_decode;
     header.precision = (uint32_t)model->precision;
     header.train_updates = (uint64_t)model->train_updates;
     header.phase = (uint32_t)contract->phase;
@@ -189,7 +215,15 @@ static det_status det_kshira_load_file(det_context *ctx, const char *path,
     spec = (det_model_spec){(int)header.width, (int)header.height,
                             (int)header.channels, (int)header.classes,
                             (int)header.max_detections, (int)header.seed,
-                            DET_ARCH_KSHIRA, (int)header.feature_channels};
+                            DET_ARCH_KSHIRA, (int)header.feature_channels,
+                            (det_stem_mode)header.stem_mode,
+                            (int)header.one_to_one_head,
+                             (int)header.shared_multiscale_head,
+                             (det_research_mode)header.research_mode,
+                             (int)header.context_fusion,
+                             (int)header.raw_input_features,
+                             (int)header.p3_only_deployment,
+                             (int)header.smooth_box_decode, NULL};
     status = det_model_build(ctx, &spec, &model);
     if (status != DET_OK) {
         free(encoded);

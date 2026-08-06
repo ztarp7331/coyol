@@ -6,6 +6,8 @@
 #include "det_forward.inc"
 #include "det_train.inc"
 #include "det_kshira.inc"
+#include "det_kshira_bootstrap.inc"
 #include "det_kshira_io.inc"
+#include "det_native_io.inc"
 #include "det_eval.inc"
 #include "det_serialize.inc"

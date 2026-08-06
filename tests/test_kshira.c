@@ -1,10 +1,12 @@
 #include "kshira/core.h"
+#include "kshira/budget.h"
 #include "kshira/domain.h"
 #include "kshira/eval.h"
 #include "kshira/phase.h"
 #include "kshira/quant.h"
 #include "kshira/rad.h"
 #include "kshira/session.h"
+#include "kshira/solver.h"
 #include "kshira/sparse.h"
 
 #include <assert.h>
@@ -52,6 +54,19 @@ static void test_arena(void) {
         aligned = kshira_arena_alloc(&unaligned, 4U, 16U);
         assert(aligned != NULL && ((uintptr_t)aligned % 16U) == 0U);
     }
+}
+
+static void test_budget_controller(void) {
+    kshira_budget budget;
+    kshira_budget_init(&budget, 30000.0, 1000.0, 100.0);
+    assert(budget.active == 1);
+    assert(kshira_budget_stage(&budget, 100.0) == 0);
+    assert(kshira_budget_remaining(&budget, 100.0) == 29000.0);
+    kshira_budget_observe(&budget, 200.0);
+    assert(budget.samples == 1U && budget.sample_ms_ema == 100.0);
+    assert(kshira_budget_stage(&budget, 3800.0) == 1);
+    assert(kshira_budget_stage(&budget, 11000.0) == 2);
+    assert(kshira_budget_should_stop(&budget, 29100.0) == 1);
 }
 
 static void test_quant(void) {
@@ -115,6 +130,21 @@ static void test_qas_and_sparse(void) {
     }
 }
 
+static void test_solver(void) {
+    const double matrix[4] = {4.0, 1.0, 1.0, 3.0};
+    const double rhs[2] = {1.0, 2.0};
+    double solution[2] = {0.0, 0.0};
+    double workspace[4] = {0.0};
+    assert(kshira_solver_cholesky(matrix, rhs, 2U, 1U, solution, workspace) == KSHIRA_OK);
+    assert(fabs(solution[0] - 1.0 / 11.0) < 1.0e-12);
+    assert(fabs(solution[1] - 7.0 / 11.0) < 1.0e-12);
+    {
+        const double singular[4] = {1.0, 1.0, 1.0, 1.0};
+        assert(kshira_solver_cholesky(singular, rhs, 2U, 1U, solution, workspace) ==
+               KSHIRA_ERR_RANGE);
+    }
+}
+
 static void test_phases(void) {
     kshira_phase_contract contract = {KSHIRA_PHASE_PRE, KSHIRA_BITS_FLOAT,
                                       KSHIRA_UPDATE_FULL, 256U << 10, 0};
@@ -155,6 +185,9 @@ static void test_rad_top_k(void) {
     kshira_rad_spec spec = {32, 32, 1, 3, 4, 3, 17};
     kshira_image_f32 image = {pixels, 1, 32, 32};
     kshira_rad_detection detections[4];
+    size_t residual_cells[4];
+    float residual_scores[4];
+    int residual_count = 0;
     int count = 0;
     assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
     for (int y = 8; y < 16; ++y) {
@@ -167,6 +200,13 @@ static void test_rad_top_k(void) {
     assert(kshira_arena_high_water(&arena) < sizeof(memory));
     assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
     assert(count > 0 && count <= 3);
+    assert(kshira_rad_hard_negative_candidates(model, &image, residual_cells,
+                                               residual_scores, 4,
+                                               &residual_count) == KSHIRA_OK);
+    assert(residual_count == 4);
+    for (int i = 1; i < residual_count; ++i) {
+        assert(residual_scores[i - 1] >= residual_scores[i]);
+    }
     for (int i = 0; i < count; ++i) {
         assert(isfinite(detections[i].score) && isfinite(detections[i].quality));
         assert(detections[i].score >= 0.0f && detections[i].score <= 1.0f);
@@ -405,6 +445,56 @@ static void test_rad_top_k(void) {
     }
 }
 
+static void test_two_stage_stem_parity(void) {
+    unsigned char memory_a[1U << 20];
+    unsigned char memory_b[1U << 20];
+    unsigned char state[1U << 20];
+    float pixels[32 * 32] = {0.0f};
+    kshira_arena arena_a;
+    kshira_arena arena_b;
+    kshira_rad_model *model_a = NULL;
+    kshira_rad_model *model_b = NULL;
+    kshira_rad_spec spec = {32, 32, 1, 3, 8, 4, 73, 1, 2, 0, 0, 0, 0};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_detection detections_a[4];
+    kshira_rad_detection detections_b[4];
+    kshira_rad_box target = {8.0f, 8.0f, 20.0f, 20.0f, 1};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_FULL, NULL, 1.0e-4f
+    };
+    size_t state_bytes;
+    size_t written = 0U;
+    int count_a = 0;
+    int count_b = 0;
+    int train_count = 0;
+    for (int i = 0; i < 32 * 32; ++i) pixels[i] = (float)(i % 17) / 17.0f;
+    assert(kshira_arena_init(&arena_a, memory_a, sizeof(memory_a)) == KSHIRA_OK);
+    assert(kshira_arena_init(&arena_b, memory_b, sizeof(memory_b)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena_a, &spec, &model_a) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena_b, &spec, &model_b) == KSHIRA_OK);
+    assert(kshira_rad_train_step(model_a, &image, &target, &config, &(float){0.0f}) ==
+           KSHIRA_OK);
+    assert(kshira_rad_predict(model_a, &image, 0.0f, detections_a, 4, &count_a) ==
+           KSHIRA_OK);
+    state_bytes = kshira_rad_state_bytes(model_a);
+    assert(state_bytes > 0U && state_bytes < sizeof(state));
+    assert(kshira_rad_export_state(model_a, state, sizeof(state), &written) == KSHIRA_OK);
+    assert(written == state_bytes);
+    assert(kshira_rad_import_state(model_b, state, written) == KSHIRA_OK);
+    assert(kshira_rad_predict(model_b, &image, 0.0f, detections_b, 4, &count_b) ==
+           KSHIRA_OK);
+    assert(count_a == count_b);
+    for (int i = 0; i < count_a; ++i) {
+        assert(fabsf(detections_a[i].score - detections_b[i].score) < 1.0e-6f);
+    }
+    assert(kshira_rad_set_bits(model_a, KSHIRA_BITS_INT8) == KSHIRA_OK);
+    assert(kshira_rad_predict(model_a, &image, 0.0f, detections_a, 4, &train_count) ==
+           KSHIRA_OK);
+    assert(kshira_rad_set_bits(model_a, KSHIRA_BITS_INT4) == KSHIRA_OK);
+    assert(kshira_rad_predict(model_a, &image, 0.0f, detections_a, 4, &train_count) ==
+           KSHIRA_OK);
+}
+
 static void test_session_contract(void) {
     unsigned char memory[16U << 10];
     float pixels[32 * 32] = {0.0f};
@@ -460,10 +550,12 @@ static void test_multiscale_session(void) {
     unsigned char memory[64U << 10];
     float pixels[32 * 32] = {0.0f};
     kshira_session session;
-    kshira_session_spec spec = {{32, 32, 1, 3, 4, 3, 43, 1}, sizeof(memory)};
+    kshira_session_spec spec = {{32, 32, 1, 3, 4, 3, 43, 1, 0, 1}, sizeof(memory)};
     kshira_image_f32 image = {pixels, 1, 32, 32};
     kshira_rad_box target = {8.0f, 8.0f, 16.0f, 16.0f, 0};
+    kshira_rad_detection detections[8];
     float loss = 0.0f;
+    int count = 0;
     for (size_t i = 0U; i < sizeof(pixels) / sizeof(pixels[0]); ++i) pixels[i] = 0.5f;
     assert(kshira_session_init(&session, memory, sizeof(memory), &spec) == KSHIRA_OK);
     assert(kshira_rad_multiscale_ready(session.rad));
@@ -480,6 +572,9 @@ static void test_multiscale_session(void) {
     assert(kshira_session_multiscale_step(&session, &image, &target, 2,
                                           1.0e-4f, &loss) == KSHIRA_OK);
     assert(isfinite(loss) && loss >= 0.0f);
+    assert(kshira_session_predict(&session, &image, 0.0f, detections, 8, &count) ==
+           KSHIRA_OK);
+    assert(count >= 0 && count <= 8);
     session.phase.steps = SIZE_MAX;
     loss = -1.0f;
     assert(kshira_session_multiscale_step(&session, &image, &target, 1,
@@ -543,7 +638,7 @@ static void test_rad_state_roundtrip(void) {
     kshira_arena second_arena;
     kshira_rad_model *first = NULL;
     kshira_rad_model *second = NULL;
-    kshira_rad_spec spec = {32, 32, 1, 2, 4, 4, 55, 1};
+    kshira_rad_spec spec = {32, 32, 1, 2, 4, 4, 55, 1, 1, 1, 1};
     kshira_image_f32 image = {pixels, 1, 32, 32};
     kshira_rad_box target = {8.0f, 8.0f, 20.0f, 20.0f, 1};
     kshira_rad_train_config config = {
@@ -588,6 +683,47 @@ static void test_rad_state_roundtrip(void) {
         assert(memcmp(&first_detections[i], &second_detections[i],
                       sizeof(first_detections[i])) == 0);
     }
+}
+
+static void test_shared_multiscale_precision_parity(void) {
+    unsigned char memory[64U << 10];
+    float pixels[32 * 32] = {0.0f};
+    kshira_arena arena;
+    kshira_rad_model *model = NULL;
+    kshira_rad_spec spec = {32, 32, 1, 2, 4, 4, 77, 1, 0, 1, 1, 1, 0, 1};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_box target = {8.0f, 8.0f, 24.0f, 24.0f, 1};
+    kshira_rad_train_config config = {
+        KSHIRA_BITS_FLOAT, KSHIRA_UPDATE_CHANNELS, NULL, 1.0e-3f, 5
+    };
+    kshira_rad_detection detections[4];
+    int count = 0;
+    for (int y = 8; y < 24; ++y) {
+        for (int x = 8; x < 24; ++x) pixels[y * 32 + x] = 0.75f;
+    }
+    config.quality_aligned_assignment = 1;
+    assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
+    assert(kshira_rad_train_step(model, &image, &target, &config, &(float){0.0f}) ==
+           KSHIRA_OK);
+    assert(kshira_rad_train_multiscale_step(model, &image, &target, 1, &config,
+                                            &(float){0.0f}) == KSHIRA_OK);
+    assert(kshira_rad_train_multiscale_step(model, &image, &target, 2, &config,
+                                            &(float){0.0f}) == KSHIRA_OK);
+    assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
+    assert(count >= 0 && count <= 4);
+    for (int i = 0; i < count; ++i) {
+        assert(isfinite(detections[i].score) && detections[i].score >= 0.0f &&
+               detections[i].score <= 1.0f);
+    }
+    assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT8) == KSHIRA_OK);
+    assert(kshira_rad_calibrate(model, &image) == KSHIRA_OK);
+    assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
+    assert(count >= 0 && count <= 4);
+    assert(kshira_rad_set_bits(model, KSHIRA_BITS_INT4) == KSHIRA_OK);
+    assert(kshira_rad_calibrate(model, &image) == KSHIRA_OK);
+    assert(kshira_rad_predict(model, &image, 0.0f, detections, 4, &count) == KSHIRA_OK);
+    assert(count >= 0 && count <= 4);
 }
 
 static void test_background_training(void) {
@@ -646,7 +782,8 @@ static void test_hybrid_contrast_learning(void) {
     }
     assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
     assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
-    /* Quality-class head: outputs = 4 box + K qualities; head_in = C + contrast. */
+    /* Quality-class head: outputs = 4 box + K qualities; head_in = C + contrast
+     * for the legacy zero-initialized profile. */
     head_count = (size_t)(4 + spec.classes) * (size_t)(spec.feature_channels + 1);
     assert(kshira_rad_parameter_bytes(model) >= head_count * sizeof(float));
     /* Snapshot quality-row footprint (includes contrast column). */
@@ -802,20 +939,52 @@ static void test_quality_class_score_and_ranking(void) {
     }
 }
 
+static void test_analytic_readout(void) {
+    unsigned char memory[128U << 10];
+    float pixels[32 * 32] = {0.0f};
+    double gram[34 * 34] = {0.0};
+    double rhs[34 * 80] = {0.0};
+    double target_square_sum[80] = {0.0};
+    kshira_arena arena;
+    kshira_rad_model *model = NULL;
+    kshira_rad_spec spec = {32, 32, 1, 2, 4, 4, 101, 0};
+    kshira_image_f32 image = {pixels, 1, 32, 32};
+    kshira_rad_box target = {8.0f, 8.0f, 20.0f, 20.0f, 1};
+    kshira_rad_readout_stats stats;
+    kshira_rad_readout_report report;
+    assert(kshira_arena_init(&arena, memory, sizeof(memory)) == KSHIRA_OK);
+    assert(kshira_rad_build(&arena, &spec, &model) == KSHIRA_OK);
+    stats = (kshira_rad_readout_stats){
+        gram, rhs, target_square_sum, (size_t)spec.feature_channels + 2U,
+        (size_t)spec.classes, 0U, 0U, 0U
+    };
+    assert(kshira_rad_readout_accumulate(model, &image, &target, 1, &stats, 16) ==
+           KSHIRA_OK);
+    assert(stats.examples > 0U && stats.positives == 1U && stats.negatives > 0U);
+    assert(kshira_rad_readout_solve(model, &stats, 1.0e-2, &report) == KSHIRA_OK);
+    assert(report.applied == 1 && isfinite(report.pre_objective) &&
+           isfinite(report.post_objective) && report.post_objective <= report.pre_objective);
+}
+
 int main(void) {
     test_arena();
+    test_budget_controller();
     test_quant();
     test_qas_and_sparse();
+    test_solver();
     test_phases();
     test_rad_top_k();
+    test_two_stage_stem_parity();
     test_session_contract();
     test_multiscale_session();
     test_domain_curriculum();
     test_proxy_metrics();
     test_rad_state_roundtrip();
+    test_shared_multiscale_precision_parity();
     test_background_training();
     test_hybrid_contrast_learning();
     test_quality_class_score_and_ranking();
+    test_analytic_readout();
     puts("all kshira tests passed");
     return 0;
 }

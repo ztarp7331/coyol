@@ -204,6 +204,17 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
         (spec->architecture != DET_ARCH_CDET &&
          spec->architecture != DET_ARCH_KSHIRA) || spec->feature_channels < 0 ||
         spec->feature_channels > 32 ||
+        (spec->stem_mode != DET_STEM_LEGACY &&
+         spec->stem_mode != DET_STEM_SPACE_TO_DEPTH &&
+         spec->stem_mode != DET_STEM_TWO_STAGE) ||
+        (spec->one_to_one_head != 0 && spec->one_to_one_head != 1) ||
+        (spec->shared_multiscale_head != 0 && spec->shared_multiscale_head != 1) ||
+        (spec->context_fusion != 0 && spec->context_fusion != 1) ||
+        (spec->raw_input_features != 0 && spec->raw_input_features != 1) ||
+        (spec->p3_only_deployment != 0 && spec->p3_only_deployment != 1) ||
+        (spec->smooth_box_decode != 0 && spec->smooth_box_decode != 1) ||
+        spec->research_mode < DET_RESEARCH_SCRATCH ||
+        spec->research_mode > DET_RESEARCH_FULL ||
         (spec->architecture == DET_ARCH_CDET && spec->feature_channels != 0)) {
         return DET_ERR_ARGUMENT;
     }
@@ -218,6 +229,14 @@ det_status det_model_build(det_context *ctx, const det_model_spec *spec,
         if (status != DET_OK) {
             free(model);
             return status;
+        }
+        if (spec->native_graph_dir != NULL) {
+            status = det_native_graph_attach(model, spec->native_graph_dir);
+            if (status != DET_OK) {
+                det_kshira_release(model);
+                free(model);
+                return status;
+            }
         }
         *out = model;
         return DET_OK;
@@ -443,12 +462,53 @@ det_status det_model_set_precision(det_model *model, det_precision precision) {
     return DET_OK;
 }
 
+det_status det_model_set_native_graph(det_model *model, const char *directory) {
+    if (model == NULL || model->architecture != DET_ARCH_KSHIRA || directory == NULL) {
+        return DET_ERR_ARGUMENT;
+    }
+    det_native_graph_release(model);
+    return det_native_graph_attach(model, directory);
+}
+
+det_status det_model_native_graph_calibration(const det_model *model,
+                                             float *gain, float *bias) {
+    if (model == NULL || gain == NULL || bias == NULL ||
+        !model->native_graph_enabled) return DET_ERR_ARGUMENT;
+    *gain = model->native_score_gain;
+    *bias = model->native_score_bias;
+    return DET_OK;
+}
+
 det_precision det_model_precision(const det_model *model) {
     return model == NULL ? DET_PRECISION_F32 : model->precision;
 }
 
 det_architecture det_model_architecture(const det_model *model) {
     return model == NULL ? DET_ARCH_CDET : model->architecture;
+}
+
+int det_model_one_to_one_head(const det_model *model) {
+    return model != NULL && model->architecture == DET_ARCH_KSHIRA ?
+           model->spec.one_to_one_head : 0;
+}
+
+int det_model_shared_multiscale(const det_model *model) {
+    return model != NULL && model->architecture == DET_ARCH_KSHIRA ?
+           model->spec.shared_multiscale_head : 0;
+}
+
+int det_model_context_fusion(const det_model *model) {
+    return model != NULL && model->architecture == DET_ARCH_KSHIRA ?
+           model->spec.context_fusion : 0;
+}
+
+int det_model_p3_only_deployment(const det_model *model) {
+    return model != NULL && model->architecture == DET_ARCH_KSHIRA ?
+           model->spec.p3_only_deployment : 0;
+}
+
+det_research_mode det_model_research_mode(const det_model *model) {
+    return model == NULL ? DET_RESEARCH_SCRATCH : model->spec.research_mode;
 }
 
 static int add_memory_bytes(size_t *total, size_t elements,
@@ -509,7 +569,28 @@ det_status det_model_memory(const det_model *model, det_memory_report *report) {
             kshira_rad_activation_bytes(model->kshira.rad);
         report->arena_high_water_bytes =
             kshira_session_arena_high_water(&model->kshira);
+        if (model->native_graph_arena_high_water > report->arena_high_water_bytes) {
+            report->arena_high_water_bytes = model->native_graph_arena_high_water;
+        }
         report->arena_capacity_bytes = model->kshira_memory_bytes;
+        if (model->native_graph_enabled) {
+            if (model->native_graph_arena_bytes > report->arena_capacity_bytes) {
+                report->arena_capacity_bytes = model->native_graph_arena_bytes;
+            }
+            if (!checked_add_size(report->parameter_bytes,
+                                  model->native_graph_weights.weight_blob_size +
+                                  model->native_graph_weights.bias_count * sizeof(int32_t) +
+                                  model->native_graph_weights.mult_count * sizeof(int32_t) +
+                                  model->native_graph_weights.shift_count * sizeof(uint8_t),
+                                  &report->parameter_bytes) ||
+                !checked_add_size(report->activation_workspace_bytes,
+                                  model->native_graph_arena_bytes,
+                                  &report->activation_workspace_bytes) ||
+                !checked_add_size(report->activation_workspace_bytes,
+                                  (size_t)model->native_graph_weights.input_channels *
+                                  (size_t)model->spec.width * (size_t)model->spec.height,
+                                  &report->activation_workspace_bytes)) return DET_ERR_MEMORY;
+        }
         return DET_OK;
     }
     for (int i = 0; i < DET_GRAPH_STAGES; ++i) {
@@ -538,6 +619,7 @@ void det_model_destroy(det_model *model) {
     if (model == NULL) return;
     if (model->architecture == DET_ARCH_KSHIRA) {
         det_kshira_release(model);
+        det_native_graph_release(model);
         free(model);
         return;
     }

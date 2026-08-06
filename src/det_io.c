@@ -26,7 +26,36 @@ struct det_manifest_dataset {
     unsigned char *raw;
     size_t raw_capacity;
     det_status status;
+    float *cache_pixels;
+    det_box *cache_boxes;
+    int *cache_box_counts;
+    int cache_enabled;
+    long *line_offsets;
+    size_t *sample_order;
+    size_t sample_cursor;
+    size_t sample_epoch;
+    uint32_t shuffle_seed;
+    int shuffle_enabled;
 };
+
+static uint32_t cache_random_next(uint32_t *state) {
+    *state = *state * 1664525U + 1013904223U;
+    return *state;
+}
+
+static void manifest_shuffle_order(det_manifest_dataset *dataset) {
+    uint32_t state;
+    if (dataset == NULL || dataset->sample_order == NULL || dataset->sample_count == 0U) return;
+    state = dataset->shuffle_seed ^ ((uint32_t)dataset->sample_epoch * 0x9e3779b9U);
+    for (size_t i = 0U; i < dataset->sample_count; ++i) dataset->sample_order[i] = i;
+    for (size_t i = dataset->sample_count - 1U; i > 0U; --i) {
+        size_t swap_index = (size_t)(cache_random_next(&state) % (uint32_t)(i + 1U));
+        size_t temporary = dataset->sample_order[i];
+        dataset->sample_order[i] = dataset->sample_order[swap_index];
+        dataset->sample_order[swap_index] = temporary;
+    }
+    if (dataset->sample_epoch < SIZE_MAX) ++dataset->sample_epoch;
+}
 
 static char *skip_space(char *text) {
     while (text != NULL && *text != '\0' && isspace((unsigned char)*text)) ++text;
@@ -100,6 +129,7 @@ static int parse_nonnegative_token(const char *token, int *out) {
 
 static int parse_box_token(const char *token, det_box *box) {
     float values[4];
+    float target_weight = 0.0f;
     char *cursor = (char *)token;
     char *end = NULL;
     long class_value;
@@ -112,14 +142,25 @@ static int parse_box_token(const char *token, det_box *box) {
     }
     errno = 0;
     class_value = strtol(cursor, &end, 10);
-    if (errno != 0 || end == cursor || *end != '\0' || class_value < 0L ||
+    if (errno != 0 || end == cursor || (end[0] != '\0' && end[0] != ',') ||
+        class_value < 0L ||
         class_value > (long)INT_MAX || !isfinite(values[0]) || !isfinite(values[1]) ||
         !isfinite(values[2]) || !isfinite(values[3]) ||
         values[0] < 0.0f || values[1] < 0.0f || values[2] <= values[0] ||
         values[3] <= values[1]) {
         return 0;
     }
-    *box = (det_box){values[0], values[1], values[2], values[3], (int)class_value};
+    if (*end == ',') {
+        char *weight_end = NULL;
+        errno = 0;
+        target_weight = strtof(end + 1, &weight_end);
+        if (errno != 0 || weight_end == end + 1 || *weight_end != '\0' ||
+            !isfinite(target_weight) || target_weight <= 0.0f || target_weight > 1.0f) {
+            return 0;
+        }
+    }
+    *box = (det_box){values[0], values[1], values[2], values[3],
+                     (int)class_value, target_weight};
     return 1;
 }
 
@@ -204,21 +245,65 @@ static det_status decode_pnm(det_manifest_dataset *dataset, const char *path,
     }
     if (fclose(file) != 0) return DET_ERR_IO;
     for (int y = 0; y < dataset->height; ++y) {
-        size_t source_y = (size_t)y * (size_t)height / (size_t)dataset->height;
+        float source_y = ((float)y + 0.5f) * (float)height /
+                         (float)dataset->height - 0.5f;
+        int y0 = (int)floorf(source_y);
+        float y_weight;
+        if (y0 < 0) y0 = 0;
+        if (y0 >= height) y0 = height - 1;
+        y_weight = source_y - (float)y0;
+        if (y_weight < 0.0f) y_weight = 0.0f;
+        if (y_weight > 1.0f) y_weight = 1.0f;
+        int y1 = y0 + 1 < height ? y0 + 1 : y0;
         for (int x = 0; x < dataset->width; ++x) {
-            size_t source_x = (size_t)x * (size_t)width / (size_t)dataset->width;
-            size_t source_index = (source_y * (size_t)width + source_x) *
-                                   (size_t)source_channels;
+            float source_x = ((float)x + 0.5f) * (float)width /
+                             (float)dataset->width - 0.5f;
+            int x0 = (int)floorf(source_x);
+            float x_weight;
+            if (x0 < 0) x0 = 0;
+            if (x0 >= width) x0 = width - 1;
+            x_weight = source_x - (float)x0;
+            if (x_weight < 0.0f) x_weight = 0.0f;
+            if (x_weight > 1.0f) x_weight = 1.0f;
+            int x1 = x0 + 1 < width ? x0 + 1 : x0;
             for (int c = 0; c < dataset->channels; ++c) {
-                float value;
+                int source_channel = source_channels == 1 ? 0 : c;
+                size_t index00 = ((size_t)y0 * (size_t)width + (size_t)x0) *
+                                 (size_t)source_channels + (size_t)source_channel;
+                size_t index01 = ((size_t)y0 * (size_t)width + (size_t)x1) *
+                                 (size_t)source_channels + (size_t)source_channel;
+                size_t index10 = ((size_t)y1 * (size_t)width + (size_t)x0) *
+                                 (size_t)source_channels + (size_t)source_channel;
+                size_t index11 = ((size_t)y1 * (size_t)width + (size_t)x1) *
+                                 (size_t)source_channels + (size_t)source_channel;
+                float top = (float)dataset->raw[index00] * (1.0f - x_weight) +
+                            (float)dataset->raw[index01] * x_weight;
+                float bottom = (float)dataset->raw[index10] * (1.0f - x_weight) +
+                               (float)dataset->raw[index11] * x_weight;
+                float value = (top * (1.0f - y_weight) + bottom * y_weight) /
+                              (float)max_value;
                 if (dataset->channels == 1 && source_channels == 3) {
-                    value = (0.299f * (float)dataset->raw[source_index] +
-                             0.587f * (float)dataset->raw[source_index + 1U] +
-                             0.114f * (float)dataset->raw[source_index + 2U]) /
-                            (float)max_value;
-                } else {
-                    int source_channel = source_channels == 1 ? 0 : c;
-                    value = (float)dataset->raw[source_index + (size_t)source_channel] /
+                    float red_top = (float)dataset->raw[index00 - (size_t)source_channel] *
+                                    (1.0f - x_weight) +
+                                    (float)dataset->raw[index01 - (size_t)source_channel] * x_weight;
+                    float red_bottom = (float)dataset->raw[index10 - (size_t)source_channel] *
+                                       (1.0f - x_weight) +
+                                       (float)dataset->raw[index11 - (size_t)source_channel] * x_weight;
+                    float green_top = (float)dataset->raw[index00 + 1U] *
+                                      (1.0f - x_weight) +
+                                      (float)dataset->raw[index01 + 1U] * x_weight;
+                    float green_bottom = (float)dataset->raw[index10 + 1U] *
+                                         (1.0f - x_weight) +
+                                         (float)dataset->raw[index11 + 1U] * x_weight;
+                    float blue_top = (float)dataset->raw[index00 + 2U] *
+                                     (1.0f - x_weight) +
+                                     (float)dataset->raw[index01 + 2U] * x_weight;
+                    float blue_bottom = (float)dataset->raw[index10 + 2U] *
+                                        (1.0f - x_weight) +
+                                        (float)dataset->raw[index11 + 2U] * x_weight;
+                    value = (0.299f * (red_top * (1.0f - y_weight) + red_bottom * y_weight) +
+                             0.587f * (green_top * (1.0f - y_weight) + green_bottom * y_weight) +
+                             0.114f * (blue_top * (1.0f - y_weight) + blue_bottom * y_weight)) /
                             (float)max_value;
                 }
                 dataset->pixels[((size_t)c * (size_t)dataset->height + (size_t)y) *
@@ -263,17 +348,45 @@ static int manifest_next(void *user, det_sample *sample) {
     char line[DET_MANIFEST_LINE];
     char relative_path[DET_MANIFEST_PATH];
     char image_path[DET_MANIFEST_PATH];
-    if (dataset == NULL || sample == NULL || dataset->manifest == NULL) return -1;
-    while (fgets(line, sizeof(line), dataset->manifest) != NULL) {
-        ++dataset->line_number;
-        if (strchr(line, '\n') == NULL && !feof(dataset->manifest)) {
-            int ch;
-            do ch = fgetc(dataset->manifest); while (ch != EOF && ch != '\n');
+    size_t sample_index;
+    if (dataset == NULL || sample == NULL || dataset->manifest == NULL ||
+        dataset->sample_order == NULL || dataset->line_offsets == NULL) return -1;
+    if (dataset->sample_cursor >= dataset->sample_count) return 0;
+    sample_index = dataset->sample_order[dataset->sample_cursor];
+    if (dataset->cache_enabled) {
+        size_t plane = (size_t)dataset->channels * (size_t)dataset->height *
+                       (size_t)dataset->width;
+        memcpy(dataset->pixels, dataset->cache_pixels + sample_index * plane,
+               plane * sizeof(*dataset->pixels));
+        if (dataset->cache_box_counts[sample_index] > 0) {
+            memcpy(dataset->boxes,
+                   dataset->cache_boxes + sample_index * (size_t)dataset->max_boxes,
+                   (size_t)dataset->cache_box_counts[sample_index] *
+                       sizeof(*dataset->boxes));
+        }
+        sample->image = (det_image){dataset->pixels, dataset->channels,
+                                    dataset->height, dataset->width};
+        sample->boxes = dataset->boxes;
+        sample->box_count = dataset->cache_box_counts[sample_index];
+        ++dataset->sample_cursor;
+        return 1;
+    }
+    if (fseek(dataset->manifest, dataset->line_offsets[sample_index], SEEK_SET) != 0 ||
+        fgets(line, sizeof(line), dataset->manifest) == NULL) {
+        dataset->status = DET_ERR_IO;
+        return -1;
+    }
+    dataset->line_number = sample_index + 1U;
+    if (strchr(line, '\n') == NULL && !feof(dataset->manifest)) {
+        dataset->status = DET_ERR_FORMAT;
+        return -1;
+    }
+    {
+        int parsed = parse_manifest_line(dataset, line, relative_path, sizeof(relative_path));
+        if (parsed == 0) {
             dataset->status = DET_ERR_FORMAT;
             return -1;
         }
-        int parsed = parse_manifest_line(dataset, line, relative_path, sizeof(relative_path));
-        if (parsed == 0) continue;
         if (parsed < 0 || !make_image_path(dataset, relative_path, image_path)) {
             dataset->status = DET_ERR_FORMAT;
             return -1;
@@ -299,23 +412,32 @@ static int manifest_next(void *user, det_sample *sample) {
             dataset->boxes[i].x2 *= x_scale;
             dataset->boxes[i].y1 *= y_scale;
             dataset->boxes[i].y2 *= y_scale;
+            dataset->boxes[i].x1 = fmaxf(0.0f, fminf((float)dataset->width,
+                                                     dataset->boxes[i].x1));
+            dataset->boxes[i].x2 = fmaxf(0.0f, fminf((float)dataset->width,
+                                                     dataset->boxes[i].x2));
+            dataset->boxes[i].y1 = fmaxf(0.0f, fminf((float)dataset->height,
+                                                     dataset->boxes[i].y1));
+            dataset->boxes[i].y2 = fmaxf(0.0f, fminf((float)dataset->height,
+                                                     dataset->boxes[i].y2));
         }
         sample->image = (det_image){dataset->pixels, dataset->channels,
                                     dataset->height, dataset->width};
         sample->boxes = dataset->boxes;
         sample->box_count = parsed - 1;
+        ++dataset->sample_cursor;
         return 1;
     }
-    if (ferror(dataset->manifest)) {
-        dataset->status = DET_ERR_IO;
-        return -1;
-    }
-    return 0;
 }
 
 static void manifest_reset(void *user) {
     det_manifest_dataset *dataset = (det_manifest_dataset *)user;
     if (dataset == NULL || dataset->manifest == NULL) return;
+    dataset->sample_cursor = 0U;
+    if (dataset->shuffle_enabled) manifest_shuffle_order(dataset);
+    else if (dataset->sample_order != NULL) {
+        for (size_t i = 0U; i < dataset->sample_count; ++i) dataset->sample_order[i] = i;
+    }
     rewind(dataset->manifest);
     clearerr(dataset->manifest);
     dataset->line_number = 0U;
@@ -391,6 +513,60 @@ det_status det_manifest_open(const char *manifest_path, int width, int height,
         det_manifest_close(dataset);
         return DET_ERR_IO;
     }
+    if (dataset->sample_count == 0U ||
+        dataset->sample_count > SIZE_MAX / sizeof(*dataset->line_offsets) ||
+        dataset->sample_count > SIZE_MAX / sizeof(*dataset->sample_order)) {
+        det_status failure = dataset->sample_count == 0U ? DET_ERR_ARGUMENT : DET_ERR_MEMORY;
+        det_manifest_close(dataset);
+        return failure;
+    }
+    dataset->line_offsets = (long *)malloc(dataset->sample_count *
+                                           sizeof(*dataset->line_offsets));
+    dataset->sample_order = (size_t *)malloc(dataset->sample_count *
+                                             sizeof(*dataset->sample_order));
+    if (dataset->line_offsets == NULL || dataset->sample_order == NULL) {
+        det_manifest_close(dataset);
+        return DET_ERR_MEMORY;
+    }
+    rewind(dataset->manifest);
+    clearerr(dataset->manifest);
+    {
+        size_t index = 0U;
+        for (;;) {
+            long offset = ftell(dataset->manifest);
+            int has_newline;
+            char *text;
+            if (offset < 0L) {
+                det_manifest_close(dataset);
+                return DET_ERR_IO;
+            }
+            if (fgets(line, sizeof(line), dataset->manifest) == NULL) break;
+            has_newline = strchr(line, '\n') != NULL;
+            text = trim_line(line);
+            if (!has_newline && !feof(dataset->manifest)) {
+                det_manifest_close(dataset);
+                return DET_ERR_FORMAT;
+            }
+            if (text != NULL && *text != '\0' && *text != '#') {
+                if (index >= dataset->sample_count) {
+                    det_manifest_close(dataset);
+                    return DET_ERR_FORMAT;
+                }
+                dataset->line_offsets[index] = offset;
+                dataset->sample_order[index] = index;
+                ++index;
+            }
+        }
+        if (ferror(dataset->manifest) || index != dataset->sample_count) {
+            det_status failure = ferror(dataset->manifest) ? DET_ERR_IO : DET_ERR_FORMAT;
+            det_manifest_close(dataset);
+            return failure;
+        }
+    }
+    dataset->sample_cursor = 0U;
+    dataset->sample_epoch = 0U;
+    dataset->shuffle_seed = 1U;
+    dataset->shuffle_enabled = 0;
     rewind(dataset->manifest);
     clearerr(dataset->manifest);
     dataset->status = DET_OK;
@@ -405,6 +581,92 @@ det_status det_manifest_dataset_view(det_manifest_dataset *dataset, det_dataset 
     return DET_OK;
 }
 
+det_status det_manifest_enable_cache(det_manifest_dataset *dataset) {
+    size_t plane;
+    size_t pixel_count;
+    float *cache_pixels;
+    det_box *cache_boxes;
+    int *cache_box_counts;
+    int shuffle_enabled;
+    uint32_t shuffle_seed;
+    size_t sample_epoch;
+    if (dataset == NULL || dataset->manifest == NULL) return DET_ERR_ARGUMENT;
+    if (dataset->cache_enabled) return DET_OK;
+    if ((size_t)dataset->channels > SIZE_MAX / (size_t)dataset->height ||
+        (size_t)dataset->channels * (size_t)dataset->height >
+            SIZE_MAX / (size_t)dataset->width) return DET_ERR_SHAPE;
+    plane = (size_t)dataset->channels * (size_t)dataset->height *
+            (size_t)dataset->width;
+    if (dataset->sample_count > SIZE_MAX / plane ||
+        dataset->sample_count * plane > SIZE_MAX / sizeof(*cache_pixels) ||
+        dataset->sample_count > SIZE_MAX / (size_t)dataset->max_boxes ||
+        dataset->sample_count * (size_t)dataset->max_boxes >
+            SIZE_MAX / sizeof(*cache_boxes)) return DET_ERR_MEMORY;
+    pixel_count = dataset->sample_count * plane;
+    cache_pixels = (float *)malloc(pixel_count * sizeof(*cache_pixels));
+    cache_boxes = (det_box *)malloc(dataset->sample_count *
+                                    (size_t)dataset->max_boxes * sizeof(*cache_boxes));
+    cache_box_counts = (int *)malloc(dataset->sample_count * sizeof(*cache_box_counts));
+    if (cache_pixels == NULL || cache_boxes == NULL || cache_box_counts == NULL) {
+        free(cache_pixels);
+        free(cache_boxes);
+        free(cache_box_counts);
+        return DET_ERR_MEMORY;
+    }
+    dataset->cache_enabled = 0;
+    shuffle_enabled = dataset->shuffle_enabled;
+    shuffle_seed = dataset->shuffle_seed;
+    sample_epoch = dataset->sample_epoch;
+    dataset->shuffle_enabled = 0;
+    manifest_reset(dataset);
+    for (size_t index = 0U; index < dataset->sample_count; ++index) {
+        det_sample sample;
+        int next_status = manifest_next(dataset, &sample);
+        if (next_status != 1 || sample.box_count < 0 ||
+            sample.box_count > dataset->max_boxes) {
+            free(cache_pixels);
+            free(cache_boxes);
+            free(cache_box_counts);
+            dataset->status = next_status < 0 ? dataset->status : DET_ERR_FORMAT;
+            dataset->shuffle_enabled = shuffle_enabled;
+            dataset->shuffle_seed = shuffle_seed;
+            dataset->sample_epoch = sample_epoch;
+            manifest_reset(dataset);
+            return dataset->status;
+        }
+        memcpy(cache_pixels + index * plane, sample.image.data,
+               plane * sizeof(*cache_pixels));
+        if (sample.box_count > 0) {
+            memcpy(cache_boxes + index * (size_t)dataset->max_boxes, sample.boxes,
+                   (size_t)sample.box_count * sizeof(*cache_boxes));
+        }
+        cache_box_counts[index] = sample.box_count;
+    }
+    dataset->cache_pixels = cache_pixels;
+    dataset->cache_boxes = cache_boxes;
+    dataset->cache_box_counts = cache_box_counts;
+    dataset->cache_enabled = 1;
+    dataset->shuffle_enabled = shuffle_enabled;
+    dataset->shuffle_seed = shuffle_seed;
+    dataset->sample_epoch = sample_epoch;
+    manifest_reset(dataset);
+    return DET_OK;
+}
+
+det_status det_manifest_set_shuffle(det_manifest_dataset *dataset, int enabled,
+                                    int seed) {
+    if (dataset == NULL || dataset->sample_order == NULL ||
+        (enabled != 0 && enabled != 1)) {
+        return DET_ERR_ARGUMENT;
+    }
+    if (enabled && seed <= 0) return DET_ERR_ARGUMENT;
+    dataset->shuffle_enabled = enabled;
+    dataset->shuffle_seed = (uint32_t)(enabled ? seed : 1);
+    dataset->sample_epoch = 0U;
+    manifest_reset(dataset);
+    return DET_OK;
+}
+
 det_status det_manifest_status(const det_manifest_dataset *dataset) {
     return dataset == NULL ? DET_ERR_ARGUMENT : dataset->status;
 }
@@ -415,5 +677,10 @@ void det_manifest_close(det_manifest_dataset *dataset) {
     free(dataset->pixels);
     free(dataset->boxes);
     free(dataset->raw);
+    free(dataset->cache_pixels);
+    free(dataset->cache_boxes);
+    free(dataset->cache_box_counts);
+    free(dataset->line_offsets);
+    free(dataset->sample_order);
     free(dataset);
 }

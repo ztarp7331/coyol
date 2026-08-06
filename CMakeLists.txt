@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(c_oloy C)
 
+# The detector is a performance-sensitive CPU runtime.  Keep debug builds
+# explicit; a plain configure should measure the optimized kernels.
+if(NOT CMAKE_BUILD_TYPE AND NOT MSVC)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -11,9 +17,12 @@ add_library(kshira STATIC
   src/kshira_core.c
   src/kshira_quant.c
   src/kshira_sparse.c
+  src/kshira_solver.c
+  src/kshira_budget.c
   src/kshira_phase.c
-  src/kshira_rad.c
-  src/kshira_rad_state.c
+    src/kshira_rad.c
+    src/kshira_pyramid.c
+    src/kshira_rad_state.c
   src/kshira_session.c
   src/kshira_domain.c
   src/kshira_eval.c
@@ -29,9 +38,34 @@ if(DET_ENABLE_ASAN AND NOT MSVC)
   target_link_options(kshira PRIVATE -fsanitize=address,undefined)
 endif()
 
+add_library(native_graph STATIC
+  src/native_graph_ops.c
+  src/native_graph_model.c
+  src/native_graph_model_f32.c
+  src/native_graph_loader.c
+  src/native_graph_post.c
+)
+target_include_directories(native_graph PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(native_graph PUBLIC c_std_99)
+if(MSVC)
+  target_compile_options(native_graph PRIVATE /W4)
+else()
+  target_compile_options(native_graph PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+add_library(native_multiscale STATIC src/native_multiscale.c src/native_multiscale_f32.c)
+target_include_directories(native_multiscale PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(native_multiscale PUBLIC native_graph)
+target_compile_features(native_multiscale PUBLIC c_std_99)
+if(MSVC)
+  target_compile_options(native_multiscale PRIVATE /W4)
+else()
+  target_compile_options(native_multiscale PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
 add_library(det STATIC src/det.c src/det_io.c)
 target_include_directories(det PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(det PUBLIC kshira)
+target_link_libraries(det PUBLIC kshira native_graph native_multiscale)
 if(MSVC)
   target_compile_options(det PRIVATE /W4)
 else()
@@ -82,6 +116,41 @@ if(MSVC)
   target_link_libraries(det_bench PRIVATE det)
 else()
   target_link_libraries(det_bench PRIVATE det m)
+endif()
+
+add_executable(native_graph_detect tools/native_graph_detect.c)
+if(MSVC)
+  target_link_libraries(native_graph_detect PRIVATE native_graph)
+else()
+  target_link_libraries(native_graph_detect PRIVATE native_graph m)
+endif()
+
+add_executable(native_multiscale_detect tools/native_multiscale_detect.c)
+if(MSVC)
+  target_link_libraries(native_multiscale_detect PRIVATE native_multiscale native_graph)
+else()
+  target_link_libraries(native_multiscale_detect PRIVATE native_multiscale native_graph m)
+endif()
+
+add_executable(native_lifecycle_smoke tools/native_lifecycle_smoke.c)
+if(MSVC)
+  target_link_libraries(native_lifecycle_smoke PRIVATE det)
+else()
+  target_link_libraries(native_lifecycle_smoke PRIVATE det m)
+endif()
+
+add_executable(native_adapter_bench tools/native_adapter_bench.c)
+if(MSVC)
+  target_link_libraries(native_adapter_bench PRIVATE det)
+else()
+  target_link_libraries(native_adapter_bench PRIVATE det m)
+endif()
+
+add_executable(native_teacher_manifest tools/native_teacher_manifest.c)
+if(MSVC)
+  target_link_libraries(native_teacher_manifest PRIVATE det)
+else()
+  target_link_libraries(native_teacher_manifest PRIVATE det m)
 endif()
 
 add_executable(viz_detect tools/viz_detect.c)

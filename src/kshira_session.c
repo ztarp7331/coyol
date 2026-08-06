@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum { KSHIRA_DEFAULT_DENSE_AUX_BUDGET = 2, KSHIRA_MAX_DENSE_AUX_BUDGET = 32 };
+
 static void session_rollback(kshira_session *session, size_t offset, size_t high_water) {
     session->arena.offset = offset;
     session->arena.high_water = high_water;
@@ -57,6 +59,8 @@ kshira_status kshira_session_init(kshira_session *session, void *memory,
         session_rollback(session, start_offset, start_high_water);
         return status;
     }
+    session->dense_aux_budget = KSHIRA_DEFAULT_DENSE_AUX_BUDGET;
+    session->quality_aligned_assignment = 0;
     return KSHIRA_OK;
 }
 
@@ -91,6 +95,21 @@ kshira_status kshira_session_set_channel(kshira_session *session, size_t channel
     return kshira_sparse_mask_set(&session->channel_mask, channel, enabled);
 }
 
+kshira_status kshira_session_set_dense_aux_budget(kshira_session *session, int budget) {
+    if (session == NULL || budget < 1 || budget > KSHIRA_MAX_DENSE_AUX_BUDGET) {
+        return KSHIRA_ERR_ARGUMENT;
+    }
+    session->dense_aux_budget = budget;
+    return KSHIRA_OK;
+}
+
+kshira_status kshira_session_set_quality_aligned_assignment(kshira_session *session,
+                                                             int enabled) {
+    if (session == NULL || (enabled != 0 && enabled != 1)) return KSHIRA_ERR_ARGUMENT;
+    session->quality_aligned_assignment = enabled;
+    return KSHIRA_OK;
+}
+
 kshira_status kshira_session_step(kshira_session *session, const kshira_image_f32 *image,
                                    const kshira_rad_box *target, float learning_rate,
                                    float *loss) {
@@ -104,6 +123,8 @@ kshira_status kshira_session_step(kshira_session *session, const kshira_image_f3
     config.update_mode = contract.update_mode;
     config.channel_mask = &session->channel_mask;
     config.learning_rate = learning_rate;
+    config.dense_aux_budget = session->dense_aux_budget;
+    config.quality_aligned_assignment = session->quality_aligned_assignment;
     {
         kshira_status status = kshira_rad_train_step(session->rad, image, target, &config, loss);
         if (status != KSHIRA_OK) return status;
@@ -134,6 +155,8 @@ kshira_status kshira_session_background_step(kshira_session *session,
     config.update_mode = contract.update_mode;
     config.channel_mask = &session->channel_mask;
     config.learning_rate = learning_rate;
+    config.dense_aux_budget = session->dense_aux_budget;
+    config.quality_aligned_assignment = session->quality_aligned_assignment;
     {
         kshira_status status = kshira_rad_train_background_step(
             session->rad, image, cell_y, cell_x, &config, loss);
@@ -158,6 +181,8 @@ kshira_status kshira_session_multiscale_step(kshira_session *session,
     config.update_mode = contract.update_mode;
     config.channel_mask = &session->channel_mask;
     config.learning_rate = learning_rate;
+    config.dense_aux_budget = session->dense_aux_budget;
+    config.quality_aligned_assignment = session->quality_aligned_assignment;
     {
         kshira_status status = kshira_rad_train_multiscale_step(
             session->rad, image, target, level, &config, loss);

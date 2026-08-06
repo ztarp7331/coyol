@@ -20,6 +20,8 @@ typedef struct {
     kshira_phase_driver phase;
     kshira_rad_model *rad;
     kshira_sparse_mask channel_mask;
+    int dense_aux_budget;
+    int quality_aligned_assignment;
 } kshira_session;
 
 kshira_status kshira_session_init(kshira_session *session, void *memory,
@@ -29,6 +31,8 @@ kshira_status kshira_session_transition(kshira_session *session, kshira_bit_mode
 kshira_status kshira_session_calibrate(kshira_session *session,
                                         const kshira_image_f32 *image);
 kshira_status kshira_session_set_channel(kshira_session *session, size_t channel, int enabled);
+kshira_status kshira_session_set_dense_aux_budget(kshira_session *session, int budget);
+kshira_status kshira_session_set_quality_aligned_assignment(kshira_session *session, int enabled);
 kshira_status kshira_session_step(kshira_session *session, const kshira_image_f32 *image,
                                    const kshira_rad_box *target, float learning_rate,
                                    float *loss);

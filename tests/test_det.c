@@ -1,4 +1,5 @@
 #include "det.h"
+#include "native_graph_ops.h"
 
 #include <assert.h>
 #include <math.h>
@@ -314,7 +315,7 @@ static void test_manifest_adapter(void) {
     assert(fclose(image) == 0);
     FILE *manifest = fopen(manifest_path, "wb");
     assert(manifest != NULL);
-    assert(fputs("det_test_image.pgm 0,0,2,2,2\n", manifest) >= 0);
+    assert(fputs("det_test_image.pgm 0,0,2,2,2,0.5\n", manifest) >= 0);
     assert(fclose(manifest) == 0);
 
     det_manifest_dataset *raw = NULL;
@@ -326,14 +327,53 @@ static void test_manifest_adapter(void) {
     assert(dataset.next(dataset.user, &sample) == 1);
     assert(sample.image.width == 4 && sample.image.height == 4 && sample.image.channels == 1);
     assert(fabsf(sample.image.data[0] - 0.0f) < 1e-6f);
-    assert(fabsf(sample.image.data[2] - 64.0f / 255.0f) < 1e-6f);
-    assert(fabsf(sample.image.data[2 * 4 + 2] - 255.0f / 255.0f) < 1e-6f);
+    assert(fabsf(sample.image.data[2] - 48.0f / 255.0f) < 1e-6f);
+    assert(fabsf(sample.image.data[2 * 4 + 2] - 179.4375f / 255.0f) < 1e-6f);
     assert(sample.box_count == 1);
     assert(fabsf(sample.boxes[0].x2 - 4.0f) < 1e-6f);
     assert(fabsf(sample.boxes[0].y2 - 4.0f) < 1e-6f);
     assert(sample.boxes[0].class_id == 2);
+    assert(fabsf(sample.boxes[0].target_weight - 0.5f) < 1e-6f);
     assert(dataset.next(dataset.user, &sample) == 0);
     assert(det_manifest_status(raw) == DET_OK);
+    det_manifest_close(raw);
+    manifest = fopen(manifest_path, "wb");
+    assert(manifest != NULL);
+    assert(fputs("det_test_image.pgm 0,0,2,2,0\n", manifest) >= 0);
+    assert(fputs("det_test_image.pgm 0,0,2,2,1\n", manifest) >= 0);
+    assert(fputs("det_test_image.pgm 0,0,2,2,2\n", manifest) >= 0);
+    assert(fclose(manifest) == 0);
+    raw = NULL;
+    assert(det_manifest_open(manifest_path, 4, 4, 1, 4, &raw) == DET_OK);
+    assert(det_manifest_set_shuffle(raw, 1, 7) == DET_OK);
+    assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
+    {
+        int seen_classes = 0;
+        for (int i = 0; i < 3; ++i) {
+            assert(dataset.next(dataset.user, &sample) == 1);
+            assert(sample.box_count == 1);
+            seen_classes |= 1 << sample.boxes[0].class_id;
+        }
+        assert(seen_classes == 7);
+        assert(dataset.next(dataset.user, &sample) == 0);
+    }
+    det_manifest_close(raw);
+    raw = NULL;
+    manifest = fopen(manifest_path, "wb");
+    assert(manifest != NULL);
+    assert(fputs("det_test_image.pgm 0,0,2,2,2,0.5\n", manifest) >= 0);
+    assert(fclose(manifest) == 0);
+    assert(det_manifest_open(manifest_path, 4, 4, 1, 4, &raw) == DET_OK);
+    assert(det_manifest_enable_cache(raw) == DET_OK);
+    assert(det_manifest_set_shuffle(raw, 1, 7) == DET_OK);
+    assert(det_manifest_dataset_view(raw, &dataset) == DET_OK);
+    assert(dataset.next(dataset.user, &sample) == 1);
+    assert(fabsf(sample.image.data[2 * 4 + 2] - 179.4375f / 255.0f) < 1e-6f);
+    assert(sample.box_count == 1 && sample.boxes[0].class_id == 2 &&
+           fabsf(sample.boxes[0].target_weight - 0.5f) < 1e-6f);
+    assert(dataset.next(dataset.user, &sample) == 0);
+    dataset.reset(dataset.user);
+    assert(dataset.next(dataset.user, &sample) == 1);
     det_manifest_close(raw);
     manifest = fopen(manifest_path, "wb");
     assert(manifest != NULL);
@@ -441,6 +481,23 @@ static void test_arena_and_conv(void) {
                                    &grad_input, grad_weights, grad_bias) == DET_OK);
     for (int i = 0; i < 9; ++i) assert(fabsf(grad_weights[i] - input.data[i]) < 1e-6f);
     assert(fabsf(grad_bias[0] - 1.0f) < 1e-6f);
+}
+
+static void test_native_conv_padding(void) {
+    int8_t input_data[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    int8_t output_data[9] = {0};
+    int8_t weights[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    int32_t bias[1] = {0};
+    int32_t multiplier[1] = {1};
+    uint8_t shift[1] = {0};
+    NGConv2D layer = {weights, NULL, bias, NULL, multiplier, shift, NULL,
+                      1, 1, 3, 1, 1, 1, NG_QUANT_INT8, NG_ACT_IDENTITY,
+                      0.0f, 0.0f};
+    NGTensor input = {input_data, 1, 1, 3, 3};
+    NGTensor output = {output_data, 1, 1, 3, 3};
+    const int8_t expected[9] = {12, 21, 16, 27, 45, 33, 24, 39, 28};
+    assert(ng_conv2d_s8(&input, &output, &layer) == 0);
+    assert(memcmp(output_data, expected, sizeof(expected)) == 0);
 }
 
 static void test_stride2_padding_parity(void) {
@@ -817,6 +874,9 @@ static void test_odd_shape_neck_roundtrip(void) {
     assert(file_regions_differ(before_path, path, bottomup_offset,
                                4U * 9U * sizeof(float)));
     assert(det_load(ctx, path, &loaded) == DET_OK);
+    assert(det_save(loaded, "det_kshira_loaded_immediate.bin") == DET_OK);
+    assert(files_equal(path, "det_kshira_loaded_immediate.bin"));
+    (void)remove("det_kshira_loaded_immediate.bin");
     assert(det_predict(loaded, &image, 0.1f, after, 8, &after_count) == DET_OK);
     assert(after_count == trained_count);
     for (int i = 0; i < trained_count; ++i) {
@@ -993,7 +1053,8 @@ static void test_integrated_kshira_architecture(void) {
     det_model *peer = NULL;
     det_model *loaded = NULL;
     det_model *corrupt = NULL;
-    det_model_spec spec = {32, 32, 1, 2, 8, 17, DET_ARCH_KSHIRA, 4};
+    det_model_spec spec = {32, 32, 1, 2, 8, 17, DET_ARCH_KSHIRA, 4,
+                           DET_STEM_LEGACY, 1, 0, DET_RESEARCH_ADAPT};
     float pixels[32 * 32] = {0.0f};
     det_box boxes[2] = {{4.0f, 4.0f, 8.0f, 8.0f, 0},
                         {12.0f, 12.0f, 24.0f, 24.0f, 1}};
@@ -1067,7 +1128,8 @@ static void test_integrated_kshira_architecture(void) {
     (void)remove(truncated_path);
     assert(det_load(ctx, path, &loaded) == DET_OK);
     assert(det_model_architecture(loaded) == DET_ARCH_KSHIRA &&
-           det_model_precision(loaded) == DET_PRECISION_INT4);
+           det_model_precision(loaded) == DET_PRECISION_INT4 &&
+           det_model_research_mode(loaded) == DET_RESEARCH_ADAPT);
     assert(det_predict(loaded, &storage.sample.image, 0.0f, loaded_detections, 8,
                        &loaded_count) == DET_OK);
     assert(count == loaded_count);
@@ -1143,6 +1205,7 @@ static void test_kshira_resource_profiles(void) {
 
 int main(void) {
     test_arena_and_conv();
+    test_native_conv_padding();
     test_stride2_padding_parity();
     test_math();
     test_manifest_adapter();

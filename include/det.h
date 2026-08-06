@@ -35,9 +35,21 @@ typedef enum {
 } det_train_mode;
 
 typedef enum {
+    DET_RESEARCH_SCRATCH = 0,
+    DET_RESEARCH_ADAPT = 1,
+    DET_RESEARCH_FULL = 2
+} det_research_mode;
+
+typedef enum {
     DET_ARCH_CDET = 0,
     DET_ARCH_KSHIRA = 1
 } det_architecture;
+
+typedef enum {
+    DET_STEM_LEGACY = 0,
+    DET_STEM_SPACE_TO_DEPTH = 1,
+    DET_STEM_TWO_STAGE = 2
+} det_stem_mode;
 
 typedef struct {
     float x1;
@@ -45,6 +57,8 @@ typedef struct {
     float x2;
     float y2;
     int class_id;
+    /* Optional manifest confidence; zero means an ordinary ground-truth box. */
+    float target_weight;
 } det_box;
 
 typedef struct {
@@ -79,6 +93,17 @@ typedef struct {
     int seed;
     det_architecture architecture;
     int feature_channels; /* KSHIRA: 0 selects the measured 8-channel profile. */
+    det_stem_mode stem_mode; /* KSHIRA: legacy, space-to-depth, or two-stage stem. */
+    int one_to_one_head; /* KSHIRA: separate deployment head; zero preserves legacy. */
+    int shared_multiscale_head; /* KSHIRA: shared deployment head across P3/P4/P5. */
+    det_research_mode research_mode;
+    int context_fusion; /* KSHIRA: opt-in learned pooled-context fusion ablation. */
+    int raw_input_features; /* KSHIRA: append fixed local image statistics. */
+    int p3_only_deployment; /* KSHIRA: retain auxiliary scales for training, emit P3 only. */
+    int smooth_box_decode; /* KSHIRA: smooth positive box-side parameterization. */
+    /* Optional exported native graph directory for the KSHIRA accuracy profile.
+       NULL keeps the ordinary trainable KSHIRA predictor. */
+    const char *native_graph_dir;
 } det_model_spec;
 
 typedef struct {
@@ -91,6 +116,33 @@ typedef struct {
     int max_samples;
     int seed;
     int reset_weights;
+    /* Optional Phase 0/1 controls. Zero preserves the legacy fixed-epoch path. */
+    double time_budget_ms;
+    int analytic_readout;
+    /* Optional Phase 2 target-domain bootstrap. Zero preserves the legacy path. */
+    double bootstrap_budget_ms;
+    int bootstrap_enabled;
+    /* Adaptation profile: update the head while keeping encoder channels fixed. */
+    int freeze_encoder;
+    /* Adaptation profile: retain weights but restart stream-dependent schedules. */
+    int reset_schedule;
+    /* Training-only one-to-many positive budget; zero preserves the default. */
+    int dense_aux_budget;
+    /* Optional total stream cap across epochs; zero preserves per-epoch behavior. */
+    int max_total_samples;
+    /* Train pooled P4/P5 heads as auxiliary scales; zero preserves P3-only. */
+    int multiscale_aux;
+    /* Use measured dense/mixed/residual stage transitions; zero preserves the
+       established epoch schedule. */
+    int adaptive_budget;
+    /* Use a full-map residual candidate pass for hard-negative mining. */
+    int residual_budget;
+    /* Use score/IoU-ranked positive cells instead of a fixed neighborhood. */
+    int quality_aligned_assignment;
+    /* Fit the native graph's final class projection from cached feature maps. */
+    int feature_readout;
+    /* Adapt final class weights at the cells that produced training candidates. */
+    int candidate_head_adapt;
 } det_train_config;
 
 typedef struct {
@@ -99,6 +151,18 @@ typedef struct {
     double elapsed_ms;
     float mean_loss;
     int used_global_backward;
+    int stopped_by_budget;
+    int analytic_readout_applied;
+    size_t readout_examples;
+    size_t readout_positives;
+    size_t readout_negatives;
+    double readout_pre_objective;
+    double readout_post_objective;
+    size_t bootstrap_samples;
+    double bootstrap_elapsed_ms;
+    int feature_readout_applied;
+    size_t feature_readout_examples;
+    size_t candidate_head_updates;
 } det_train_report;
 
 /* Model-owned payload bytes. Allocator metadata and automatic stack temporaries
@@ -131,6 +195,9 @@ typedef struct {
     /* Number of streamed ground-truth boxes in small, medium, and large
        COCO-style area buckets. */
     size_t size_ground_truths[3];
+    /* Score bins are [0,.1), ... [.9,1]; row 0 is loose IoU-positive and row 1
+       is non-matching. They are filled before the requested score threshold. */
+    size_t score_histogram[2][10];
 } det_eval_report;
 
 typedef struct {
@@ -189,8 +256,17 @@ det_status det_upsample_nearest(const det_tensor_f32 *input, int scale,
 det_status det_model_build(det_context *ctx, const det_model_spec *spec,
                            det_model **out);
 det_status det_model_set_precision(det_model *model, det_precision precision);
+/* Attach or replace the optional exported native graph accuracy profile. */
+det_status det_model_set_native_graph(det_model *model, const char *directory);
+det_status det_model_native_graph_calibration(const det_model *model,
+                                             float *gain, float *bias);
 det_precision det_model_precision(const det_model *model);
 det_architecture det_model_architecture(const det_model *model);
+int det_model_one_to_one_head(const det_model *model);
+int det_model_shared_multiscale(const det_model *model);
+int det_model_context_fusion(const det_model *model);
+int det_model_p3_only_deployment(const det_model *model);
+det_research_mode det_model_research_mode(const det_model *model);
 det_status det_model_memory(const det_model *model, det_memory_report *report);
 void det_model_destroy(det_model *model);
 det_status det_model_reset(det_model *model, int seed);
@@ -219,6 +295,13 @@ det_status det_manifest_open(const char *manifest_path, int width, int height,
                              det_manifest_dataset **out);
 det_status det_manifest_dataset_view(det_manifest_dataset *dataset,
                                      det_dataset *out);
+/* Optional predecoded cache. Preparation is outside det_train's budget and is
+   reported separately by the benchmark; the streamed API remains unchanged. */
+det_status det_manifest_enable_cache(det_manifest_dataset *dataset);
+/* Optionally permute manifest samples deterministically at every reset. This
+   uses a lightweight line index and does not require the pixel cache. */
+det_status det_manifest_set_shuffle(det_manifest_dataset *dataset, int enabled,
+                                    int seed);
 det_status det_manifest_status(const det_manifest_dataset *dataset);
 void det_manifest_close(det_manifest_dataset *dataset);
 

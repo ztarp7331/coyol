@@ -1,6 +1,10 @@
 /* Core public tensors, arena, convolution, and scalar math operators. */
 #include "det.h"
+#include "kshira/budget.h"
 #include "kshira/session.h"
+#include "native_graph_loader.h"
+#include "native_graph_post.h"
+#include "native_multiscale.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -76,6 +80,28 @@ struct det_model {
     det_head aux_heads[DET_MAX_SCALES];
     det_precision precision;
     size_t train_updates;
+    NGLoadedWeights native_graph_weights;
+    int native_graph_enabled;
+    int native_graph_architecture;
+    int8_t *native_graph_input;
+    float *native_graph_input_f32;
+    int8_t *native_graph_arena;
+    size_t native_graph_arena_bytes;
+    size_t native_graph_arena_high_water;
+    float native_score_gain;
+    float native_score_bias;
+    float native_class_bias[DET_MAX_CLASSES];
+    float native_scale_bias[DET_MAX_SCALES];
+    float native_box_bias[DET_MAX_SCALES][4];
+    float native_class_box_bias[DET_MAX_SCALES][DET_MAX_CLASSES][4];
+    float native_head_accum[DET_MAX_SCALES][DET_MAX_CLASSES];
+    float *native_feature_cache[DET_MAX_SCALES];
+    size_t native_feature_cache_count[DET_MAX_SCALES];
+    int native_feature_channels[DET_MAX_SCALES];
+    int native_feature_height[DET_MAX_SCALES];
+    int native_feature_width[DET_MAX_SCALES];
+    float *native_head_weight_accum[DET_MAX_SCALES];
+    size_t native_head_weight_accum_count[DET_MAX_SCALES];
 };
 
 static const int k_strides[DET_MAX_SCALES] = {8, 16, 32};
@@ -95,6 +121,179 @@ static det_status det_kshira_predict(det_model *model, const det_image *image,
 static det_status det_kshira_save_file(const det_model *model, const char *path);
 static det_status det_kshira_load_file(det_context *ctx, const char *path,
                                        det_model **out);
+static det_status det_native_graph_save_file(const det_model *model, const char *path);
+static det_status det_native_graph_load_file(det_context *ctx, const char *path,
+                                             det_model **out);
+static int checked_size3(int a, int b, int c, size_t *out);
+
+static void det_native_feature_release(det_model *model) {
+    if (model == NULL) return;
+    for (int level = 0; level < DET_MAX_SCALES; ++level) {
+        free(model->native_feature_cache[level]);
+        model->native_feature_cache[level] = NULL;
+        model->native_feature_cache_count[level] = 0U;
+        model->native_feature_channels[level] = 0;
+        model->native_feature_height[level] = 0;
+        model->native_feature_width[level] = 0;
+        free(model->native_head_weight_accum[level]);
+        model->native_head_weight_accum[level] = NULL;
+        model->native_head_weight_accum_count[level] = 0U;
+    }
+}
+
+static det_status det_native_feature_prepare(det_model *model) {
+    int level = 0;
+    if (model == NULL || model->native_graph_architecture == NG_GRAPH_MULTISCALE) {
+        return DET_OK;
+    }
+    for (int i = 0; i < model->native_graph_weights.conv_count && level < DET_MAX_SCALES; ++i) {
+        const NGConv2D *conv = &model->native_graph_weights.convs[i];
+        size_t count;
+        size_t weight_count;
+        int stride;
+        if (conv->out_channels != model->native_graph_weights.class_count ||
+            conv->kernel != 1 || conv->stride != 1 || conv->in_channels <= 0) continue;
+        stride = 8 << level;
+        if (model->spec.height % stride != 0 || model->spec.width % stride != 0 ||
+            !checked_size3(conv->in_channels, model->spec.height / stride,
+                           model->spec.width / stride, &count)) {
+            det_native_feature_release(model);
+            return DET_ERR_SHAPE;
+        }
+        model->native_feature_cache[level] = (float *)calloc(count, sizeof(float));
+        if (!checked_size3(conv->out_channels, conv->in_channels, 1,
+                           &weight_count)) {
+            det_native_feature_release(model);
+            return DET_ERR_SHAPE;
+        }
+        model->native_head_weight_accum[level] =
+            (float *)calloc(weight_count, sizeof(float));
+        if (model->native_feature_cache[level] == NULL ||
+            model->native_head_weight_accum[level] == NULL) {
+            det_native_feature_release(model);
+            return DET_ERR_MEMORY;
+        }
+        model->native_feature_cache_count[level] = count;
+        model->native_feature_channels[level] = conv->in_channels;
+        model->native_feature_height[level] = model->spec.height / stride;
+        model->native_feature_width[level] = model->spec.width / stride;
+        model->native_head_weight_accum_count[level] = weight_count;
+        ++level;
+    }
+    if (level != DET_MAX_SCALES) {
+        det_native_feature_release(model);
+        return DET_ERR_FORMAT;
+    }
+    return DET_OK;
+}
+
+static det_status det_native_graph_prepare(det_model *model) {
+    size_t input_bytes;
+    if (model == NULL || model->architecture != DET_ARCH_KSHIRA ||
+        model->spec.width <= 0 || model->spec.height <= 0 ||
+        model->spec.width % 32 != 0 || model->spec.height % 32 != 0) {
+        return DET_ERR_ARGUMENT;
+    }
+    if (model->native_graph_weights.class_count != model->spec.num_classes ||
+        model->native_graph_weights.input_channels <= 0 ||
+        model->native_graph_weights.input_channels > 3 ||
+        !checked_size3(model->native_graph_weights.input_channels, model->spec.height,
+                       model->spec.width, &input_bytes)) {
+        return DET_ERR_FORMAT;
+    }
+    model->native_graph_input = (int8_t *)calloc(input_bytes, sizeof(int8_t));
+    if (model->native_graph_weights.weight_f32_blob != NULL &&
+        model->native_graph_weights.bias_f32_blob != NULL) {
+        model->native_graph_input_f32 = (float *)calloc(input_bytes, sizeof(float));
+    }
+    model->native_graph_arena_bytes = model->native_graph_weights.architecture ==
+                                      NG_GRAPH_MULTISCALE ?
+                                      4U * 1024U * 1024U :
+                                      (model->native_graph_weights.weight_f32_blob != NULL &&
+                                       model->native_graph_weights.bias_f32_blob != NULL ?
+                                       8U * 1024U * 1024U : 2U * 1024U * 1024U);
+    model->native_graph_arena = (int8_t *)malloc(model->native_graph_arena_bytes);
+    if (model->native_graph_input == NULL ||
+        ((model->native_graph_weights.weight_f32_blob != NULL ||
+          model->native_graph_weights.bias_f32_blob != NULL) &&
+         model->native_graph_input_f32 == NULL) ||
+        model->native_graph_arena == NULL) {
+        free(model->native_graph_input);
+        free(model->native_graph_input_f32);
+        free(model->native_graph_arena);
+        det_native_feature_release(model);
+        model->native_graph_input = NULL;
+        model->native_graph_input_f32 = NULL;
+        model->native_graph_arena = NULL;
+        model->native_graph_arena_bytes = 0U;
+        model->native_graph_arena_high_water = 0U;
+        ng_weights_free(&model->native_graph_weights);
+        return DET_ERR_MEMORY;
+    }
+    model->native_graph_enabled = 1;
+    model->native_graph_architecture = model->native_graph_weights.architecture;
+    {
+        det_status feature_status = det_native_feature_prepare(model);
+        if (feature_status != DET_OK) {
+            free(model->native_graph_input);
+            free(model->native_graph_input_f32);
+            free(model->native_graph_arena);
+            model->native_graph_input = NULL;
+            model->native_graph_input_f32 = NULL;
+            model->native_graph_arena = NULL;
+            model->native_graph_arena_bytes = 0U;
+            model->native_graph_enabled = 0;
+            det_native_feature_release(model);
+            ng_weights_free(&model->native_graph_weights);
+            return feature_status;
+        }
+    }
+    model->native_score_gain = 1.0f;
+    model->native_score_bias = 0.0f;
+    model->native_graph_arena_high_water = 0U;
+    memset(model->native_class_bias, 0, sizeof(model->native_class_bias));
+    memset(model->native_scale_bias, 0, sizeof(model->native_scale_bias));
+    memset(model->native_box_bias, 0, sizeof(model->native_box_bias));
+    memset(model->native_class_box_bias, 0, sizeof(model->native_class_box_bias));
+    memset(model->native_head_accum, 0, sizeof(model->native_head_accum));
+    return DET_OK;
+}
+
+static det_status det_native_graph_attach(det_model *model, const char *directory) {
+    det_status status;
+    if (model == NULL || directory == NULL) return DET_ERR_ARGUMENT;
+    if (ng_weights_load_dir_mode(directory, &model->native_graph_weights, 1) != 0) {
+        return DET_ERR_FORMAT;
+    }
+    status = det_native_graph_prepare(model);
+    if (status != DET_OK) {
+        ng_weights_free(&model->native_graph_weights);
+        return status;
+    }
+    return DET_OK;
+}
+
+static void det_native_graph_release(det_model *model) {
+    if (model == NULL) return;
+    det_native_feature_release(model);
+    ng_weights_free(&model->native_graph_weights);
+    free(model->native_graph_input);
+    free(model->native_graph_input_f32);
+    free(model->native_graph_arena);
+    model->native_graph_input = NULL;
+    model->native_graph_input_f32 = NULL;
+    model->native_graph_arena = NULL;
+    model->native_graph_arena_bytes = 0U;
+    model->native_graph_enabled = 0;
+    model->native_graph_architecture = NG_GRAPH_BASE;
+    model->native_score_gain = 1.0f;
+    model->native_score_bias = 0.0f;
+    memset(model->native_class_bias, 0, sizeof(model->native_class_bias));
+    memset(model->native_scale_bias, 0, sizeof(model->native_scale_bias));
+    memset(model->native_box_bias, 0, sizeof(model->native_box_bias));
+    memset(model->native_class_box_bias, 0, sizeof(model->native_class_box_bias));
+    memset(model->native_head_accum, 0, sizeof(model->native_head_accum));
+}
 
 static double now_ms(void) {
 #if defined(_WIN32)

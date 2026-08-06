@@ -109,6 +109,9 @@ static int expected_payload_size(const det_file_header *header, size_t *out) {
 det_status det_save(const det_model *model, const char *path) {
     if (model == NULL || path == NULL) return DET_ERR_ARGUMENT;
     if (model->architecture == DET_ARCH_KSHIRA) {
+        if (model->native_graph_enabled) {
+            return det_native_graph_save_file(model, path);
+        }
         return det_kshira_save_file(model, path);
     }
     if (!valid_precision(model->precision)) return DET_ERR_FORMAT;
@@ -303,9 +306,17 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
         fclose(file);
         return DET_ERR_FORMAT;
     }
-    if (memcmp(prefix_magic, "CDET", 4U) == 0 && prefix_version == 9U) {
+    if (memcmp(prefix_magic, "CDET", 4U) == 0 &&
+        (prefix_version == 17U || prefix_version == 18U ||
+         prefix_version == 19U || prefix_version == 20U ||
+         prefix_version == 21U || prefix_version == 22U)) {
         fclose(file);
         return det_kshira_load_file(ctx, path, out);
+    }
+    if (memcmp(prefix_magic, "CY8N", 4U) == 0 &&
+        (prefix_version == 1U || prefix_version == 2U)) {
+        fclose(file);
+        return det_native_graph_load_file(ctx, path, out);
     }
     if (fseek(file, 0L, SEEK_END) != 0) {
         fclose(file);
@@ -354,7 +365,8 @@ det_status det_load(det_context *ctx, const char *path, det_model **out) {
     }
     det_model_spec spec = {(int)header.width, (int)header.height, (int)header.channels,
                            (int)header.classes, (int)header.max_detections, 1,
-                           DET_ARCH_CDET, 0};
+                           DET_ARCH_CDET, 0, DET_STEM_LEGACY, 0, 0,
+                           DET_RESEARCH_SCRATCH, 0, 0, 0, 0, NULL};
     det_model *model = NULL;
     det_status status = det_model_build(ctx, &spec, &model);
     if (status != DET_OK) {
